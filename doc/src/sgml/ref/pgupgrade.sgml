@@ -263,6 +263,25 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--initdb</option></term>
+      <listitem>
+       <para>
+        Create the new cluster automatically by running
+        <command>initdb</command> before upgrading, instead of requiring the
+        user to have created it manually.  The WAL segment size, data checksum
+        setting, encoding, and locale are derived from the old cluster so that
+        <application>pg_upgrade</application> can verify compatibility.
+       </para>
+       <para>
+        The new cluster data directory specified with
+        <option>-D</option>/<option>--new-datadir</option> must not already
+        exist when this option is given; if it does,
+        <application>pg_upgrade</application> will exit with an error.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--no-statistics</option></term>
       <listitem>
        <para>
@@ -461,6 +480,12 @@ make prefix=/usr/local/pgsql.new install
      flags that match the old cluster. Many
      prebuilt installers do this step automatically. There is no need to
      start the new cluster.
+    </para>
+    <para>
+     Alternatively, pass <option>--initdb</option> to
+     <application>pg_upgrade</application> to have it run
+     <command>initdb</command> automatically, deriving the required settings
+     from the old cluster.  In that case this manual step can be skipped.
     </para>
    </step>
 
