@@ -268,6 +268,38 @@ the CN checkpoint record, which already carries the transplanted values.
 The result: from just the folder skeleton + pg_control + PG_VERSION + the WAL,
 first startup reconstructs the complete upgraded cluster.
 
+PREREQUISITE: THE SKELETON MUST EXIST BEFORE REPLAY
+---------------------------------------------------
+
+The directory skeleton is a HARD prerequisite -- recovery does NOT work from a
+bare directory containing only pg_control + PG_VERSION + the WAL.  Verified: with
+the skeleton removed, startup FATALs with
+
+    could not open directory "pg_notify": No such file or directory
+
+The reason is ordering.  At startup the postmaster initializes runtime
+subsystems -- pg_notify (async.c), pg_subtrans, pg_serial (predicate.c),
+pg_dynshmem, pg_commit_ts, pg_stat, etc. -- which open their directories
+BEFORE, and independently of, WAL replay.  Those directories hold transient
+runtime state; nothing WAL-logs them, so XLOG_UPGRADE_DIRSKEL (which runs during
+replay, later) cannot supply them in time.  DIRSKEL recreates the DATA
+directories (base/<dboid>, the SLRU dirs) that replay writes into; it does not
+and cannot substitute for the runtime skeleton the postmaster needs up front.
+
+So the minimum on-disk state required before first startup is:
+
+  - pg_control            (pre-WAL anchor: sysid, CN pointer, DB_IN_PRODUCTION)
+  - PG_VERSION            (checked by the postmaster before recovery)
+  - the initdb skeleton   (pg_notify, pg_subtrans, pg_wal, config files, ...)
+  - the upgrade WAL in pg_wal/
+
+The DATA folders (base/<dboid>, pg_xact, pg_multixact) may be empty or absent --
+those are rebuilt from WAL.  But the runtime skeleton and the two anchor files
+must pre-exist.  For a spawn-a-fresh-cluster deployment (e.g. a new-version VM /
+compute that replays the upgrade WAL), this means the target must lay down an
+initdb skeleton (or run initdb) FIRST; handing it a bare directory plus the WAL
+will not start.
+
 WAL BYTES COUNTER
 
 pg_upgrade also measures the WAL generated during schema restore via the
