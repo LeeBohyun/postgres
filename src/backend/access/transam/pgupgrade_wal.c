@@ -30,6 +30,7 @@
 #include "access/slru.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
+#include "access/xlogrecovery.h"	/* pgUpgradeReplayInProgress */
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"	/* wal_segment_close */
@@ -359,6 +360,13 @@ pg_upgrade_redo(XLogReaderState *record)
 							 "the upgrade cannot be replayed on a running standby.")));
 
 		/*
+		 * LEE: the upgrade window is now open.  Suppress hot standby activation
+		 * until XLOG_PG_UPGRADE_COMPLETE replays, so no read-only connection can
+		 * observe the half-upgraded cluster (new catalogs partially applied).
+		 */
+		pgUpgradeReplayInProgress = true;
+
+		/*
 		 * Write $PGDATA/PG_VERSION from the embedded string.  The top-level
 		 * PG_VERSION is created by initdb outside the server and is not
 		 * otherwise WAL-logged.  Per-database PG_VERSION files are covered by
@@ -383,7 +391,12 @@ pg_upgrade_redo(XLogReaderState *record)
 	}
 	else if (info == XLOG_PG_UPGRADE_COMPLETE)
 	{
-		/* informational marker, no redo action needed */
+		/*
+		 * LEE: the upgrade window is now closed and the cluster is fully
+		 * upgraded.  Clear the guard so hot standby may activate normally
+		 * (CheckRecoveryConsistency will pick it up on the next call).
+		 */
+		pgUpgradeReplayInProgress = false;
 	}
 	else if (info == XLOG_UPGRADE_DIRSKEL)
 	{

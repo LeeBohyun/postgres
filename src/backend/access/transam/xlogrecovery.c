@@ -302,6 +302,15 @@ static bool backupEndRequired = false;
  */
 bool		reachedConsistency = false;
 
+/*
+ * LEE: true while replaying a pg_upgrade --wal-log-upgrade window, i.e. after
+ * an XLOG_PG_UPGRADE_START record and before its matching
+ * XLOG_PG_UPGRADE_COMPLETE.  While set, hot standby must NOT go active: the
+ * cluster is only half-upgraded (new catalogs partially applied), so no
+ * read-only connection may observe it.  Set/cleared by pg_upgrade_redo().
+ */
+bool		pgUpgradeReplayInProgress = false;
+
 /* Buffers dedicated to consistency checks of size BLCKSZ */
 static char *replay_image_masked = NULL;
 static char *primary_image_masked = NULL;
@@ -2233,6 +2242,7 @@ CheckRecoveryConsistency(void)
 	if (standbyState == STANDBY_SNAPSHOT_READY &&
 		!LocalHotStandbyActive &&
 		reachedConsistency &&
+		!pgUpgradeReplayInProgress &&
 		IsUnderPostmaster)
 	{
 		SpinLockAcquire(&XLogRecoveryCtl->info_lck);
