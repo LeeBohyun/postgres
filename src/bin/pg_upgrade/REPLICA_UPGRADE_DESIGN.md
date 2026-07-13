@@ -203,6 +203,33 @@ LIVE standby. The replica path MUST therefore replay the upgrade window in the
 same non-serving recovery mode (paused, not accepting queries), exactly like the
 primary bootstrap. This is a hard requirement, not an optimization.
 
+## Connection blocking during replay (IMPLEMENTED)
+
+No client may observe a half-upgraded cluster (new catalogs partially applied)
+while the upgrade WAL is replaying. Two layers enforce this:
+
+1. **Crash-recovery consistency gate (stock).** The primary /
+   spawn-fresh-cluster replay is crash recovery (`DB_IN_PRODUCTION`, no
+   `standby.signal`). The postmaster rejects every connection until a consistent
+   state is reached, which for crash recovery is only after redo completes. So
+   the whole window is covered with no extra code. Verified: racing 400
+   connection attempts against the replay yields rejections during replay and
+   zero partial-state reads (`run_connblock_test.sh`).
+
+2. **Hot-standby suppression guard (added for the replica path).** A streaming
+   standby doing *archive* recovery with `hot_standby=on` could otherwise flip
+   hot standby active at its consistency point — mid-upgrade. The
+   `pgUpgradeReplayInProgress` flag (xlogrecovery.c) is set by `pg_upgrade_redo()`
+   at `XLOG_PG_UPGRADE_START` and cleared at `XLOG_PG_UPGRADE_COMPLETE`;
+   `CheckRecoveryConsistency()` will not activate hot standby while it is set. So
+   even on a hot-standby replica, connections are refused until the whole
+   START..COMPLETE window has replayed.
+
+   (Layer 2 is in place and does not regress the crash-recovery path, but its
+   unique effect — blocking hot-standby reads during archive recovery — can only
+   be exercised directly once the full streaming-standby convergence path below
+   is built.)
+
 ## Open questions / risks
 
 1. **CN/REDO anchor on the standby.** The primary captures CN via
@@ -248,3 +275,9 @@ primary bootstrap. This is a hard requirement, not an optimization.
    verify a standby that sees START but never COMPLETE stays the OLD cluster
    (the standby analog of the existing run_crash_test.sh).
 5. Address orphaned-old-file cleanup (Open Q2) if confirmed necessary.
+
+Already done (independent of the streaming-standby path above):
+  - sysid preservation (new cluster carries the old cluster's identifier)
+  - connection blocking during replay (pgUpgradeReplayInProgress guard +
+    crash-recovery consistency gate) — see "Connection blocking during replay"
+  - end-to-end WAL-replay-vs-vanilla equivalence test (run_neon_e2e_test.sh)
