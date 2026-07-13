@@ -46,7 +46,9 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "access/clog.h"
+#include "access/clog.h"			/* LEE: CheckPointCLOG for XLogFlushUpgradeSLRU */
+#include "access/pgupgrade_wal.h"	/* LEE: RM_PG_UPGRADE_ID, pg_upgrade WAL functions */
+#include "access/slru.h"			/* LEE: SLRU_PAGES_PER_SEGMENT for upgrade WAL */
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
@@ -8665,6 +8667,571 @@ XLogAssignLSN(void)
 	XLogSetRecordFlags(XLOG_MARK_UNIMPORTANT);
 	XLogRegisterData(&dummy, sizeof(dummy));
 	return XLogInsert(RM_XLOG_ID, XLOG_ASSIGN_LSN);
+}
+
+/*
+ * LEE: Write a WAL record marking the start or completion of pg_upgrade.
+ *
+ * These records bracket the schema-restore window so that crash recovery,
+ * pg_waldump, and replication tooling can identify the upgrade and verify
+ * that both markers are present (i.e. the upgrade completed atomically).
+ *
+ * is_start=true  → XLOG_PG_UPGRADE_START
+ * is_start=false → XLOG_PG_UPGRADE_COMPLETE
+ */
+XLogRecPtr
+XLogWritePgUpgrade(bool is_start, uint32 old_major_version,
+				   uint32 new_major_version)
+{
+	xl_pg_upgrade xlrec;
+	XLogRecPtr	RecPtr;
+
+	xlrec.old_major_version = old_major_version;
+	xlrec.new_major_version = new_major_version;
+	xlrec.upgrade_time = (pg_time_t) time(NULL);
+	/* LEE: embed PG_MAJORVERSION so redo can write $PGDATA/PG_VERSION */
+	snprintf(xlrec.pg_version, sizeof(xlrec.pg_version), "%s\n",
+			 PG_MAJORVERSION);
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfXLPgUpgrade);
+	RecPtr = XLogInsert(RM_PG_UPGRADE_ID,
+						is_start ? XLOG_PG_UPGRADE_START
+								 : XLOG_PG_UPGRADE_COMPLETE);
+
+	ereport(LOG,
+			(errmsg("pg_upgrade %s recorded at %X/%X "
+					"(old major version %u, new major version %u)",
+					is_start ? "start" : "complete",
+					LSN_FORMAT_ARGS(RecPtr),
+					old_major_version, new_major_version)));
+
+	return RecPtr;
+}
+
+/*
+ * LEE: recursively collect PGDATA-relative subdirectory paths under "abspath"
+ * (whose PGDATA-relative prefix is "relpath"), appending each as a
+ * NUL-terminated string to "buf" and counting them in *ndirs.  Parent
+ * directories are appended before their children (the entry is written before
+ * recursing) so that a plain mkdir() per path suffices on replay.
+ *
+ * pg_wal is skipped: the upgrade WAL segments and pg_wal/ itself are handled by
+ * PerformWalUpgradeIfNeeded(), not by the directory after-image.
+ */
+static void
+collect_upgrade_dirs(const char *abspath, const char *relpath,
+					 StringInfo buf, uint32 *ndirs)
+{
+	DIR		   *dir;
+	struct dirent *de;
+
+	dir = AllocateDir(abspath);
+	if (dir == NULL)
+		return;
+
+	while ((de = ReadDir(dir, abspath)) != NULL)
+	{
+		char		childabs[MAXPGPATH];
+		char		childrel[MAXPGPATH];
+		struct stat st;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+
+		/* top-level pg_wal is not part of the after-image (see comment) */
+		if (relpath[0] == '\0' && strcmp(de->d_name, "pg_wal") == 0)
+			continue;
+
+		snprintf(childabs, sizeof(childabs), "%s/%s", abspath, de->d_name);
+		if (lstat(childabs, &st) != 0 || !S_ISDIR(st.st_mode))
+			continue;			/* only directories; skip files and symlinks */
+
+		if (relpath[0] == '\0')
+			snprintf(childrel, sizeof(childrel), "%s", de->d_name);
+		else
+			snprintf(childrel, sizeof(childrel), "%s/%s", relpath, de->d_name);
+
+		/* append this directory, then recurse into it (parent-before-child) */
+		appendBinaryStringInfo(buf, childrel, strlen(childrel) + 1);
+		(*ndirs)++;
+
+		collect_upgrade_dirs(childabs, childrel, buf, ndirs);
+	}
+	FreeDir(dir);
+}
+
+/*
+ * LEE: Emit one XLOG_UPGRADE_DIRSKEL record capturing the after-image of the
+ * new cluster's directory tree (every subdirectory under PGDATA except pg_wal).
+ * initdb creates this tree outside the server, so it is not otherwise
+ * WAL-logged; this record lets recovery rebuild the whole skeleton from WAL,
+ * and lets a standby upgrade itself without ever running initdb.
+ *
+ * Emitted right after XLOG_PG_UPGRADE_START and before the file-image records,
+ * so the directories exist before any relfile/SLRU image is replayed into them.
+ */
+XLogRecPtr
+XLogWriteUpgradeDirSkel(void)
+{
+	xl_upgrade_dirskel xlrec;
+	StringInfoData buf;
+	XLogRecPtr	RecPtr;
+
+	initStringInfo(&buf);
+	xlrec.ndirs = 0;
+	collect_upgrade_dirs(DataDir, "", &buf, &xlrec.ndirs);
+	xlrec.total_bytes = (uint32) buf.len;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfXLUpgradeDirskel);
+	if (buf.len > 0)
+		XLogRegisterData(buf.data, buf.len);
+	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_DIRSKEL);
+
+	ereport(LOG,
+			(errmsg("pg_upgrade directory after-image recorded at %X/%X (%u directories)",
+					LSN_FORMAT_ARGS(RecPtr), xlrec.ndirs)));
+
+	pfree(buf.data);
+	return RecPtr;
+}
+
+/*
+ * LEE: Emit XLOG_UPGRADE_SLRU_DATA records for all existing segment files in
+ * one SLRU directory.  Called by pg_write_upgrade_slru_data() for each of the
+ * three SLRU types (pg_xact, pg_multixact/offsets, pg_multixact/members).
+ *
+ * LEE: segments are sorted by number and packed into WAL-segment-sized chunks
+ * (wal_segment_size bytes per record) so that the number of WAL records is
+ * minimised even when the old cluster has gigabytes of SLRU history.  Each
+ * record covers a contiguous run of segment files [first_seg, last_seg].
+ * The redo handler writes the raw bytes back as a single pwrite() call per
+ * segment file, reconstructing any segment files that are missing or wrong.
+ *
+ * Returns the LSN of the last record written, or InvalidXLogRecPtr if the
+ * directory is empty.
+ */
+XLogRecPtr
+XLogWriteUpgradeSlruData(uint8 slru_type)
+{
+	const char *slru_dirs[] = UPGRADE_SLRU_DIRS;
+	const char *slru_dir;
+	DIR		   *dir;
+	struct dirent *de;
+	XLogRecPtr	lsn = InvalidXLogRecPtr;
+
+	/* sorted list of (seg_number, filepath) pairs */
+	typedef struct
+	{
+		int64		segno;
+		char		path[MAXPGPATH];
+	} SlruSegInfo;
+
+	SlruSegInfo *segs = NULL;
+	int			nsegs = 0;
+	int			segs_alloc = 0;
+	int			i;
+	/* LEE: max segments per WAL record, capped at XLogRecordMaxSize */
+	Size		seg_size = SLRU_PAGES_PER_SEGMENT * BLCKSZ;
+	int			max_segs_per_rec = (int) (XLogRecordMaxSize / seg_size);
+
+	if (slru_type >= lengthof(slru_dirs))
+		elog(ERROR, "XLogWriteUpgradeSlruData: invalid slru_type %u", slru_type);
+
+	slru_dir = slru_dirs[slru_type];
+
+	/* --- Pass 1: collect and sort segment numbers --- */
+	dir = AllocateDir(slru_dir);
+	if (dir == NULL)
+		return InvalidXLogRecPtr;
+
+	while ((de = ReadDir(dir, slru_dir)) != NULL)
+	{
+		int64		segno;
+
+		if (de->d_name[0] == '.')
+			continue;
+		if (sscanf(de->d_name, "%04" SCNx64, (uint64 *) &segno) != 1)
+			continue;
+
+		if (nsegs >= segs_alloc)
+		{
+			segs_alloc = (segs_alloc == 0) ? 64 : segs_alloc * 2;
+			if (segs == NULL)
+				segs = palloc_array(SlruSegInfo, segs_alloc);
+			else
+				segs = repalloc_array(segs, SlruSegInfo, segs_alloc);
+		}
+		segs[nsegs].segno = segno;
+		snprintf(segs[nsegs].path, MAXPGPATH, "%s/%s", slru_dir, de->d_name);
+		nsegs++;
+	}
+	FreeDir(dir);
+
+	if (nsegs == 0)
+	{
+		if (segs)
+			pfree(segs);
+		return InvalidXLogRecPtr;
+	}
+
+	/* sort ascending by segment number */
+	{
+		int			k,
+					n = nsegs;
+
+		/* simple insertion sort — segment count is typically small */
+		for (k = 1; k < n; k++)
+		{
+			SlruSegInfo tmp = segs[k];
+			int			m = k;
+
+			while (m > 0 && segs[m - 1].segno > tmp.segno)
+			{
+				segs[m] = segs[m - 1];
+				m--;
+			}
+			segs[m] = tmp;
+		}
+	}
+
+	/* --- Pass 2: pack consecutive segments per record, allocate exact size --- */
+	i = 0;
+	while (i < nsegs)
+	{
+		xl_upgrade_slru_data xlrec;
+		int			j;
+		int			batch_count;
+		Size		batch_bytes;
+		char	   *packbuf;
+
+		/* Determine how many consecutive segments go in this batch */
+		j = i;
+		while (j < nsegs &&
+			   (j - i) < max_segs_per_rec &&
+			   (j == i || segs[j].segno == segs[j - 1].segno + 1))
+			j++;
+
+		batch_count = j - i;
+		batch_bytes = (Size) batch_count * seg_size;
+
+		/* Allocate exactly what we need — no 1GB buffer */
+		packbuf = palloc(batch_bytes);
+
+		/* Read each segment file into the pack buffer */
+		for (int k = 0; k < batch_count; k++)
+		{
+			int			fd;
+			ssize_t		nbytes;
+
+			fd = OpenTransientFile(segs[i + k].path, O_RDONLY | PG_BINARY);
+			if (fd < 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not open SLRU file \"%s\": %m",
+								segs[i + k].path)));
+
+			nbytes = read(fd, packbuf + (Size) k * seg_size, seg_size);
+			CloseTransientFile(fd);
+
+			if (nbytes < 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not read SLRU file \"%s\": %m",
+								segs[i + k].path)));
+
+			/* pad short segment to full size so redo can stride by seg_size */
+			if ((Size) nbytes < seg_size)
+				memset(packbuf + (Size) k * seg_size + nbytes,
+					   0, seg_size - nbytes);
+		}
+
+		xlrec.slru_type = slru_type;
+		xlrec.first_seg = segs[i].segno;
+		xlrec.last_seg = segs[i + batch_count - 1].segno;
+		xlrec.total_bytes = (uint32) batch_bytes;
+
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, SizeOfXLUpgradeSlruData);
+		XLogRegisterData(packbuf, batch_bytes);
+		lsn = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_SLRU_DATA);
+
+		pfree(packbuf);
+		i = j;
+	}
+
+	pfree(segs);
+	return lsn;
+}
+
+/*
+ * LEE: batched emission of XLOG_UPGRADE_RELFILE_DATA.
+ *
+ * To use the coarsest WAL granularity, many relation-file chunks are packed
+ * into one record up to the max WAL payload.  Callers:
+ *
+ *     UpgradeRelfileBatch b;
+ *     XLogUpgradeRelfileBatchBegin(&b);
+ *     for each file: XLogUpgradeRelfileBatchAddFile(&b, path, ...);
+ *     XLogUpgradeRelfileBatchEnd(&b);
+ *
+ * Cap the batch a little below XLogRecordMaxSize to leave room for the
+ * XLogRecord header/overhead.  A single chunk never exceeds the cap minus one
+ * entry header, so after a flush any chunk fits.
+ */
+#define UPGRADE_RELFILE_BATCH_CAP \
+	((Size) ((XLogRecordMaxSize / BLCKSZ - 2) * (Size) BLCKSZ))
+#define UPGRADE_RELFILE_MAX_CHUNK \
+	((Size) (((UPGRADE_RELFILE_BATCH_CAP - SizeOfXLUpgradeRelfileEntry) / BLCKSZ) * (Size) BLCKSZ))
+
+static void
+XLogUpgradeRelfileBatchFlush(UpgradeRelfileBatch *b)
+{
+	if (b->used == 0)
+		return;
+
+	XLogBeginInsert();
+	XLogRegisterData(b->buf, b->used);
+	XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_RELFILE_DATA);
+
+	b->nrecords++;
+	b->used = 0;
+	b->nentries = 0;
+}
+
+void
+XLogUpgradeRelfileBatchBegin(UpgradeRelfileBatch *b)
+{
+	b->buf = palloc(UPGRADE_RELFILE_BATCH_CAP);
+	b->cap = UPGRADE_RELFILE_BATCH_CAP;
+	b->used = 0;
+	b->nentries = 0;
+	b->nrecords = 0;
+	b->nfiles = 0;
+}
+
+/*
+ * Add every chunk of one relation file segment to the batch, flushing full
+ * records as we go.  A missing or empty file is silently skipped.
+ */
+void
+XLogUpgradeRelfileBatchAddFile(UpgradeRelfileBatch *b, const char *path,
+							   Oid tsoid, Oid dboid, RelFileNumber rfnum,
+							   uint8 forknum, uint32 segno)
+{
+	struct stat stbuf;
+	int			fd;
+	Size		filesize;
+	Size		off;
+
+	if (stat(path, &stbuf) != 0)
+	{
+		if (errno == ENOENT)
+			return;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat \"%s\": %m", path)));
+	}
+	if (stbuf.st_size == 0)
+		return;
+
+	filesize = (Size) stbuf.st_size;
+
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open \"%s\": %m", path)));
+
+	for (off = 0; off < filesize; off += UPGRADE_RELFILE_MAX_CHUNK)
+	{
+		Size		chunk = Min(UPGRADE_RELFILE_MAX_CHUNK, filesize - off);
+		xl_upgrade_relfile_entry ent;
+		ssize_t		nread;
+
+		/* Start a fresh record if this entry would overflow the batch. */
+		if (b->used + SizeOfXLUpgradeRelfileEntry + chunk > b->cap)
+			XLogUpgradeRelfileBatchFlush(b);
+
+		/* zero the struct so its alignment padding is never uninitialized WAL */
+		memset(&ent, 0, sizeof(ent));
+		ent.tablespace_oid = tsoid;
+		ent.database_oid = dboid;
+		ent.relfilenumber = rfnum;
+		ent.forknum = forknum;
+		ent.segno = segno;
+		ent.blockoff = (uint32) (off / BLCKSZ);
+		ent.nbytes = (uint32) chunk;
+
+		memcpy(b->buf + b->used, &ent, SizeOfXLUpgradeRelfileEntry);
+		b->used += SizeOfXLUpgradeRelfileEntry;
+
+		nread = pg_pread(fd, b->buf + b->used, chunk, off);
+		if (nread != (ssize_t) chunk)
+		{
+			CloseTransientFile(fd);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read \"%s\": %m", path)));
+		}
+		b->used += chunk;
+		b->nentries++;
+	}
+
+	CloseTransientFile(fd);
+	b->nfiles++;
+}
+
+void
+XLogUpgradeRelfileBatchEnd(UpgradeRelfileBatch *b)
+{
+	XLogUpgradeRelfileBatchFlush(b);
+	pfree(b->buf);
+	b->buf = NULL;
+
+	ereport(LOG,
+			(errmsg("pg_upgrade captured %d relation files in %d WAL record(s)",
+					b->nfiles, b->nrecords)));
+}
+
+/*
+ * LEE: Emit XLOG_UPGRADE_RAWFILE — a verbatim image of a non-relation file
+ * (pg_filenode.map, PG_VERSION) so the cluster can be rebuilt from an empty
+ * data directory.  "path" is the PGDATA-relative path.  Returns the record LSN,
+ * or InvalidXLogRecPtr if the file is absent or empty.
+ */
+XLogRecPtr
+XLogWriteUpgradeRawFile(const char *path)
+{
+	xl_upgrade_rawfile xlrec;
+	struct stat stbuf;
+	int			fd;
+	char	   *buf;
+	ssize_t		nbytes;
+	uint32		path_len = (uint32) strlen(path);
+	XLogRecPtr	lsn;
+
+	if (stat(path, &stbuf) != 0)
+	{
+		if (errno == ENOENT)
+			return InvalidXLogRecPtr;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("XLogWriteUpgradeRawFile: could not stat \"%s\": %m", path)));
+	}
+
+	if (stbuf.st_size == 0)
+		return InvalidXLogRecPtr;
+
+	if ((Size) stbuf.st_size + path_len + SizeOfXLUpgradeRawfile > XLogRecordMaxSize)
+		ereport(ERROR,
+				(errmsg("XLogWriteUpgradeRawFile: file \"%s\" too large for a WAL record",
+						path)));
+
+	buf = palloc(stbuf.st_size);
+
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("XLogWriteUpgradeRawFile: could not open \"%s\": %m", path)));
+	nbytes = read(fd, buf, stbuf.st_size);
+	CloseTransientFile(fd);
+	if (nbytes != stbuf.st_size)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("XLogWriteUpgradeRawFile: could not read \"%s\": %m", path)));
+
+	xlrec.path_len = path_len;
+	xlrec.data_len = (uint32) nbytes;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfXLUpgradeRawfile);
+	XLogRegisterData(unconstify(char *, path), path_len);
+	XLogRegisterData(buf, nbytes);
+	lsn = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_RAWFILE);
+
+	pfree(buf);
+	return lsn;
+}
+
+/*
+ * LEE: Force all dirty SLRU (CLOG, multixact) pages to disk, bypassing the
+ * enableFsync flag.  pg_upgrade runs with fsync=off for performance, so
+ * SimpleLruWriteAll() + ProcessSyncRequests() skips the actual fsync calls.
+ * After stop_postmaster_immediate(), those dirty pages may remain only in
+ * the OS page cache.  Call this before pg_switch_wal() to ensure the
+ * committed transaction statuses are durable so crash recovery sees correct
+ * CLOG state without needing to replay the SLRU_DATA records.
+ */
+void
+XLogFlushUpgradeSLRU(void)
+{
+	/*
+	 * LEE: force a full checkpoint with fsync enabled to write and durably
+	 * sync all dirty SLRU pages (CLOG, multixact) to disk.
+	 *
+	 * The server runs with fsync=off so all previous checkpoint and SLRU
+	 * writes only reach the OS page cache.  We temporarily set enableFsync=true
+	 * so the checkpoint process calls fsync() on all pending sync requests.
+	 * CHECKPOINT_FORCE ensures it runs even if nothing appears dirty.
+	 * CHECKPOINT_IMMEDIATE makes it run right now rather than spreading it out.
+	 * CHECKPOINT_WAIT blocks until the checkpointer confirms completion.
+	 */
+	{
+		bool		save_enableFsync = enableFsync;
+
+		enableFsync = true;
+		RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST | CHECKPOINT_WAIT);
+		enableFsync = save_enableFsync;
+	}
+
+	/*
+	 * Fsync all SLRU segment files and their parent directories — this
+	 * catches evicted pages whose OS cache writes were not synced because
+	 * enableFsync=false at the time of eviction.  fsync_fname() handles
+	 * both regular files and directories safely.
+	 */
+	{
+		static const char *const slru_dirs[] = {
+			"pg_xact", "pg_multixact/offsets", "pg_multixact/members"
+		};
+		int			i;
+
+		for (i = 0; i < lengthof(slru_dirs); i++)
+		{
+			DIR		   *dir;
+			struct dirent *de;
+
+			dir = AllocateDir(slru_dirs[i]);
+			if (dir == NULL)
+				continue;
+
+			while ((de = ReadDir(dir, slru_dirs[i])) != NULL)
+			{
+				char		path[MAXPGPATH];
+
+				if (de->d_name[0] == '.')
+					continue;
+				/* SLRU segment names are short hex strings, not WAL names */
+				if (strlen(de->d_name) > 8)
+					continue;
+				if (strspn(de->d_name, "0123456789ABCDEFabcdef") != strlen(de->d_name))
+					continue;
+
+				snprintf(path, sizeof(path), "%s/%s",
+						 slru_dirs[i], de->d_name);
+
+				/* fsync_fname ignores enableFsync; forces actual kernel sync */
+				(void) fsync_fname(path, false);
+			}
+			FreeDir(dir);
+
+			/* also fsync the directory itself */
+			(void) fsync_fname(slru_dirs[i], true);
+		}
+	}
 }
 
 /*

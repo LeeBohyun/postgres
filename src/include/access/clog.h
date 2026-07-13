@@ -56,5 +56,7 @@ extern int	clogsyncfiletag(const FileTag *ftag, char *path);
 extern void clog_redo(XLogReaderState *record);
 extern void clog_desc(StringInfo buf, XLogReaderState *record);
 extern const char *clog_identify(uint8 info);
+/* LEE: restore captured CLOG segment during --wal-log-upgrade replay */
+extern void CLOGUpgradeRestoreSegment(int64 segno, const char *data, Size datalen);
 
 #endif							/* CLOG_H */

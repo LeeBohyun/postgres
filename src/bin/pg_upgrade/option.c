@@ -64,6 +64,8 @@ parseCommandLine(int argc, char *argv[])
 		{"set-char-signedness", required_argument, NULL, 6},
 		{"swap", no_argument, NULL, 7},
 		{"initdb", no_argument, NULL, 8},
+		/* LEE: capture the upgrade as WAL and reconstruct it on first startup */
+		{"wal-log-upgrade", no_argument, NULL, 9},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -239,6 +241,11 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.initdb_new_cluster = true;
 				break;
 
+			/* LEE: --wal-log-upgrade */
+			case 9:
+				user_opts.wal_log_upgrade = true;
+				break;
+
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 						os_info.progname);
@@ -333,6 +340,10 @@ usage(void)
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
 	printf(_("  --copy                        copy files to new cluster (default)\n"));
 	printf(_("  --copy-file-range             copy files to new cluster with copy_file_range\n"));
+	/* LEE: --wal-log-upgrade usage */
+	printf(_("  --wal-log-upgrade             capture the whole upgrade as WAL and reconstruct\n"
+			 "                                the cluster from it on first startup (atomic,\n"
+			 "                                crash-safe, WAL-replayable)\n"));
 	printf(_("  --initdb                      create the new cluster with initdb before\n"
 			 "                                upgrading (settings derived from old cluster)\n"));
 	printf(_("  --no-statistics               do not import statistics from old cluster\n"));

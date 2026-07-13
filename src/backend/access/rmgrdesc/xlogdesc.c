@@ -218,12 +218,19 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 	{
 		/* no further information to print */
 	}
+	/* LEE: upgrade records handled by pg_upgrade_desc() via RM_PG_UPGRADE_ID */
 }
 
 const char *
 xlog_identify(uint8 info)
 {
 	const char *id = NULL;
+
+	/*
+	 * LEE: check our new record types before masking, since 0xC0/0xC1/0xC2
+	 * all reduce to 0xC0 after applying ~XLR_INFO_MASK (0xF0).
+	 */
+	/* LEE: upgrade records handled by pg_upgrade_identify() via RM_PG_UPGRADE_ID */
 
 	switch (info & ~XLR_INFO_MASK)
 	{

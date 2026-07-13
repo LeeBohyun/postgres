@@ -17,6 +17,7 @@
 
 #include "access/transam.h"
 #include "access/xlogdefs.h"
+#include "common/relpath.h"		/* for RelFileNumber */
 #include "pgtime.h"				/* for pg_time_t */
 #include "port/pg_crc32c.h"
 
@@ -83,11 +84,154 @@ typedef struct CheckPoint
 #define XLOG_FPI						0xB0
 #define XLOG_ASSIGN_LSN					0xC0
 #define XLOG_OVERWRITE_CONTRECORD		0xD0
+
+/*
+ * LEE: pg_upgrade WAL record types in RM_PG_UPGRADE_ID.
+ * Using a dedicated rmgr gives us a clean 0x10-aligned namespace free from
+ * the XLR_RMGR_INFO_MASK = 0xF0 constraint that limits RM_XLOG_ID to one
+ * record type per 0x10 bucket.
+ */
+#define XLOG_PG_UPGRADE_START			0x00	/* upgrade window start marker */
+#define XLOG_PG_UPGRADE_COMPLETE		0x10	/* upgrade window complete marker */
+#define XLOG_UPGRADE_SLRU_DATA			0x20	/* bulk SLRU segment image */
+#define XLOG_UPGRADE_RELFILE_DATA		0x30	/* bulk relation file segment image */
+#define XLOG_UPGRADE_RAWFILE			0x50	/* verbatim non-relation file image
+												 * (pg_filenode.map, PG_VERSION) */
+#define XLOG_UPGRADE_DIRSKEL			0x40	/* logged after-image of the initdb
+												 * directory tree */
 #define XLOG_CHECKPOINT_REDO			0xE0
 #define XLOG_LOGICAL_DECODING_STATUS_CHANGE	0xF0
 
 /* XLOG info values for XLOG2 rmgr */
 #define XLOG2_CHECKSUMS					0x00
+
+/*
+ * LEE: WAL record written at the start and completion of pg_upgrade.
+ * Allows crash recovery and tooling (pg_waldump) to identify the upgrade
+ * window and verify atomicity.
+ *
+ * pg_version[] carries the new cluster's PG_MAJORVERSION string (e.g. "18")
+ * so that redo can write $PGDATA/PG_VERSION, which initdb created outside
+ * the server and is therefore not otherwise WAL-logged.
+ */
+typedef struct xl_pg_upgrade
+{
+	uint32		old_major_version;	/* old cluster PG_VERSION_NUM major */
+	uint32		new_major_version;	/* new cluster PG_VERSION_NUM major */
+	pg_time_t	upgrade_time;		/* wall-clock time of this record */
+	char		pg_version[8];		/* new cluster PG_MAJORVERSION, e.g. "18\n" */
+} xl_pg_upgrade;
+
+#define SizeOfXLPgUpgrade	sizeof(xl_pg_upgrade)
+
+/*
+ * LEE: XLOG_UPGRADE_SLRU_DATA — full page image of one SLRU segment, emitted
+ * by pg_upgrade before stop_postmaster() so SLRU content is WAL-replayable.
+ *
+ * slru_type identifies which SLRU directory the segment belongs to:
+ *   0 = pg_xact            (commit status)
+ *   1 = pg_multixact/offsets
+ *   2 = pg_multixact/members
+ *
+ * The record payload is this header followed by npages * BLCKSZ bytes of raw
+ * page data for the segment.  npages <= SLRU_PAGES_PER_SEGMENT (32).
+ * One record is emitted per segment file.
+ */
+typedef struct xl_upgrade_slru_data
+{
+	uint8		slru_type;		/* which SLRU: 0=pg_xact, 1=mxoff, 2=mxmem */
+	int64		first_seg;		/* first segment file number in this record */
+	int64		last_seg;		/* last segment file number in this record */
+	uint32		total_bytes;	/* total bytes of raw SLRU data that follow */
+	/* followed by total_bytes of raw segment file data (consecutive segments) */
+} xl_upgrade_slru_data;
+
+#define SizeOfXLUpgradeSlruData		offsetof(xl_upgrade_slru_data, total_bytes) + sizeof(uint32)
+
+/* slru_type values for xl_upgrade_slru_data */
+#define UPGRADE_SLRU_XACT		0
+#define UPGRADE_SLRU_MXOFF		1
+#define UPGRADE_SLRU_MXMEM		2
+
+/* directory paths corresponding to the slru_type values above */
+#define UPGRADE_SLRU_DIRS		{ "pg_xact", "pg_multixact/offsets", "pg_multixact/members" }
+
+/*
+ * LEE: XLOG_UPGRADE_RELFILE_DATA — full page images of relation files.
+ *
+ * To use WAL records at the coarsest granularity, one record BATCHES many
+ * relation-file chunks packed up to the 1020MB max WAL payload.  The record
+ * payload is a sequence of entries, each being an xl_upgrade_relfile_entry
+ * header immediately followed by its nbytes of raw page data:
+ *
+ *     [entry_0][data_0][entry_1][data_1] ... [entry_k][data_k]
+ *
+ * A relation-file segment larger than the payload cap is split into several
+ * page-aligned chunks (see blockoff), each its own entry, possibly across
+ * several records.  Redo walks the entries until the record data is consumed.
+ *
+ * ForkNumber: 0=main, 1=FSM, 2=VM, 3=init
+ */
+typedef struct xl_upgrade_relfile_entry
+{
+	Oid			tablespace_oid;		/* tablespace containing the file */
+	Oid			database_oid;		/* database OID (0 for shared relations) */
+	RelFileNumber relfilenumber;	/* relation file number */
+	uint8		forknum;			/* fork: 0=main, 1=FSM, 2=VM, 3=init */
+	uint32		segno;				/* 1GB segment number (0 = base segment) */
+	uint32		blockoff;			/* first block within the segment for this
+									 * chunk */
+	uint32		nbytes;				/* bytes of raw page data that follow */
+	/* followed by nbytes bytes of raw file data for this chunk */
+} xl_upgrade_relfile_entry;
+
+#define SizeOfXLUpgradeRelfileEntry		sizeof(xl_upgrade_relfile_entry)
+
+/*
+ * LEE: XLOG_UPGRADE_RAWFILE — verbatim image of a non-relation file that is
+ * not reachable through the buffer manager, so that the cluster can be rebuilt
+ * from an empty data directory (only the folder skeleton + pg_control need to
+ * pre-exist).  Currently used for pg_filenode.map (the relation-map that points
+ * catalog OIDs at their relfilenodes) and PG_VERSION files.
+ *
+ * Redo creates any missing parent directories and writes the file verbatim.
+ * The record payload is this header, then path_len bytes of the PGDATA-relative
+ * path (no trailing NUL), then data_len bytes of file contents.
+ */
+typedef struct xl_upgrade_rawfile
+{
+	uint32		path_len;		/* length of the PGDATA-relative path */
+	uint32		data_len;		/* length of the file contents that follow */
+	/* followed by path_len bytes of path, then data_len bytes of contents */
+} xl_upgrade_rawfile;
+
+#define SizeOfXLUpgradeRawfile	offsetof(xl_upgrade_rawfile, data_len) + sizeof(uint32)
+
+/*
+ * LEE: XLOG_UPGRADE_DIRSKEL — the logged "after-image" of the new cluster's
+ * directory tree as it exists once pg_upgrade --initdb has finished all its
+ * work (schema restore, file transfer, counter transplant).  initdb creates
+ * this tree outside the server, so it is not otherwise WAL-logged; capturing it
+ * as one record lets recovery rebuild the entire directory skeleton from WAL
+ * alone -- without relying on a surviving on-disk skeleton, and (for a standby)
+ * without the standby ever running initdb.
+ *
+ * Redo mkdir()s each path in order, idempotently (EEXIST is fine): on the
+ * primary's crash recovery the dirs were wiped and must be recreated; on a
+ * standby they largely already exist (it is a physical copy of the old cluster,
+ * whose DB OIDs pg_upgrade preserves) so most creations are no-ops.
+ *
+ * The payload is this header followed by ndirs NUL-terminated PGDATA-relative
+ * directory paths, emitted parent-before-child so a plain mkdir() suffices.
+ */
+typedef struct xl_upgrade_dirskel
+{
+	uint32		ndirs;			/* number of directory paths that follow */
+	uint32		total_bytes;	/* total bytes of path data that follow */
+	/* followed by ndirs NUL-terminated relative paths, total_bytes long */
+} xl_upgrade_dirskel;
+
+#define SizeOfXLUpgradeDirskel	offsetof(xl_upgrade_dirskel, total_bytes) + sizeof(uint32)
 
 
 /*

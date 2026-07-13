@@ -19,10 +19,12 @@
 #include <unistd.h>
 
 #include "access/htup_details.h"
+#include "access/pgupgrade_wal.h"	/* LEE: XLogFlushUpgradeSLRU, emit fns */
 #include "access/xlog_internal.h"
 #include "access/xlogbackup.h"
 #include "access/xlogrecovery.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_tablespace_d.h"	/* LEE: DEFAULTTABLESPACE_OID */
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -300,6 +302,318 @@ pg_create_restore_point(PG_FUNCTION_ARGS)
  * archiving process.  Note that the data before this point is written out
  * to the kernel, but is not necessarily synced to disk.
  */
+
+/*
+ * LEE: pg_write_pg_upgrade_start / pg_write_pg_upgrade_complete
+ *
+ * SQL-callable wrappers that write the pg_upgrade start/complete WAL markers.
+ * Called by pg_upgrade via psql just before and after the pg_restore phase.
+ * Restricted to superusers; only valid outside recovery.
+ *
+ * Arguments: old_major_version integer, new_major_version integer.
+ * Returns: LSN of the inserted WAL record.
+ */
+Datum
+pg_write_pg_upgrade_start(PG_FUNCTION_ARGS)
+{
+	uint32		old_major = PG_GETARG_UINT32(0);
+	uint32		new_major = PG_GETARG_UINT32(1);
+	XLogRecPtr	lsn;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to write pg_upgrade WAL markers")));
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("WAL control functions cannot be executed during recovery.")));
+
+
+	lsn = XLogWritePgUpgrade(true, old_major, new_major);
+	PG_RETURN_LSN(lsn);
+}
+
+Datum
+pg_write_pg_upgrade_complete(PG_FUNCTION_ARGS)
+{
+	uint32		old_major = PG_GETARG_UINT32(0);
+	uint32		new_major = PG_GETARG_UINT32(1);
+	XLogRecPtr	lsn;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to write pg_upgrade WAL markers")));
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("WAL control functions cannot be executed during recovery.")));
+
+
+	lsn = XLogWritePgUpgrade(false, old_major, new_major);
+	PG_RETURN_LSN(lsn);
+}
+
+/*
+ * LEE: pg_write_upgrade_slru_data(slru_type integer) → pg_lsn
+ *
+ * Emit XLOG_UPGRADE_SLRU_DATA records for all segment files in the given SLRU
+ * directory.  slru_type: 0=pg_xact, 1=pg_multixact/offsets, 2=pg_multixact/members.
+ * Called by pg_upgrade before stop_postmaster() so SLRU content is WAL-replayable.
+ * Restricted to superusers.
+ */
+Datum
+pg_write_upgrade_slru_data(PG_FUNCTION_ARGS)
+{
+	uint8		slru_type = (uint8) PG_GETARG_INT32(0);
+	XLogRecPtr	lsn;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to write pg_upgrade SLRU WAL data")));
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("WAL control functions cannot be executed during recovery.")));
+
+
+	if (slru_type > 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid slru_type %u (must be 0, 1, or 2)", slru_type)));
+
+	lsn = XLogWriteUpgradeSlruData(slru_type);
+
+	if (XLogRecPtrIsInvalid(lsn))
+		PG_RETURN_NULL();
+
+	PG_RETURN_LSN(lsn);
+}
+
+/*
+ * LEE: pg_write_upgrade_dirskel() → pg_lsn
+ *
+ * Emit one XLOG_UPGRADE_DIRSKEL record capturing the after-image of the new
+ * cluster's directory tree.  Called by pg_upgrade right after the START marker
+ * and before the file-image records, so replay recreates the directory skeleton
+ * from WAL before any relfile/SLRU image lands in it.  Restricted to superusers.
+ */
+Datum
+pg_write_upgrade_dirskel(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	lsn;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to write pg_upgrade directory WAL data")));
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("WAL control functions cannot be executed during recovery.")));
+
+	lsn = XLogWriteUpgradeDirSkel();
+
+	PG_RETURN_LSN(lsn);
+}
+
+/*
+ * LEE: parse a relation file name "<rfnum>[_fork][.segno]" into its parts.
+ * Returns true if it is a relation file, filling *rfnum, *forknum (0=main,
+ * 1=fsm, 2=vm, 3=init) and *segno.  Returns false for non-relation files
+ * (PG_VERSION, pg_filenode.map, pg_internal.init, etc.).
+ */
+static bool
+parse_relfile_name(const char *name, RelFileNumber *rfnum,
+				   uint8 *forknum, uint32 *segno)
+{
+	char		base[MAXPGPATH];
+	char	   *p;
+	unsigned long n;
+	char	   *endp;
+
+	if (name[0] < '1' || name[0] > '9')
+		return false;			/* relation files start with a nonzero digit */
+
+	strlcpy(base, name, sizeof(base));
+
+	*segno = 0;
+	p = strrchr(base, '.');
+	if (p != NULL && p[1] >= '0' && p[1] <= '9')
+	{
+		*segno = (uint32) strtoul(p + 1, NULL, 10);
+		*p = '\0';
+	}
+
+	*forknum = 0;
+	if ((p = strstr(base, "_vm")) != NULL && p[3] == '\0')
+	{
+		*forknum = 2;
+		*p = '\0';
+	}
+	else if ((p = strstr(base, "_fsm")) != NULL && p[4] == '\0')
+	{
+		*forknum = 1;
+		*p = '\0';
+	}
+	else if ((p = strstr(base, "_init")) != NULL && p[5] == '\0')
+	{
+		*forknum = 3;
+		*p = '\0';
+	}
+
+	errno = 0;
+	n = strtoul(base, &endp, 10);
+	if (errno != 0 || *endp != '\0' || n == 0 || n > PG_UINT32_MAX)
+		return false;
+	*rfnum = (RelFileNumber) n;
+	return true;
+}
+
+/*
+ * LEE: capture every file in one PGDATA subdirectory (base/<dboid> or global)
+ * as WAL.  Relation files -> XLOG_UPGRADE_RELFILE_DATA (replayed through the
+ * buffer manager); pg_filenode.map and PG_VERSION -> XLOG_UPGRADE_RAWFILE
+ * (written verbatim, since they are not buffered relations).  Everything else
+ * (pg_internal.init and friends) is regenerated by the server and skipped.
+ */
+static void
+capture_dir_files(UpgradeRelfileBatch *batch, const char *reldir,
+				  Oid tsoid, Oid dboid)
+{
+	DIR		   *dir;
+	struct dirent *de;
+	char		path[MAXPGPATH];
+
+	dir = AllocateDir(reldir);
+	if (dir == NULL)
+		return;
+
+	while ((de = ReadDir(dir, reldir)) != NULL)
+	{
+		RelFileNumber rfnum;
+		uint8		forknum;
+		uint32		segno;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+
+		snprintf(path, sizeof(path), "%s/%s", reldir, de->d_name);
+
+		if (parse_relfile_name(de->d_name, &rfnum, &forknum, &segno))
+			XLogUpgradeRelfileBatchAddFile(batch, path, tsoid, dboid, rfnum,
+										   forknum, segno);
+		else if (strcmp(de->d_name, "pg_filenode.map") == 0 ||
+				 strcmp(de->d_name, "PG_VERSION") == 0)
+			(void) XLogWriteUpgradeRawFile(path);
+		/* else: pg_internal.init, etc. — regenerated, skip */
+	}
+	FreeDir(dir);
+}
+
+/*
+ * LEE: pg_write_upgrade_relfile_data() → void
+ *
+ * Capture the FULL physical image of the cluster as WAL: every relation file
+ * under base/<dboid>/ and global/, plus the raw pg_filenode.map / PG_VERSION
+ * files, so that first-startup replay can reconstruct the cluster from an
+ * otherwise-empty data directory (just the folder skeleton + pg_control).
+ *
+ * Recovery is anchored at the end-of-upgrade checkpoint (CN), so pg_restore's
+ * own WAL is not replayed and cannot supply the catalogs — the images written
+ * here are the sole source.  A CHECKPOINT immediately precedes this call so the
+ * on-disk files we read are the authoritative, fully-flushed final state.
+ */
+Datum
+pg_write_upgrade_relfile_data(PG_FUNCTION_ARGS)
+{
+	UpgradeRelfileBatch batch;
+	DIR		   *basedir;
+	struct dirent *de;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to write pg_upgrade relfile WAL data")));
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress")));
+
+	XLogUpgradeRelfileBatchBegin(&batch);
+
+	/* Shared catalogs live in global/ (tablespace GLOBALTABLESPACE_OID, db 0). */
+	capture_dir_files(&batch, "global", GLOBALTABLESPACE_OID, InvalidOid);
+
+	/* Every database directory under base/. */
+	basedir = AllocateDir("base");
+	if (basedir != NULL)
+	{
+		while ((de = ReadDir(basedir, "base")) != NULL)
+		{
+			char		dbpath[MAXPGPATH];
+			char	   *endp;
+			unsigned long dboid;
+
+			if (de->d_name[0] < '1' || de->d_name[0] > '9')
+				continue;
+			errno = 0;
+			dboid = strtoul(de->d_name, &endp, 10);
+			if (errno != 0 || *endp != '\0')
+				continue;
+
+			snprintf(dbpath, sizeof(dbpath), "base/%s", de->d_name);
+			capture_dir_files(&batch, dbpath, DEFAULTTABLESPACE_OID,
+							  (Oid) dboid);
+		}
+		FreeDir(basedir);
+	}
+
+	/* Flush the last partial record of relation-file images. */
+	XLogUpgradeRelfileBatchEnd(&batch);
+
+	/* Top-level PG_VERSION (needed pre-recovery, but capture for completeness). */
+	(void) XLogWriteUpgradeRawFile("PG_VERSION");
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * LEE: pg_flush_upgrade_slru() → void
+ *
+ * Force all dirty SLRU (CLOG, multixact) pages to disk, bypassing enableFsync.
+ * Required for --wal-log-upgrade when the server runs with fsync=off: SLRU
+ * dirty pages would otherwise not be synced to disk before
+ * stop_postmaster_immediate(), leaving pg_xact with stale data.
+ */
+Datum
+pg_flush_upgrade_slru(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to flush upgrade SLRU")));
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress")));
+
+	XLogFlushUpgradeSLRU();
+	PG_RETURN_VOID();
+}
+
 Datum
 pg_current_wal_lsn(PG_FUNCTION_ARGS)
 {

@@ -1116,6 +1116,16 @@ clog_redo(XLogReaderState *record)
 }
 
 /*
+ * LEE: restore a captured pg_xact (CLOG) segment during --wal-log-upgrade
+ * replay.  Thin wrapper exposing XactCtl to the RM_PG_UPGRADE_ID redo handler.
+ */
+void
+CLOGUpgradeRestoreSegment(int64 segno, const char *data, Size datalen)
+{
+	SlruUpgradeRestoreSegment(XactCtl, segno, data, datalen);
+}
+
+/*
  * Entrypoint for sync.c to sync clog files.
  */
 int

@@ -1444,6 +1444,53 @@ SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied)
 }
 
 /*
+ * LEE: Restore one SLRU segment's worth of pages from a captured image during
+ * pg_upgrade --wal-log-upgrade WAL replay (XLOG_UPGRADE_SLRU_DATA redo).
+ *
+ * "segno" is the SLRU segment number; "data" is the raw segment image and
+ * "datalen" its length (a whole number of BLCKSZ pages, padded to a full
+ * segment by the emit side).  For each page we install the captured image into
+ * a SimpleLru buffer, mark it dirty, and flush it to disk immediately.
+ *
+ * The image is the final, merged CLOG/multixact state captured after the whole
+ * upgrade completed, so it is authoritative: it dominates anything an earlier
+ * replayed commit record wrote for the same page (our record is emitted last)
+ * and it does not depend on the on-disk SLRU segment file, which pg_upgrade has
+ * unlinked as part of "skipping the disk writes".
+ *
+ * The SLRU directory (ctl->Dir) is recreated earlier in replay by the
+ * XLOG_UPGRADE_DIRSKEL record (the logged after-image of the initdb directory
+ * tree), so it is guaranteed to exist by the time we write a segment here.
+ */
+void
+SlruUpgradeRestoreSegment(SlruDesc *ctl, int64 segno,
+						  const char *data, Size datalen)
+{
+	int			npages = (int) (datalen / BLCKSZ);
+	int64		basepage = segno * SLRU_PAGES_PER_SEGMENT;
+
+	for (int i = 0; i < npages; i++)
+	{
+		int64		pageno = basepage + i;
+		LWLock	   *lock = SimpleLruGetBankLock(ctl, pageno);
+		int			slotno;
+
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+
+		/* allocate/zero a buffer slot for this page, then overwrite it */
+		slotno = SimpleLruZeroPage(ctl, pageno);
+		memcpy(ctl->shared->page_buffer[slotno],
+			   data + (Size) i * BLCKSZ, BLCKSZ);
+		ctl->shared->page_dirty[slotno] = true;
+
+		/* persist immediately, mirroring clog_redo()'s CLOG_ZEROPAGE path */
+		SimpleLruWritePage(ctl, slotno);
+
+		LWLockRelease(lock);
+	}
+}
+
+/*
  * Remove all segments before the one holding the passed page number
  *
  * All SLRUs prevent concurrent calls to this function, either with an LWLock

@@ -19,6 +19,7 @@
  */
 #include "postgres.h"
 
+#include "access/pgupgrade_wal.h"	/* LEE: PerformWalUpgradeIfNeeded */
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -250,6 +251,14 @@ StartupProcessMain(const void *startup_data, size_t startup_data_len)
 	 * Unblock signals (they were blocked when the postmaster forked us)
 	 */
 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+
+	/*
+	 * LEE: if pg_wal_upgrade/ exists, copy its WAL segments into pg_wal/ and
+	 * let StartupXLOG() crash-recover from C0 (initdb checkpoint) through
+	 * XLOG_PG_UPGRADE_COMPLETE.  If pg_wal_upgrade/ exists but lacks COMPLETE
+	 * (crash mid-upgrade), FATALs with a re-run instruction.
+	 */
+	PerformWalUpgradeIfNeeded();
 
 	/*
 	 * Do what we came for.

@@ -201,7 +201,40 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	 * win on ext4.
 	 */
 	if (cluster == &new_cluster)
-		appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");
+	{
+		/*
+		 * Turn off durability requirements to improve object creation speed.
+		 * LEE: when --wal-log-upgrade is set, keep full_page_writes=on so
+		 * that the first write to each page after a checkpoint includes the
+		 * complete page image in WAL.  This ensures that after a smart
+		 * shutdown checkpoint, all catalog pages are correctly on disk even
+		 * with fsync=off — the checkpoint flushes complete page images.
+		 */
+		if (user_opts.wal_log_upgrade)
+		{
+			/* LEE: keep fsync=on and full_page_writes=on for durability */
+			appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off");
+
+			/*
+			 * LEE: the end-of-upgrade image WAL — from the CN checkpoint
+			 * through PG_UPGRADE_COMPLETE — must survive intact in pg_wal/ so
+			 * that first startup can crash-recover the whole upgrade.  A large
+			 * cluster generates gigabytes of WAL (the full-page images are as
+			 * large as the data), which would otherwise trigger checkpoints that
+			 * recycle those segments and leave gaps.
+			 *
+			 * Pin all WAL for the upgrade window: an effectively unbounded
+			 * wal_keep_size prevents any segment from being removed, and large
+			 * max_wal_size / checkpoint_timeout avoid needless checkpoint churn.
+			 */
+			appendPQExpBufferStr(&pgoptions,
+								 " -c wal_keep_size=1TB"
+								 " -c max_wal_size=1TB"
+								 " -c checkpoint_timeout=1h");
+		}
+		else
+			appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");
+	}
 
 	/*
 	 * Use -b to disable autovacuum and logical replication launcher
@@ -306,6 +339,34 @@ stop_postmaster(bool in_atexit)
 			  cluster->bindir, cluster->pgconfig,
 			  cluster->pgopts ? cluster->pgopts : "",
 			  in_atexit ? "-m fast" : "-m smart");
+
+	os_info.running_cluster = NULL;
+}
+
+/*
+ * LEE: stop_postmaster_immediate()
+ *
+ * Stop the postmaster with -m immediate (SIGQUIT) so that no shutdown
+ * checkpoint is written and no WAL segments are recycled.  Used by
+ * --wal-log-upgrade after writing XLOG_PG_UPGRADE_COMPLETE so the upgrade
+ * WAL stream remains intact for preservation in pg_wal_upgrade/.
+ */
+void
+stop_postmaster_immediate(void)
+{
+	ClusterInfo *cluster;
+
+	if (os_info.running_cluster == &old_cluster)
+		cluster = &old_cluster;
+	else if (os_info.running_cluster == &new_cluster)
+		cluster = &new_cluster;
+	else
+		return;
+
+	exec_prog(SERVER_STOP_LOG_FILE, NULL, true, true,
+			  "\"%s/pg_ctl\" -w -D \"%s\" -o \"%s\" -m immediate stop",
+			  cluster->bindir, cluster->pgconfig,
+			  cluster->pgopts ? cluster->pgopts : "");
 
 	os_info.running_cluster = NULL;
 }

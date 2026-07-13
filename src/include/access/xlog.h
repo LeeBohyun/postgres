@@ -273,6 +273,13 @@ extern WALAvailability GetWALAvailability(XLogRecPtr targetLSN);
 extern void XLogPutNextOid(Oid nextOid);
 extern XLogRecPtr XLogRestorePoint(const char *rpName);
 extern XLogRecPtr XLogAssignLSN(void);
+/* LEE: pg_upgrade WAL markers */
+extern XLogRecPtr XLogWritePgUpgrade(bool is_start,
+									 uint32 old_major_version,
+									 uint32 new_major_version);
+/* LEE: SLRU bulk image for pg_upgrade WAL replay */
+extern XLogRecPtr XLogWriteUpgradeSlruData(uint8 slru_type);
+/* LEE: batched relation-file images live in access/pgupgrade_wal.h */
 extern void UpdateFullPageWrites(void);
 extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p);
 extern XLogRecPtr GetRedoRecPtr(void);

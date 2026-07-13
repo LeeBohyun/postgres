@@ -760,6 +760,12 @@ output_completion_banner(char *deletion_script_file_name)
 		appendPQExpBufferChar(&user_specification, ' ');
 	}
 
+	/* LEE: report WAL generated during pg_restore (only for --wal-log-upgrade) */
+	if (user_opts.wal_log_upgrade)
+		pg_log(PG_REPORT,
+			   "WAL generated during schema restore: " UINT64_FORMAT " bytes",
+			   log_opts.pg_upgrade_wal_bytes);
+
 	pg_log(PG_REPORT,
 		   "Some statistics are not transferred by pg_upgrade.\n"
 		   "Once you start the new server, consider running these two commands:\n"

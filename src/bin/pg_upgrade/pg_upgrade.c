@@ -41,6 +41,7 @@
 
 #include "postgres_fe.h"
 
+#include <dirent.h>
 #include <time.h>
 
 #include "access/multixact.h"
@@ -71,9 +72,10 @@ static void set_frozenxids(void);
 static void make_outputdirs(char *pgdata);
 static void setup(char *argv0);
 static void resolve_new_bindir(const char *argv0);
-static void create_new_cluster_via_initdb(void);
+static void create_new_cluster_via_initdb(const char *argv0);
 static void create_logical_replication_slots(void);
 static void create_conflict_detection_slot(void);
+static void revert_wal_logged_disk_writes(void);
 
 ClusterInfo old_cluster,
 			new_cluster;
@@ -107,14 +109,16 @@ main(int argc, char **argv)
 	/* Set default restrictive mask until new cluster permissions are read */
 	umask(PG_MODE_MASK_OWNER);
 
+
 	parseCommandLine(argc, argv);
+
 
 	get_restricted_token();
 
 	adjust_data_dir(&old_cluster);
 
 	if (user_opts.initdb_new_cluster)
-		create_new_cluster_via_initdb();
+		create_new_cluster_via_initdb(argv[0]);
 
 	adjust_data_dir(&new_cluster);
 
@@ -145,6 +149,13 @@ main(int argc, char **argv)
 
 	check_cluster_compatibility();
 
+	/*
+	 * LEE: the --wal-log-upgrade recovery anchor (CN) is captured later, at the
+	 * end of the upgrade, from the checkpoint we take just before the full-page
+	 * image burst — not from the initdb checkpoint.  See the end-of-upgrade
+	 * block below.
+	 */
+
 	check_and_dump_old_cluster();
 
 
@@ -174,13 +185,47 @@ main(int argc, char **argv)
 
 	/* New now using xids of the old system */
 
-	/* -- NEW -- */
+	/*
+	 * LEE: the new cluster runs at wal_level=replica (initdb's default; we do
+	 * not lower it to minimal).  Recovery is anchored at the end-of-upgrade
+	 * checkpoint (CN) and never replays pg_restore's in-process WAL, so that
+	 * restore-phase WAL is throwaway.  The whole cluster is instead captured as
+	 * full-page images at the very end -- and because the server runs at
+	 * replica, those images (and the persisted pg_control) are at a level a
+	 * standby can recover from.  Verified: pg_controldata on a completed
+	 * --wal-log-upgrade cluster shows wal_level=replica.
+	 */
 	start_postmaster(&new_cluster, true);
 
 	prepare_new_globals();
 
+	/*
+	 * LEE: for --wal-log-upgrade we no longer emit any WAL markers here.  The
+	 * entire upgrade image (SLRU segments, relation files, and the
+	 * START/COMPLETE markers) is captured as full-page images at the very end,
+	 * after everything is on disk and a CHECKPOINT has
+	 * flushed all buffers.  See the end-of-upgrade block below.
+	 */
+
 	create_new_objects();
 
+	/*
+	 * LEE: write the matching XLOG_PG_UPGRADE_COMPLETE marker when
+	 * --wal-log-upgrade is set.
+	 */
+	/*
+	 * LEE: always stop the server before transferring relation files, exactly
+	 * as stock pg_upgrade does.  (The earlier --wal-log-upgrade variant kept
+	 * the server running through the transfer; that was wrong.  The transfer
+	 * overwrites the pg_restore-built relation files -- e.g. freshly-built
+	 * indexes -- with the old cluster's files by a raw copy/clone/link that
+	 * bypasses the buffer manager, so with the server up, pg_restore's stale
+	 * index pages would linger dirty in shared buffers and the capture-time
+	 * CHECKPOINT would flush them back over the transferred files, corrupting
+	 * the captured images -- GIN indexes were the visible symptom.  For
+	 * --wal-log-upgrade we restart with a clean buffer pool afterward, so the
+	 * capture reads exactly the transferred files.)
+	 */
 	stop_postmaster(false);
 
 	/*
@@ -198,10 +243,16 @@ main(int argc, char **argv)
 								 old_cluster.pgdata, new_cluster.pgdata);
 
 	/*
-	 * Assuming OIDs are only used in system tables, there is no need to
-	 * restore the OID counter because we have not transferred any OIDs from
-	 * the old system, but we do it anyway just in case.  We do it late here
-	 * because there is no need to have the schema load use new oids.
+	 * Set the new cluster's next OID.  This is the stock upstream step, run
+	 * with the server down.  pg_restore consumes OIDs, so it must happen after
+	 * the restore.  For --wal-log-upgrade it MUST also happen HERE, before the
+	 * end-of-upgrade checkpoint below, so that checkpoint (CN) records the
+	 * transplanted OID counter; recovery replays from CN and reproduces every
+	 * counter for free.  (Doing it afterward, as a separate pg_resetwal on the
+	 * already-sealed cluster, would be discarded on recovery, which
+	 * re-initializes the counters from the CN checkpoint record -- that was the
+	 * old --control-only design, and it left the new cluster's OID counter too
+	 * low, risking collisions with preserved OIDs.)
 	 */
 	prep_status("Setting next OID for new cluster");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
@@ -211,6 +262,134 @@ main(int argc, char **argv)
 	check_ok();
 
 	migrate_logical_slots = count_old_cluster_logical_slots();
+
+	if (user_opts.wal_log_upgrade)
+	{
+		PGconn	   *conn;
+
+		/*
+		 * Restart with a fresh buffer pool for the WAL capture phase.  The
+		 * server now reads the just-transplanted counters from pg_control, so
+		 * the checkpoint we take below captures them.
+		 */
+		start_postmaster(&new_cluster, true);
+		conn = connectToServer(&new_cluster, "template1");
+
+		/*
+		 * LEE: everything below is emitted AFTER all pg_upgrade work is
+		 * complete, so the upgrade's own WAL is generated as one atomic burst
+		 * at the end rather than interleaved with the restore.
+		 *
+		 * First force every dirty buffer and SLRU page to disk so the on-disk
+		 * images we are about to capture are the authoritative final state.
+		 * The CHECKPOINT flushes shared buffers; pg_flush_upgrade_slru() then
+		 * runs a forced checkpoint and fsyncs the SLRU segment files so the
+		 * committed transaction statuses are durable before we read them.
+		 */
+		PQclear(executeQueryOrDie(conn, "CHECKPOINT"));
+		PQclear(executeQueryOrDie(conn, "SELECT pg_flush_upgrade_slru()"));
+
+		/*
+		 * LEE: capture CN — the LSN of the checkpoint we just took.  This, not
+		 * the initdb checkpoint (C0), is the recovery anchor: replay starts here
+		 * and applies ONLY the end-of-upgrade full-page images that follow, so
+		 * it never re-runs pg_restore's CREATE DATABASE FILE_COPY records (which
+		 * would need the template databases on disk).  Anchoring at CN is what
+		 * lets the cluster be reconstructed from an empty data directory.
+		 */
+		{
+			PGresult   *cres = executeQueryOrDie(conn,
+												 "SELECT checkpoint_lsn, redo_lsn FROM pg_control_checkpoint()");
+
+			strlcpy(user_opts.upgrade_recovery_lsn, PQgetvalue(cres, 0, 0),
+					sizeof(user_opts.upgrade_recovery_lsn));
+			strlcpy(user_opts.upgrade_recovery_redo_lsn, PQgetvalue(cres, 0, 1),
+					sizeof(user_opts.upgrade_recovery_redo_lsn));
+			PQclear(cres);
+		}
+
+		/*
+		 * LEE: write the upgrade WAL as full-page images, all into the still-
+		 * running server so they land in pg_wal/:
+		 *  1. PG_UPGRADE_START (with PG_VERSION string)
+		 *  2. RELFILE records (FPI of every relation file)
+		 *  3. SLRU records   (FPI of pg_xact / pg_multixact segments)
+		 *  4. PG_UPGRADE_COMPLETE (terminal marker)
+		 *  5. pg_switch_wal() — seal the segment so all records are durable
+		 *
+		 * The XID/OID/multixact counters are NOT emitted as a separate record:
+		 * they were transplanted into pg_control before the CHECKPOINT above, so
+		 * the CN checkpoint record already carries them and recovery reproduces
+		 * them.
+		 */
+		PQclear(executeQueryOrDie(conn,
+								 "SELECT pg_write_pg_upgrade_start(%u, %u)",
+								 old_cluster.major_version,
+								 new_cluster.major_version));
+		/*
+		 * LEE: capture the directory-tree after-image immediately after START
+		 * and before any file image, so replay recreates the full initdb
+		 * directory skeleton (base, global, pg_xact, pg_multixact, and the
+		 * transient runtime dirs) before a relfile/SLRU image is written into
+		 * it.  This makes the skeleton part of the WAL, not something the
+		 * recovering server must find already on disk.
+		 */
+		PQclear(executeQueryOrDie(conn,
+								 "SELECT pg_write_upgrade_dirskel()"));
+		PQclear(executeQueryOrDie(conn,
+								 "SELECT pg_write_upgrade_relfile_data()"));
+		PQclear(executeQueryOrDie(conn,
+								 "SELECT pg_write_upgrade_slru_data(0)"));	/* pg_xact */
+		PQclear(executeQueryOrDie(conn,
+								 "SELECT pg_write_upgrade_slru_data(1)"));	/* pg_multixact/offsets */
+		PQclear(executeQueryOrDie(conn,
+								 "SELECT pg_write_upgrade_slru_data(2)"));	/* pg_multixact/members */
+		/*
+		 * LEE: test-only hook.  When PG_UPGRADE_TEST_SKIP_COMPLETE is set we omit
+		 * the COMPLETE marker to simulate a crash mid-upgrade; first startup must
+		 * then FATAL and leave the old cluster intact.  Never set in production.
+		 */
+		if (getenv("PG_UPGRADE_TEST_SKIP_COMPLETE") == NULL)
+			PQclear(executeQueryOrDie(conn,
+									 "SELECT pg_write_pg_upgrade_complete(%u, %u)",
+									 old_cluster.major_version,
+									 new_cluster.major_version));
+		PQclear(executeQueryOrDie(conn, "SELECT pg_switch_wal()"));
+		PQfinish(conn);
+
+		/*
+		 * LEE: immediate stop — no checkpoint, no WAL recycling.  All upgrade
+		 * WAL stays intact in pg_wal/.  The rename to pg_wal_upgrade/ and the
+		 * --upgrade-recovery pg_control rewrite happen at the very end, after
+		 * all other pg_resetwal calls (which require pg_wal/ to exist).
+		 */
+		stop_postmaster_immediate();
+
+		/*
+		 * LEE: skip the disk writes.  Every byte pg_upgrade transferred into
+		 * the new cluster (user relation files and the copied SLRU segments) is
+		 * now captured as full-page images in pg_wal/.  Revert those on-disk
+		 * files to an empty baseline so the persisted new cluster contains NONE
+		 * of the upgrade data on disk — only in WAL.  First startup must then
+		 * reconstruct the entire cluster purely from WAL replay, which is what
+		 * proves the upgrade is fully WAL-recoverable.
+		 */
+		revert_wal_logged_disk_writes();
+
+		/*
+		 * LEE: the transferred-files manifest has served its purpose (the emit
+		 * and revert phases read it).  Remove it so it does not linger in the
+		 * live cluster.
+		 */
+		{
+			char		manifest_path[MAXPGPATH];
+
+			snprintf(manifest_path, sizeof(manifest_path),
+					 "%s/pg_upgrade_transferred_files", new_cluster.pgdata);
+			unlink(manifest_path);
+		}
+	}
+	/* (the server was already stopped before the file transfer above) */
 
 	/*
 	 * Migrate replication slots to the new cluster.
@@ -261,7 +440,41 @@ main(int argc, char **argv)
 
 	create_script_for_old_cluster_deletion(&deletion_script_file_name);
 
-	issue_warnings_and_set_wal_level();
+	/*
+	 * LEE: for --wal-log-upgrade, the upgrade WAL in pg_wal/ must not be
+	 * recycled by a server restart.  issue_warnings_and_set_wal_level()
+	 * unconditionally starts/stops the server, which would checkpoint and
+	 * recycle that WAL — so we skip it here and instead preserve the WAL and
+	 * arm crash recovery from CN.  This is the atomic commit point: the whole
+	 * upgrade is applied at once on next startup, with no midway rollback.
+	 */
+	if (user_opts.wal_log_upgrade)
+	{
+		/*
+		 * LEE: arm crash recovery — set pg_control.checkPoint = CN (the
+		 * end-of-upgrade checkpoint) and state = DB_IN_PRODUCTION.  We pass both
+		 * the checkpoint record LSN and its redo LSN: for an online checkpoint
+		 * the redo precedes the record (with an XLOG_CHECKPOINT_REDO marker
+		 * there), and StartupXLOG uses pg_control.checkPointCopy.redo directly.
+		 * The upgrade WAL stays in pg_wal/; on next startup StartupXLOG()
+		 * crash-recovers from CN through PG_UPGRADE_COMPLETE, applying the whole
+		 * upgrade at once.  No rename is needed — the WAL content itself (the
+		 * START/COMPLETE records) is the signal.
+		 */
+		if (user_opts.upgrade_recovery_lsn[0])
+		{
+			prep_status("Setting pg_control for upgrade WAL recovery");
+			exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+					  "\"%s/pg_resetwal\" --upgrade-recovery=%s,%s \"%s\"",
+					  new_cluster.bindir,
+					  user_opts.upgrade_recovery_lsn,
+					  user_opts.upgrade_recovery_redo_lsn,
+					  new_cluster.pgdata);
+			check_ok();
+		}
+	}
+	else
+		issue_warnings_and_set_wal_level();
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -404,7 +617,7 @@ resolve_new_bindir(const char *argv0)
  * start; make_outputdirs() will replace log_opts.logdir later.
  */
 static void
-create_new_cluster_via_initdb(void)
+create_new_cluster_via_initdb(const char *argv0)
 {
 	DbLocaleInfo *locale;
 	PQExpBufferData cmd;
@@ -412,7 +625,8 @@ create_new_cluster_via_initdb(void)
 	char	   *saved_logdir = log_opts.logdir;
 	const char *encoding_name;
 
-	resolve_new_bindir(os_info.progname);
+	/* LEE: pass argv0 (full path) so find_my_exec can locate the binary */
+	resolve_new_bindir(argv0);
 
 	/*
 	 * Verify that initdb is present and executable before doing any work.
@@ -477,6 +691,7 @@ create_new_cluster_via_initdb(void)
 	encoding_name = pg_encoding_to_char(locale->db_encoding);
 
 	prep_status("Creating new cluster with initdb");
+
 
 	initPQExpBuffer(&cmd);
 	appendPQExpBuffer(&cmd, "\"%s/initdb\" -D \"%s\" -N",
@@ -753,6 +968,10 @@ create_new_objects(void)
 {
 	int			dbnum;
 	PGconn	   *conn_new_template1;
+	/* LEE: LSN snapshot before and after pg_restore to measure WAL generated */
+	PGresult   *lsn_res;
+	uint64		lsn_before = 0,
+				lsn_after = 0;
 
 	prep_status_progress("Restoring database schemas in the new cluster");
 
@@ -765,6 +984,21 @@ create_new_objects(void)
 	 */
 	conn_new_template1 = connectToServer(&new_cluster, "template1");
 	PQclear(executeQueryOrDie(conn_new_template1, "CHECKPOINT"));
+
+	/*
+	 * LEE: snapshot the WAL position before pg_restore so we can measure how
+	 * many bytes the schema restore generates.  Only for --wal-log-upgrade;
+	 * without it this whole measurement is skipped so the flow matches stock
+	 * pg_upgrade exactly.
+	 */
+	if (user_opts.wal_log_upgrade)
+	{
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_before = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+	}
+
 	PQfinish(conn_new_template1);
 
 	/*
@@ -870,6 +1104,26 @@ create_new_objects(void)
 	end_progress_output();
 	check_ok();
 
+	/*
+	 * LEE: measure WAL bytes generated by pg_restore for debugging.  We
+	 * reconnect briefly to read the current WAL position and compute the
+	 * delta since lsn_before.  Only for --wal-log-upgrade; skipped otherwise so
+	 * the flow matches stock pg_upgrade exactly.
+	 */
+	if (user_opts.wal_log_upgrade)
+	{
+		conn_new_template1 = connectToServer(&new_cluster, "template1");
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_after = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+		PQfinish(conn_new_template1);
+
+		log_opts.pg_upgrade_wal_bytes = lsn_after - lsn_before;
+		pg_log(PG_VERBOSE, "pg_upgrade_wal_bytes: " UINT64_FORMAT,
+			   log_opts.pg_upgrade_wal_bytes);
+	}
+
 	/* update new_cluster info now that we have objects in the databases */
 	get_db_rel_and_slot_infos(&new_cluster);
 }
@@ -928,6 +1182,14 @@ copy_xact_xlog_xid(void)
 	 */
 	copy_subdir_files("pg_xact", "pg_xact");
 
+	/*
+	 * LEE: these are the stock upstream pg_resetwal commands, identical for
+	 * --wal-log-upgrade.  We deliberately do NOT use --control-only: they run
+	 * before pg_restore, so the WAL they reset is throwaway, and for
+	 * --wal-log-upgrade the counter values they write are captured later by the
+	 * end-of-upgrade checkpoint (CN) that recovery replays from -- no separate
+	 * WAL record or WAL-preserving flag is needed.
+	 */
 	prep_status("Setting oldest XID for new cluster");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 			  "\"%s/pg_resetwal\" -f -u %u \"%s\"",
@@ -1019,7 +1281,11 @@ copy_xact_xlog_xid(void)
 		check_ok();
 	}
 
-	/* now reset the wal archives in the new cluster */
+	/*
+	 * Now reset the WAL archives in the new cluster.  This is the stock
+	 * pg_upgrade step and runs identically for --wal-log-upgrade: it happens
+	 * before pg_restore, so the WAL it resets is throwaway either way.
+	 */
 	prep_status("Resetting WAL archives");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 	/* use timeline 1 to match controldata and no WAL history file */
@@ -1131,6 +1397,140 @@ set_frozenxids(void)
 	PQclear(dbres);
 
 	PQfinish(conn_template1);
+
+	check_ok();
+}
+
+/*
+ * unlink every regular file in one directory (optionally keeping one name).
+ * Directories are left in place.  Returns the number of files removed.
+ */
+static int
+wipe_dir_files(const char *dirpath, const char *keep)
+{
+	DIR		   *dir;
+	struct dirent *de;
+	int			n = 0;
+
+	dir = opendir(dirpath);
+	if (dir == NULL)
+		return 0;
+	while ((de = readdir(dir)) != NULL)
+	{
+		char		path[MAXPGPATH];
+		struct stat st;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+		if (keep != NULL && strcmp(de->d_name, keep) == 0)
+			continue;
+
+		snprintf(path, sizeof(path), "%s/%s", dirpath, de->d_name);
+		if (lstat(path, &st) != 0)
+			continue;
+		if (!S_ISREG(st.st_mode))
+			continue;			/* leave subdirectories/symlinks alone */
+
+		if (unlink(path) == 0)
+			n++;
+		else if (errno != ENOENT)
+			pg_fatal("could not unlink \"%s\": %m", path);
+	}
+	closedir(dir);
+	return n;
+}
+
+/*
+ * revert_wal_logged_disk_writes()
+ *
+ * LEE: for --wal-log-upgrade, "skip the disk writes".  By the time this runs
+ * (server stopped via immediate stop, WAL sealed in pg_wal/) the ENTIRE
+ * physical image of the new cluster has been captured as full-page / raw-file
+ * images in the upgrade WAL:
+ *
+ *   - all relation files (user + system catalogs + global) -> RELFILE_DATA
+ *   - pg_filenode.map, PG_VERSION                           -> RAWFILE
+ *   - pg_xact / pg_multixact segments                       -> SLRU_DATA
+ *   - XID/OID/multixact counters                            -> the CN checkpoint
+ *
+ * We now wipe those files from disk, leaving only the directory skeleton, the
+ * top-level PG_VERSION, and global/pg_control (the entry point recovery needs
+ * before it can read any WAL).  The persisted new cluster therefore looks like
+ * a fresh, pre-initdb directory tree with empty folders; first startup rebuilds
+ * everything purely by replaying the upgrade WAL.  This is what makes the
+ * recovery verifiable end to end: if any image were missing, the data would
+ * come back wrong or the cluster would fail to start.
+ *
+ * Files are unlinked (not truncated) so --link mode does not destroy the old
+ * cluster's data via shared inodes; replay recreates each file from scratch.
+ *
+ * NOTE: removing the DIRECTORIES (base/<dboid>, the SLRU dirs) in addition to
+ * their files is NOT required for correctness -- replay would happily reuse
+ * directories left on disk.  We do it purely for TESTING: wiping the directory
+ * tree forces the XLOG_UPGRADE_DIRSKEL redo path to actually recreate every
+ * directory, proving it can rebuild the skeleton from WAL alone (the property a
+ * standby depends on).  If those rmdir()s were dropped, the upgrade would still
+ * be correct; the DIRSKEL replay would just become a no-op instead of being
+ * exercised.
+ */
+static void
+revert_wal_logged_disk_writes(void)
+{
+	char		path[MAXPGPATH];
+	DIR		   *basedir;
+	struct dirent *de;
+
+	prep_status("Skipping disk writes (wiping data files; only WAL remains)");
+
+	/* Shared catalogs + relmap in global/, but KEEP pg_control. */
+	snprintf(path, sizeof(path), "%s/global", new_cluster.pgdata);
+	wipe_dir_files(path, "pg_control");
+
+	/*
+	 * Every database directory under base/.  We remove the directory itself
+	 * too, not just its files -- but only to exercise the DIRSKEL redo path
+	 * (see the function header note); it is not needed for correctness, since
+	 * XLOG_UPGRADE_DIRSKEL redo recreates base/<dboid> on replay anyway.
+	 */
+	snprintf(path, sizeof(path), "%s/base", new_cluster.pgdata);
+	basedir = opendir(path);
+	if (basedir != NULL)
+	{
+		while ((de = readdir(basedir)) != NULL)
+		{
+			if (de->d_name[0] < '1' || de->d_name[0] > '9')
+				continue;
+			snprintf(path, sizeof(path), "%s/base/%s",
+					 new_cluster.pgdata, de->d_name);
+			wipe_dir_files(path, NULL);
+			if (rmdir(path) != 0 && errno != ENOENT)
+				pg_fatal("could not remove directory \"%s\": %m", path);
+		}
+		closedir(basedir);
+	}
+
+	/*
+	 * SLRU segments (pg_xact, pg_multixact) — captured as SLRU_DATA.  As with
+	 * base/ above, removing the directories (not just their files) is a
+	 * testing measure only (see the function header note): DIRSKEL redo
+	 * recreates them before the SLRU images replay.  Order matters: leaf dirs
+	 * before the pg_multixact parent.
+	 */
+	{
+		static const char *const slru_dirs[] = {
+			"pg_xact", "pg_multixact/offsets", "pg_multixact/members",
+			"pg_multixact"
+		};
+
+		for (int d = 0; d < (int) lengthof(slru_dirs); d++)
+		{
+			snprintf(path, sizeof(path), "%s/%s",
+					 new_cluster.pgdata, slru_dirs[d]);
+			wipe_dir_files(path, NULL);
+			if (rmdir(path) != 0 && errno != ENOENT)
+				pg_fatal("could not remove directory \"%s\": %m", path);
+		}
+	}
 
 	check_ok();
 }

@@ -96,3 +96,179 @@ An important feature of the pg_upgrade design is that it leaves the
 original cluster intact --- if a problem occurs during the upgrade, you
 can still run the previous version, after renaming the tablespaces back
 to the original names.
+
+------------------------------------------------------------------------------
+LEE: --initdb OPTION
+------------------------------------------------------------------------------
+
+Normally pg_upgrade requires the user to create the new cluster manually
+with initdb before running pg_upgrade.  The --initdb option automates
+this step: pg_upgrade runs initdb on the new data directory, propagating
+the locale, encoding, WAL segment size, and checksum settings from the
+old cluster so the two clusters are compatible.
+
+The --initdb option uses pg_controldata output from the old cluster to
+derive the correct initdb parameters.  Specifically it mirrors:
+
+  --encoding          (from the old cluster's template0 database)
+  --locale-provider   (builtin, libc, or icu)
+  --builtin-locale / --icu-locale / --locale  (from the old cluster)
+  --lc-collate, --lc-ctype
+  --wal-segsize       (from the old cluster's WAL segment size)
+  --data-checksums    (if the old cluster uses checksums)
+  --char-signedness   (if the old and new versions differ on the default)
+
+Without --initdb the new cluster must already exist in the directory
+named by -D / --new-datadir before pg_upgrade is invoked.
+
+------------------------------------------------------------------------------
+LEE: --wal-log-upgrade OPTION
+------------------------------------------------------------------------------
+
+By default pg_upgrade physically transfers user relation files and copies
+the old cluster's SLRU (pg_xact, pg_multixact) into the new cluster, none
+of which is WAL-logged, and then destroys the restore WAL with pg_resetwal.
+The upgrade is therefore not crash-safe and cannot be replayed.
+
+--wal-log-upgrade makes the whole upgrade atomic and WAL-replayable, and
+"skips the disk writes" so that recovery is genuinely verifiable: every
+byte the upgrade would have written to the new cluster's data files is
+instead captured as full-page images in WAL, the on-disk copies are then
+reverted to an empty baseline, and first startup reconstructs the entire
+cluster purely from WAL.  If any image were missing the data would come
+back wrong, so a correct startup proves the WAL is self-sufficient.
+
+GENERATE ALL UPGRADE WAL AT THE END
+-----------------------------------
+
+The upgrade server runs at wal_level=replica (initdb's default; not lowered to
+minimal).  Only after ALL pg_upgrade work is complete (schema restore, file
+transfer, counter transplant) does pg_upgrade, with the server still running,
+generate its own WAL as one atomic burst (pg_upgrade.c).  Running at replica
+means the burst -- and the persisted pg_control -- are at a level a standby can
+recover from:
+
+  1. CHECKPOINT + pg_flush_upgrade_slru()  -- flush every dirty buffer and
+     SLRU page so the on-disk images are the authoritative final state
+  2. pg_write_pg_upgrade_start()           -- XLOG_PG_UPGRADE_START marker
+  3. pg_write_upgrade_dirskel()            -- XLOG_UPGRADE_DIRSKEL: after-image
+     of the initdb directory tree (so replay recreates the skeleton)
+  4. pg_write_upgrade_relfile_data()       -- FPI of every relation file
+  5. pg_write_upgrade_slru_data(0/1/2)     -- FPI of pg_xact and pg_multixact
+  6. pg_write_pg_upgrade_complete()        -- XLOG_PG_UPGRADE_COMPLETE marker
+  7. pg_switch_wal()                       -- seal the segment
+
+The XID/OID/multixact counters are NOT a WAL record.  They are transplanted
+into pg_control with stock pg_resetwal BEFORE the CHECKPOINT above (which is
+why the server is restarted just before it), so the CN checkpoint record
+already carries them and recovery reproduces every counter for free.  This is
+exactly what stock pg_upgrade ends up with -- verified: the OID/XID/multixact
+counters after a --wal-log-upgrade match a normal pg_upgrade of the same data
+bit for bit.
+
+Emitting at the end (after all transactions have committed and been
+checkpointed) is what keeps MVCC visibility correct: the captured SLRU
+image is the final, merged commit state, so replaying it can never make a
+committed transaction look in-progress.
+
+Records are emitted at the coarsest granularity that fits a WAL record
+(XLogRecordMaxSize = 1020 MB).  SLRU segments are packed several to a
+record; a relation-file segment larger than the limit (a full 1 GB segment
+is 1024 MB) is split into page-aligned chunks, each carrying its starting
+block offset within the segment.
+
+RECOVERY ANCHOR: THE END-OF-UPGRADE CHECKPOINT (CN), NOT C0
+-----------------------------------------------------------
+
+Recovery is anchored at CN -- the checkpoint taken at step 1 above, right
+before the image burst -- NOT at the initdb checkpoint (C0).  Replay therefore
+starts after all of pg_restore's work and applies ONLY the end-of-upgrade
+images; it never re-runs pg_restore's WAL.  This matters because pg_restore
+creates databases with the CREATE DATABASE FILE_COPY strategy, whose redo
+copies the template databases' files from disk -- which would be impossible
+once those files are wiped.
+
+CN is an online checkpoint, so its redo pointer precedes the checkpoint record
+(PostgreSQL writes an XLOG_CHECKPOINT_REDO marker there).  pg_upgrade captures
+both LSNs from pg_control_checkpoint() and passes them to
+pg_resetwal --upgrade-recovery=CN,REDO, which sets pg_control.checkPoint = CN
+and checkPointCopy.redo = REDO so StartupXLOG() replays from the right point.
+
+SKIP THE DISK WRITES (WIPE THE WHOLE IMAGE)
+-------------------------------------------
+
+After stop_postmaster_immediate() (no shutdown checkpoint, WAL intact),
+revert_wal_logged_disk_writes() wipes the ENTIRE on-disk data image, since it
+is all captured in WAL now:
+
+  - every file in each base/<dboid>/ directory
+  - every file in global/ EXCEPT pg_control
+  - all pg_xact / pg_multixact segments
+
+Files are unlinked (not truncated) so --link mode does not destroy the old
+cluster's data through shared inodes.  What remains on disk is only the empty
+directory skeleton, global/pg_control (the entry point recovery needs before
+it can read any WAL), and the top-level PG_VERSION (checked by the postmaster
+before recovery starts).  The persisted new cluster thus looks like a fresh,
+pre-initdb directory tree with empty folders.
+
+RETAIN AND ARM THE WAL
+----------------------
+
+The upgrade server runs with wal_keep_size / max_wal_size pinned very high
+(server.c) so that no checkpoint recycles any segment of the image burst
+before it is preserved (the images are as large as the data itself).  The
+counter-transplant pg_resetwal calls are the plain upstream ones (they run
+before the image burst, so the WAL they reset is throwaway either way -- no
+--control-only, no separate handling).  Finally pg_resetwal
+--upgrade-recovery=CN,REDO arms crash recovery.
+
+The upgrade WAL simply STAYS in pg_wal/ -- there is no rename to a side
+directory.  The START/COMPLETE records in the WAL are themselves the signal
+that an upgrade is pending, and pg_control (checkPoint = CN, DB_IN_PRODUCTION)
+drives normal crash recovery.  Keeping the WAL in pg_wal/ is also what lets a
+physical standby receive the same records in its WAL stream.
+
+REPLAY ON FIRST STARTUP
+-----------------------
+
+PerformWalUpgradeIfNeeded() (pgupgrade_wal.c, before StartupXLOG) scans pg_wal/
+for the pg_upgrade markers:
+
+  - START + COMPLETE   -> arm the bootstrap; StartupXLOG() crash-recovers from
+                          CN through COMPLETE (the whole window applies atomically)
+  - START, no COMPLETE -> FATAL "re-run pg_upgrade" (crash mid-upgrade; the old
+                          cluster is intact -- a partial window is NEVER applied)
+  - no START           -> normal startup
+
+The atomicity guarantee is exactly this: the upgrade is applied only once a
+genuine COMPLETE marker is confirmed present; otherwise nothing is applied.
+
+Redo rebuilds every wiped file:
+
+  - XLOG_UPGRADE_DIRSKEL      -> recreates the initdb directory skeleton (the
+    logged after-image), so base/<dboid>, the SLRU dirs, etc. exist before any
+    file image is replayed into them -- the tree comes from WAL, not from a
+    surviving on-disk skeleton
+  - XLOG_UPGRADE_RELFILE_DATA -> applied THROUGH the buffer manager, which
+    creates the file and its database directory on demand (smgrcreate) and
+    stamps the page with the record's LSN so it is flushed by the
+    end-of-recovery checkpoint
+  - XLOG_UPGRADE_RAWFILE      -> pg_filenode.map and PG_VERSION written
+    verbatim (creating parent dirs); these are not buffered relations, so
+    they are the only way to rebuild the relation map from empty folders
+  - XLOG_UPGRADE_SLRU_DATA    -> installed into the SimpleLru buffers and
+    flushed (SlruUpgradeRestoreSegment); the image is emitted last and is the
+    final merged CLOG/multixact state, so it is authoritative and is the only
+    source of the old cluster's historical commit bits
+
+The XID/OID/multixact counters need no redo: recovery initializes them from
+the CN checkpoint record, which already carries the transplanted values.
+
+The result: from just the folder skeleton + pg_control + PG_VERSION + the WAL,
+first startup reconstructs the complete upgraded cluster.
+
+WAL BYTES COUNTER
+
+pg_upgrade also measures the WAL generated during schema restore via the
+pg_upgrade_wal_bytes counter (LogOpts), emitted at PG_VERBOSE level.

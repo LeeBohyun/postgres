@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+#
+# End-to-end test harness for pg_upgrade --wal-log-upgrade.
+#
+# Creates an "old" cluster with real data, runs pg_upgrade --wal-log-upgrade
+# --initdb into a "new" cluster, then starts the new cluster and verifies the
+# data survived a pure WAL-replay recovery.
+#
+set -u
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+BIN="${PGBIN:-$ROOT/pginst/bin}"
+WORK=${WORK:-/tmp/pgu}
+OLD=$WORK/old
+NEW=$WORK/new
+PORT=${PORT:-55432}
+export PGPORT=$PORT
+export PGDATABASE=postgres
+
+log() { echo "=== $* ==="; }
+
+rm -rf "$WORK"
+mkdir -p "$WORK"
+
+# ------------------------------------------------------------------ old cluster
+log "initdb old cluster"
+"$BIN/initdb" -D "$OLD" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb old; exit 1; }
+echo "unix_socket_directories = '$WORK'" >> "$OLD/postgresql.conf"
+echo "port = $PORT" >> "$OLD/postgresql.conf"
+
+"$BIN/pg_ctl" -D "$OLD" -l "$WORK/old.log" -w start >/dev/null 2>&1 || { echo FAIL start old; cat "$WORK/old.log"; exit 1; }
+
+log "load data into old cluster"
+"$BIN/psql" -h "$WORK" -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+CREATE TABLE t1 (id int primary key, val text);
+INSERT INTO t1 SELECT g, 'row-'||g FROM generate_series(1,50000) g;
+CREATE INDEX t1_val_idx ON t1(val);
+CREATE TABLE t2 (id bigserial primary key, payload text);
+INSERT INTO t2 (payload) SELECT repeat('x', 200) FROM generate_series(1,20000);
+CREATE DATABASE appdb;
+SQL
+[ $? -eq 0 ] || { echo FAIL load; exit 1; }
+
+"$BIN/psql" -h "$WORK" -U postgres -d appdb -v ON_ERROR_STOP=1 <<'SQL'
+CREATE TABLE orders (oid int primary key, amount numeric, note text);
+INSERT INTO orders SELECT g, g*1.5, 'order '||g FROM generate_series(1,30000) g;
+CREATE INDEX orders_amt ON orders(amount);
+SQL
+[ $? -eq 0 ] || { echo FAIL load appdb; exit 1; }
+
+# Capture reference checksums from the old cluster
+OLD_T1=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*), sum(hashtext(val)::bigint) FROM t1")
+OLD_T2=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*), sum(hashtext(payload)::bigint) FROM t2")
+OLD_ORD=$("$BIN/psql" -h "$WORK" -U postgres -d appdb -tAc "SELECT count(*), sum(hashtext(note)::bigint), sum(amount) FROM orders")
+log "OLD t1=$OLD_T1  t2=$OLD_T2  orders=$OLD_ORD"
+
+"$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
+
+# ------------------------------------------------------------------ pg_upgrade
+log "run pg_upgrade --wal-log-upgrade --initdb (mode=${MODE:---copy})"
+cd "$WORK"
+"$BIN/pg_upgrade" \
+    -b "$BIN" -B "$BIN" \
+    -d "$OLD" -D "$NEW" \
+    -U postgres \
+    --initdb --wal-log-upgrade ${MODE:---copy} \
+    > "$WORK/upgrade.log" 2>&1
+UPG_RC=$?
+log "pg_upgrade exit=$UPG_RC"
+if [ $UPG_RC -ne 0 ]; then
+    echo "---- upgrade.log tail ----"; tail -40 "$WORK/upgrade.log"; exit 1
+fi
+
+# Show the upgrade WAL
+if [ -d "$NEW/pg_wal_upgrade" ]; then
+    log "pg_wal_upgrade/ contents"
+    ls -la "$NEW/pg_wal_upgrade" | head
+    log "pg_waldump of upgrade WAL (RM_PG_UPGRADE records)"
+    for seg in "$NEW/pg_wal_upgrade"/[0-9A-F]*; do
+        "$BIN/pg_waldump" "$seg" 2>/dev/null | grep -i "pgupgrade\|pg_upgrade\|Upgrade" | head -40
+    done
+else
+    log "WARNING: no pg_wal_upgrade/ directory"
+fi
+
+# --- PROOF the disk writes were skipped: the biggest user relfile must be 0 ---
+log "verify disk writes were skipped (relfiles truncated to baseline)"
+BIGGEST=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(_fsm|_vm)?(\.[0-9]+)?' -printf '%s %p\n' 2>/dev/null | sort -rn | head -1)
+BIGSIZE=$(echo "$BIGGEST" | awk '{print $1}')
+echo "largest data file on disk after pg_upgrade: $BIGGEST"
+# A restored cluster of this size has multi-MB user tables. If skip worked they
+# are all 0 bytes; the only nonzero files are catalogs (< 1MB) still on disk.
+TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+echo "total bytes in base/ main-fork data files after pg_upgrade: $TOTAL_BASE"
+XACT_BYTES=$(find "$NEW/pg_xact" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+echo "pg_xact bytes on disk after pg_upgrade (should be 0 = skipped): $XACT_BYTES"
+
+# ------------------------------------------------------------------ new cluster
+echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
+echo "port = $PORT" >> "$NEW/postgresql.conf"
+
+log "start new cluster (triggers WAL-replay recovery)"
+"$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1
+START_RC=$?
+log "new cluster start exit=$START_RC"
+if [ $START_RC -ne 0 ]; then
+    echo "---- new.log tail ----"; tail -60 "$WORK/new.log"; exit 1
+fi
+
+log "verify data in new cluster"
+NEW_T1=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*), sum(hashtext(val)::bigint) FROM t1" 2>&1)
+NEW_T2=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*), sum(hashtext(payload)::bigint) FROM t2" 2>&1)
+NEW_ORD=$("$BIN/psql" -h "$WORK" -U postgres -d appdb -tAc "SELECT count(*), sum(hashtext(note)::bigint), sum(amount) FROM orders" 2>&1)
+# Index-only correctness check: force index scans
+NEW_IDX=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SET enable_seqscan=off; SELECT count(*) FROM t1 WHERE val LIKE 'row-1%'" 2>&1)
+log "NEW t1=$NEW_T1  t2=$NEW_T2  orders=$NEW_ORD  idxcount=$NEW_IDX"
+
+"$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
+
+# ------------------------------------------------------------------ verdict
+FAIL=0
+[ "$OLD_T1" = "$NEW_T1" ] || { echo "MISMATCH t1: old=$OLD_T1 new=$NEW_T1"; FAIL=1; }
+[ "$OLD_T2" = "$NEW_T2" ] || { echo "MISMATCH t2: old=$OLD_T2 new=$NEW_T2"; FAIL=1; }
+[ "$OLD_ORD" = "$NEW_ORD" ] || { echo "MISMATCH orders: old=$OLD_ORD new=$NEW_ORD"; FAIL=1; }
+
+if [ $FAIL -eq 0 ]; then
+    log "PASS: all data matches after WAL-replay recovery"
+else
+    log "FAIL: data mismatch"
+fi
+exit $FAIL

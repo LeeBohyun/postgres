@@ -306,6 +306,8 @@ typedef struct
 	char	   *dumpdir;		/* Dumps */
 	char	   *logdir;			/* Log files */
 	bool		isatty;			/* is stdout a tty */
+	/* LEE: WAL bytes generated during pg_restore (schema restore phase) */
+	uint64		pg_upgrade_wal_bytes;
 } LogOpts;
 
 
@@ -328,6 +330,18 @@ typedef struct
 	bool		initdb_new_cluster; /* run initdb to create the new cluster
 									 * before upgrading, instead of requiring
 									 * the user to have created it manually */
+	/* LEE: capture the whole upgrade as a WAL-replayable full-page image at the
+	 * end and skip the on-disk data writes, so first startup reconstructs the
+	 * cluster purely from WAL (atomic, crash-safe, recoverable from an empty
+	 * data directory) */
+	bool		wal_log_upgrade;
+	/* LEE: recovery anchor for --upgrade-recovery.  This is CN: the LSN of the
+	 * checkpoint taken at the end of the upgrade, right before the full-page
+	 * image burst.  Replay starts here and applies only the end-of-upgrade
+	 * images, so it never re-runs pg_restore's FILE_COPY.  For an online
+	 * checkpoint the redo point precedes the record, so we carry both. */
+	char		upgrade_recovery_lsn[32];		/* checkpoint record LSN (CN) */
+	char		upgrade_recovery_redo_lsn[32];	/* CN's redo LSN */
 } UserOpts;
 
 typedef struct
@@ -458,6 +472,9 @@ char	   *cluster_conn_opts(ClusterInfo *cluster);
 
 bool		start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error);
 void		stop_postmaster(bool in_atexit);
+/* LEE: immediate stop (no checkpoint) for --wal-log-upgrade WAL preservation */
+void		stop_postmaster_immediate(void);
+uint32		get_major_server_version(ClusterInfo *cluster);
 void		check_pghost_envvar(void);
 
 

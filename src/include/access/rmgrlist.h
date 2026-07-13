@@ -48,3 +48,5 @@ PG_RMGR(RM_REPLORIGIN_ID, "ReplicationOrigin", replorigin_redo, replorigin_desc,
 PG_RMGR(RM_GENERIC_ID, "Generic", generic_redo, generic_desc, generic_identify, NULL, NULL, generic_mask, NULL)
 PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, logicalmsg_identify, NULL, NULL, NULL, logicalmsg_decode)
 PG_RMGR(RM_XLOG2_ID, "XLOG2", xlog2_redo, xlog2_desc, xlog2_identify, NULL, NULL, NULL, xlog2_decode)
+/* LEE: dedicated resource manager for all pg_upgrade WAL records */
+PG_RMGR(RM_PG_UPGRADE_ID, "PgUpgrade", pg_upgrade_redo, pg_upgrade_desc, pg_upgrade_identify, NULL, NULL, NULL, NULL)

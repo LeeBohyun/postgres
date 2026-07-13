@@ -19,6 +19,9 @@
 
 static void transfer_single_new_db(FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace);
 static void transfer_relfile(FileNameMap *map, const char *type_suffix);
+/* LEE: record transferred user relation files for --wal-log-upgrade manifest */
+static void record_transferred_relfile(Oid db_oid, RelFileNumber relfilenumber,
+									   const char *type_suffix, int segno);
 
 /*
  * The following set of sync_queue_* functions are used for --swap to reduce
@@ -125,6 +128,19 @@ transfer_all_new_tablespaces(DbInfoArr *old_db_arr, DbInfoArr *new_db_arr,
 		case TRANSFER_MODE_SWAP:
 			prep_status_progress("Swapping data directories");
 			break;
+	}
+
+	/*
+	 * LEE: start the --wal-log-upgrade transferred-files manifest fresh.
+	 * transfer_relfile() appends to it; the WAL emit phase reads it.
+	 */
+	if (user_opts.wal_log_upgrade)
+	{
+		char		manifest_path[MAXPGPATH];
+
+		snprintf(manifest_path, sizeof(manifest_path),
+				 "%s/pg_upgrade_transferred_files", new_pgdata);
+		unlink(manifest_path);
 	}
 
 	/*
@@ -431,6 +447,64 @@ swap_catalog_files(FileNameMap *maps, int size, const char *old_catalog_dir,
 		pg_fatal("could not synchronize directory \"%s\": %m", new_db_dir);
 	if (fsync_parent_path(new_db_dir) != 0)
 		pg_fatal("could not synchronize parent directory of \"%s\": %m", new_db_dir);
+
+	/*
+	 * LEE: for --wal-log-upgrade, --swap does NOT go through transfer_relfile(),
+	 * so record the user relation files here into the transferred-files
+	 * manifest.  After the swap, new_db_dir holds the old cluster's user
+	 * relation files (every file whose relfilenumber IS in maps); catalog files
+	 * were moved out to old_catalog_dir.  We record exactly those user files
+	 * (all forks and segments) so pg_write_upgrade_relfile_data() captures them.
+	 */
+	if (user_opts.wal_log_upgrade && size > 0)
+	{
+		Oid			db_oid = maps[0].db_oid;
+
+		dir = opendir(new_db_dir);
+		if (dir == NULL)
+			pg_fatal("could not open directory \"%s\": %m", new_db_dir);
+		while (errno = 0, (de = readdir(dir)) != NULL)
+		{
+			char		basename[MAXPGPATH];
+			char	   *p;
+			int			segno = 0;
+			const char *type_suffix = "";
+			FileNameMap key;
+
+			snprintf(path, sizeof(path), "%s/%s", new_db_dir, de->d_name);
+			if (get_dirent_type(path, de, false, PG_LOG_ERROR) != PGFILETYPE_REG)
+				continue;
+
+			/* Only user relations (relfilenumber present in maps). */
+			rfn = parse_relfilenumber(de->d_name);
+			if (!RelFileNumberIsValid(rfn))
+				continue;
+			key.relfilenumber = rfn;
+			if (!bsearch(&key, maps, size, sizeof(FileNameMap), FileNameMapCmp))
+				continue;		/* catalog file, skip */
+
+			/* Parse "<rfn>[_fork][.segno]" into fork suffix + segment number. */
+			strlcpy(basename, de->d_name, sizeof(basename));
+
+			p = strrchr(basename, '.');
+			if (p != NULL && p[1] >= '0' && p[1] <= '9')
+			{
+				segno = atoi(p + 1);
+				*p = '\0';
+			}
+
+			if ((p = strstr(basename, "_fsm")) != NULL && p[4] == '\0')
+				type_suffix = "_fsm";
+			else if ((p = strstr(basename, "_vm")) != NULL && p[3] == '\0')
+				type_suffix = "_vm";
+			/* main fork ("") and unknown forks fall through */
+
+			record_transferred_relfile(db_oid, rfn, type_suffix, segno);
+		}
+		if (errno)
+			pg_fatal("could not read directory \"%s\": %m", new_db_dir);
+		(void) closedir(dir);
+	}
 }
 
 /*
@@ -614,5 +688,54 @@ transfer_relfile(FileNameMap *map, const char *type_suffix)
 				pg_fatal("should never happen");
 				break;
 		}
+
+		/*
+		 * LEE: when --wal-log-upgrade is set, record each transferred user
+		 * relation file in a manifest so pg_write_upgrade_relfile_data() emits
+		 * WAL only for exactly these files (never system catalogs, which are
+		 * rebuilt by pg_restore).  We store db_oid, relfilenumber, forknum, and
+		 * segno — the emit reconstructs the path from these.
+		 */
+		if (user_opts.wal_log_upgrade)
+			record_transferred_relfile(map->db_oid, map->relfilenumber,
+									   type_suffix, segno);
 	}
+}
+
+/*
+ * LEE: append one transferred user relation file segment to the
+ * pg_upgrade_transferred_files manifest in the new cluster's PGDATA.
+ * pg_write_upgrade_relfile_data() reads this manifest during the WAL emit
+ * phase so that only genuinely-transferred user relation files are captured.
+ *
+ * Each line is: <db_oid> <relfilenumber> <forknum> <segno>
+ *   forknum: 0=main, 1=fsm, 2=vm  (matches type_suffix "", "_fsm", "_vm")
+ */
+static void
+record_transferred_relfile(Oid db_oid, RelFileNumber relfilenumber,
+						   const char *type_suffix, int segno)
+{
+	char		manifest_path[MAXPGPATH];
+	FILE	   *fp;
+	uint8		forknum;
+
+	if (strcmp(type_suffix, "") == 0)
+		forknum = 0;
+	else if (strcmp(type_suffix, "_fsm") == 0)
+		forknum = 1;
+	else if (strcmp(type_suffix, "_vm") == 0)
+		forknum = 2;
+	else
+		return;					/* unknown fork, skip */
+
+	snprintf(manifest_path, sizeof(manifest_path),
+			 "%s/pg_upgrade_transferred_files", new_cluster.pgdata);
+
+	fp = fopen(manifest_path, "a");
+	if (fp == NULL)
+		pg_fatal("could not open transferred-files manifest \"%s\": %m",
+				 manifest_path);
+
+	fprintf(fp, "%u %u %u %d\n", db_oid, relfilenumber, forknum, segno);
+	fclose(fp);
 }
