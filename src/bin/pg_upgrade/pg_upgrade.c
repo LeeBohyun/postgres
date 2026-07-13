@@ -98,6 +98,9 @@ main(int argc, char **argv)
 {
 	char	   *deletion_script_file_name = NULL;
 	bool		migrate_logical_slots;
+	/* LEE: old cluster's system identifier, captured before its pg_control is
+	 * renamed by disable_old_cluster() in --link/--swap mode. */
+	uint64		old_system_identifier = 0;
 
 	/*
 	 * pg_upgrade doesn't currently use common/logging.c, but initialize it
@@ -229,6 +232,17 @@ main(int argc, char **argv)
 	stop_postmaster(false);
 
 	/*
+	 * LEE: for --wal-log-upgrade, capture the OLD cluster's system identifier
+	 * NOW, while its pg_control still exists.  In --link/--swap mode the next
+	 * step (disable_old_cluster) renames old pg_control to pg_control.old, after
+	 * which we could no longer read it.  We stamp this identifier into the new
+	 * cluster later (see "Setting next OID"), so a physical standby of the old
+	 * cluster accepts the upgrade WAL.
+	 */
+	if (user_opts.wal_log_upgrade)
+		old_system_identifier = get_control_system_identifier(&old_cluster);
+
+	/*
 	 * Most failures happen in create_new_objects(), which has completed at
 	 * this point.  We do this here because it is just before file transfer,
 	 * which for --link will make it unsafe to start the old cluster once the
@@ -263,13 +277,13 @@ main(int argc, char **argv)
 		 * AND the fresh WAL segment both get the old sysid -- consistent.  The
 		 * burst server starts next and writes all upgrade WAL with that sysid,
 		 * so a physical standby of the old cluster (same sysid) accepts it.
+		 * old_system_identifier was captured earlier, before disable_old_cluster
+		 * renamed the old pg_control in --link/--swap mode.
 		 */
-		uint64		old_sysid = get_control_system_identifier(&old_cluster);
-
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 				  "\"%s/pg_resetwal\" -o %u --system-identifier=" UINT64_FORMAT " \"%s\"",
 				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
-				  old_sysid, new_cluster.pgdata);
+				  old_system_identifier, new_cluster.pgdata);
 	}
 	else
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
