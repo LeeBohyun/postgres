@@ -255,10 +255,27 @@ main(int argc, char **argv)
 	 * low, risking collisions with preserved OIDs.)
 	 */
 	prep_status("Setting next OID for new cluster");
-	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -o %u \"%s\"",
-			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
-			  new_cluster.pgdata);
+	if (user_opts.wal_log_upgrade)
+	{
+		/*
+		 * LEE: for --wal-log-upgrade, also stamp the OLD cluster's system
+		 * identifier here.  This pg_resetwal call resets the WAL, so pg_control
+		 * AND the fresh WAL segment both get the old sysid -- consistent.  The
+		 * burst server starts next and writes all upgrade WAL with that sysid,
+		 * so a physical standby of the old cluster (same sysid) accepts it.
+		 */
+		uint64		old_sysid = get_control_system_identifier(&old_cluster);
+
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" -o %u --system-identifier=" UINT64_FORMAT " \"%s\"",
+				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+				  old_sysid, new_cluster.pgdata);
+	}
+	else
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" -o %u \"%s\"",
+				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+				  new_cluster.pgdata);
 	check_ok();
 
 	migrate_logical_slots = count_old_cluster_logical_slots();
