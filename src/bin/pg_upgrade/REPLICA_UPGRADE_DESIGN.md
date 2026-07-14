@@ -308,9 +308,44 @@ while the upgrade WAL is replaying. Two layers enforce this:
    `pg_resetwal --upgrade-recovery` step is gone). This same derivation is what
    the standby needs: the CN checkpoint record is in the WAL stream it receives,
    so it can recover the anchor in-band with no copied pg_control and no flag.
-   The remaining unknown is carrying that anchor across the binary swap (the
-   old-binary startup that pauses at START learns CN, but the new binary starts
-   cold) — see the sentinel-file marker in Q5.
+
+   **Post-replay history divergence — root cause and the existing fix (traced).**
+   The measured fork (standby ends ~1 segment AHEAD of the primary on the same
+   timeline, so streaming can't resume) was SELF-INFLICTED by the test: it did
+   `rm standby.signal` before restarting, so `ArchiveRecoveryRequested` was
+   false and StartupXLOG wrote a same-timeline `CHECKPOINT_END_OF_RECOVERY`
+   (xlog.c:6855). PostgreSQL already avoids this for a real standby: when
+   recovery ran with `standby.signal`/`recovery.signal`
+   (`ArchiveRecoveryRequested = true`), StartupXLOG UNCONDITIONALLY switches to a
+   new timeline at end-of-recovery (`newTLI = findNewestTimeLine + 1`,
+   xlog.c:6414) and writes a timeline-history file that other standbys follow.
+   So the correct delivery is: keep the standby in ARCHIVE recovery
+   (recovery.signal), let it apply the window, and let the built-in
+   end-of-recovery TIMELINE SWITCH happen -- no same-timeline fork, no sentinel,
+   using only existing replication machinery. Reconciling primary and upgraded
+   standby is then the standard "follow a timeline switch" flow.
+
+   **Why the standby path must be a SIBLING of the primary bootstrap, not the
+   same code.** The two want DIFFERENT end-of-recovery behavior from the SAME
+   START..COMPLETE WAL:
+     - Primary bootstrap (`PerformWalUpgradeIfNeeded`): crash recovery from CN on
+       the SAME timeline, into a wiped dir (the rebuild-from-empty property).
+     - Standby (`PerformReplicaUpgradeIfNeeded`, to build): ARCHIVE recovery that
+       applies the window and finalizes via the timeline SWITCH above.
+   So the standby entry point must arm the redo guard (below) but leave normal
+   archive-recovery finalization in place instead of the primary's CN-anchored
+   crash-recovery finalization.
+
+   **The one narrow remaining obstacle.** The `pg_upgrade_redo()`
+   XLOG_PG_UPGRADE_START guard FATALs unless `in_upgrade_bootstrap` is armed, and
+   arming happens only via the primary's `pg_wal/` startup scan. A streaming/
+   archive-recovery standby therefore FATALs at START. Applying the FPI images
+   (old, below-replay-point LSNs) must also be NON-serving (FPI-LSN safety).
+   So the constructive work is: arm the bootstrap for a standby that reaches a
+   confirmed START..COMPLETE window, apply it non-serving, and let the existing
+   timeline-switch finalization do the rest. The anchor carries in-band via the
+   CN checkpoint record; no binary-swap sentinel is required if delivery is via
+   recovery.signal + archive recovery.
 
 2. **Orphaned old-cluster files.** The standby still has the OLD cluster's files
    on disk (old system-catalog relfilenodes). The upgrade WAL *creates* the new
