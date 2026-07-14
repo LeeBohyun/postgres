@@ -9117,10 +9117,44 @@ XLogUpgradeRelfileBatchAddFile(UpgradeRelfileBatch *b, const char *path,
 				(errcode_for_file_access(),
 				 errmsg("could not stat \"%s\": %m", path)));
 	}
-	if (stbuf.st_size == 0)
-		return;
 
 	filesize = (Size) stbuf.st_size;
+
+	/*
+	 * LEE: an EMPTY (0-byte) relation file still needs a record so replay
+	 * RECREATES the file.  This matters for system catalogs that are empty in a
+	 * fresh cluster (pg_publication, pg_enum, ... -- ~34 of them): if their
+	 * relfile is missing after replay, the first write that touches the catalog
+	 * fails with "could not open file".  Emit a zero-page entry (nbytes=0,
+	 * blockoff=0); RELFILE redo creates the empty file via smgr without writing
+	 * any page.  (Only the base segment, segno 0, needs this; higher segments of
+	 * a relation are never empty.)
+	 */
+	if (filesize == 0)
+	{
+		xl_upgrade_relfile_entry ent;
+
+		if (segno != 0)
+			return;				/* an empty non-base segment: nothing to create */
+
+		if (b->used + SizeOfXLUpgradeRelfileEntry > b->cap)
+			XLogUpgradeRelfileBatchFlush(b);
+
+		memset(&ent, 0, sizeof(ent));
+		ent.tablespace_oid = tsoid;
+		ent.database_oid = dboid;
+		ent.relfilenumber = rfnum;
+		ent.forknum = forknum;
+		ent.segno = segno;
+		ent.blockoff = 0;
+		ent.nbytes = 0;			/* signals "create empty file, no pages" */
+
+		memcpy(b->buf + b->used, &ent, SizeOfXLUpgradeRelfileEntry);
+		b->used += SizeOfXLUpgradeRelfileEntry;
+		b->nentries++;
+		b->nfiles++;
+		return;
+	}
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)

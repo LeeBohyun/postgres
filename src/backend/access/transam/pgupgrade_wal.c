@@ -40,6 +40,7 @@
 #include "common/relpath.h"		/* RelFileLocator, ForkNumber */
 #include "miscadmin.h"
 #include "storage/bufmgr.h"		/* buffer-manager RELFILE_DATA redo */
+#include "storage/smgr.h"		/* smgr create for empty relfiles */
 #include "storage/bufpage.h"	/* PageSetLSN */
 #include "storage/fd.h"
 #include "storage/copydir.h"	/* copydir() for WAL segment migration */
@@ -682,6 +683,24 @@ pg_upgrade_redo(XLogReaderState *record)
 			rlocator.dbOid = ent.database_oid;
 			rlocator.relNumber = ent.relfilenumber;
 			forknum = (ForkNumber) ent.forknum;
+
+			/*
+			 * LEE: a zero-page entry (nbytes==0) means "the relation file is
+			 * empty; create it".  Empty system catalogs (pg_publication, pg_enum,
+			 * ...) have 0-byte relfiles in a fresh cluster; without recreating
+			 * them, the first write that touches such a catalog fails with
+			 * "could not open file".  Create the (main-fork) file via smgr,
+			 * idempotently, and move on -- there are no pages to install.
+			 */
+			if (ent.nbytes == 0)
+			{
+				SMgrRelation srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+
+				if (!smgrexists(srel, forknum))
+					smgrcreate(srel, forknum, true);
+				smgrclose(srel);
+				continue;
+			}
 
 			/* segments are RELSEG_SIZE blocks; blockoff is this chunk's start */
 			base_block = (BlockNumber) ent.segno * RELSEG_SIZE + ent.blockoff;
