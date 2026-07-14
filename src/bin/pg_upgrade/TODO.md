@@ -20,9 +20,19 @@ STATUS (2026-07-14): IMPLEMENTED + TESTED (same-version trigger mechanism).
     at the prior old record, NOT 0/0).  A streaming standby replays it and, under
     StandbyMode, FATALs with "reached pg_upgrade handoff on standby; halting for
     upgrade" + a re-provision hint.
-  * PROVEN by run_handoff_trigger_test.sh: caught-up streaming standby (500 rows)
-    receives the trigger and halts cleanly at it -- the halt that was UNREACHABLE
-    via the new-format START burst.
+  * PROVEN by run_handoff_trigger_test.sh: caught-up streaming standby receives
+    the trigger and SHUTS ITSELF DOWN cleanly (postmaster exits on its own,
+    pg_ctl reports not running, port refused, postmaster.pid removed, FATAL fires
+    exactly once = no restart loop) -- the halt that was UNREACHABLE via the
+    new-format START burst.  The FATAL message is "reached pg_upgrade handoff on
+    standby; shutting down for pg_upgrade".
+  * PROVEN end to end by run_standby_handoff_e2e_test.sh: streaming standby ->
+    trigger -> self-shutdown -> pg_upgrade on the primary -> re-provision the
+    halted standby from the delivered window (replay from CN) -> converged +
+    writable.  This wires the TRIGGER (halt) and TRANSPORT (out-of-band replay)
+    halves into one operator flow.  (Single fork build, so it proves the WIRING,
+    not a cross-major catalog change; run_standby_xversion_test.sh proves the
+    18->20 catalog change half.)
   * REMAINING to fully wire the operator flow: (i) have pg_upgrade / an
     orchestration step actually CALL pg_write_pg_upgrade_handoff() on the live old
     primary before shutdown (today the test calls it directly; decide whether

@@ -565,7 +565,7 @@ pg_upgrade_redo(XLogReaderState *record)
 
 			ereport(FATAL,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("reached pg_upgrade handoff on standby; halting for upgrade"),
+					 errmsg("reached pg_upgrade handoff on standby; shutting down for pg_upgrade"),
 					 errdetail("The primary initiated a --wal-log-upgrade to major version %u; "
 							   "this standby cannot follow the upgrade in the old WAL format.",
 							   xlrec->target_major_version),
