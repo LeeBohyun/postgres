@@ -20,6 +20,7 @@
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"; BIN="${PGBIN:-$ROOT/pginst/bin}"
 W=${WORK:-/tmp/pgu_tblspc}; OLD=$W/old; NEW=$W/new; P=${PORT:-55560}
+MODE=${MODE:---copy}   # transfer mode: --copy --copy-file-range --link --clone --swap
 export PGPORT=$P PGDATABASE=postgres
 log(){ echo "=== $* ==="; }
 rm -rf "$W"; mkdir -p "$W"
@@ -54,9 +55,10 @@ log "old: ts_t=$TS_FP base_t=$BASE_FP ts_idx=$TS_IDX"
 
 log "pg_upgrade --wal-log-upgrade --initdb --copy"
 cd "$W"
+log "pg_upgrade --wal-log-upgrade $MODE"
 # -O passes the in-place-tablespaces GUC to the new cluster's server so the
 # restore can recreate the in-place tablespace.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade $MODE \
     -O "-c allow_in_place_tablespaces=on" >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -25 "$W/up.log"; exit 1; }
 
