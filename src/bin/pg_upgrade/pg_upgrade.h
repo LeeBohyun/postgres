@@ -335,13 +335,6 @@ typedef struct
 	 * cluster purely from WAL (atomic, crash-safe, recoverable from an empty
 	 * data directory) */
 	bool		wal_log_upgrade;
-	/* LEE: recovery anchor for --upgrade-recovery.  This is CN: the LSN of the
-	 * checkpoint taken at the end of the upgrade, right before the full-page
-	 * image burst.  Replay starts here and applies only the end-of-upgrade
-	 * images, so it never re-runs pg_restore's FILE_COPY.  For an online
-	 * checkpoint the redo point precedes the record, so we carry both. */
-	char		upgrade_recovery_lsn[32];		/* checkpoint record LSN (CN) */
-	char		upgrade_recovery_redo_lsn[32];	/* CN's redo LSN */
 } UserOpts;
 
 typedef struct

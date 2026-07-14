@@ -104,10 +104,6 @@ static int	WalSegSz;
 /* LEE: --system-identifier: overwrite pg_control's sysid (preserve old cluster's) */
 static bool set_system_identifier = false;
 static uint64 new_system_identifier = 0;
-/* LEE: --upgrade-recovery: set checkPoint=LSN + state=DB_IN_PRODUCTION for upgrade WAL replay */
-static bool upgrade_recovery = false;
-static XLogRecPtr upgrade_recovery_lsn = InvalidXLogRecPtr;
-static XLogRecPtr upgrade_recovery_redo_lsn = InvalidXLogRecPtr;
 
 static void CheckDataVersion(void);
 static bool read_controlfile(void);
@@ -115,7 +111,6 @@ static void GuessControlValues(void);
 static void PrintControlValues(bool guessed);
 static void PrintNewControlValues(void);
 static void RewriteControlFile(void);
-static void RewriteControlFileUpgradeRecovery(void); /* LEE: upgrade recovery variant */
 static void FindEndOfXLOG(void);
 static void KillExistingXLOG(void);
 static void KillExistingArchiveStatus(void);
@@ -145,8 +140,6 @@ main(int argc, char *argv[])
 		{"char-signedness", required_argument, NULL, 2},
 		/* LEE: preserve the old cluster's system identifier for --wal-log-upgrade */
 		{"system-identifier", required_argument, NULL, 3},
-		/* LEE: set pg_control for upgrade WAL crash recovery */
-		{"upgrade-recovery", required_argument, NULL, 4},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -380,34 +373,6 @@ main(int argc, char *argv[])
 					}
 					break;
 
-				/* LEE: --upgrade-recovery=CKPT_LSN[,REDO_LSN] */
-				case 4:
-				{
-					uint32		hi,
-								lo,
-								rhi,
-								rlo;
-
-					if (sscanf(optarg, "%X/%X,%X/%X", &hi, &lo, &rhi, &rlo) == 4)
-					{
-						upgrade_recovery_lsn = ((XLogRecPtr) hi << 32) | lo;
-						upgrade_recovery_redo_lsn = ((XLogRecPtr) rhi << 32) | rlo;
-					}
-					else if (sscanf(optarg, "%X/%X", &hi, &lo) == 2)
-					{
-						/* no redo given: assume redo == checkpoint (shutdown ckpt) */
-						upgrade_recovery_lsn = ((XLogRecPtr) hi << 32) | lo;
-						upgrade_recovery_redo_lsn = upgrade_recovery_lsn;
-					}
-					else
-					{
-						pg_log_error("invalid LSN \"%s\" for --upgrade-recovery", optarg);
-						exit(1);
-					}
-					upgrade_recovery = true;
-				}
-				break;
-
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -431,12 +396,6 @@ main(int argc, char *argv[])
 	{
 		pg_log_error("no data directory specified");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
-		exit(1);
-	}
-
-	if (upgrade_recovery && (log_fname != NULL || wal_segsize_given))
-	{
-		pg_log_error("--upgrade-recovery cannot be used with -l or --wal-segsize");
 		exit(1);
 	}
 
@@ -602,19 +561,6 @@ main(int argc, char *argv[])
 		pg_log_error("not proceeding because control file values were guessed");
 		pg_log_error_hint("If these values seem acceptable, use -f to force reset.");
 		exit(1);
-	}
-
-	/*
-	 * LEE: --upgrade-recovery sets pg_control.checkPoint = the specified LSN
-	 * and state = DB_IN_PRODUCTION without touching WAL files.  Used by
-	 * pg_upgrade --wal-log-upgrade so StartupXLOG() enters crash recovery
-	 * from the initdb checkpoint and replays the upgrade WAL.
-	 */
-	if (upgrade_recovery)
-	{
-		RewriteControlFileUpgradeRecovery();
-		printf(_("pg_control set for upgrade WAL recovery\n"));
-		return 0;
 	}
 
 	/*
@@ -1025,31 +971,6 @@ RewriteControlFile(void)
 
 
 /*
- * LEE: Set pg_control.checkPoint = upgrade_recovery_lsn (with its redo at
- * upgrade_recovery_redo_lsn) and state = DB_IN_PRODUCTION so StartupXLOG()
- * enters crash recovery from the end-of-upgrade checkpoint (CN) and replays
- * the upgrade WAL that remains in pg_wal/.
- *
- * Also sets wal_level = replica so crash recovery can apply the WAL
- * (WAL_LEVEL_MINIMAL blocks recovery on a replica).
- *
- * Does NOT touch WAL files — the upgrade WAL must already be in pg_wal/.
- */
-static void
-RewriteControlFileUpgradeRecovery(void)
-{
-	ControlFile.checkPoint = upgrade_recovery_lsn;
-	ControlFile.checkPointCopy.redo = upgrade_recovery_redo_lsn;
-	ControlFile.state = DB_IN_PRODUCTION;
-	/* minRecoveryPoint=0 lets recovery stop at the end of available WAL */
-	ControlFile.minRecoveryPoint = InvalidXLogRecPtr;
-	ControlFile.minRecoveryPointTLI = 0;
-	/* Keep wal_level=replica so crash recovery can apply the records */
-	ControlFile.wal_level = WAL_LEVEL_REPLICA;
-	update_controlfile(".", &ControlFile, true);
-}
-
-/*
  * Scan existing XLOG files and determine the highest existing WAL address
  *
  * On entry, ControlFile.checkPointCopy.redo and ControlFile.xlog_seg_size
@@ -1333,14 +1254,11 @@ usage(void)
 	printf(_("  -f, --force            force update to be done even after unclean shutdown or\n"
 			 "                         if pg_control values had to be guessed\n"));
 	printf(_("  -n, --dry-run          no update, just show what would be done\n"));
-	/* LEE: --system-identifier / --upgrade-recovery usage lines */
+	/* LEE: --system-identifier usage line */
 	printf(_("      --system-identifier=N\n"
 			 "                         set pg_control system identifier to N (used by\n"
 			 "                         pg_upgrade --wal-log-upgrade to preserve the old\n"
 			 "                         cluster's identifier); do not touch WAL files\n"));
-	printf(_("      --upgrade-recovery=LSN\n"
-			 "                         set checkPoint=LSN and state=DB_IN_PRODUCTION for\n"
-			 "                         pg_upgrade WAL crash recovery; do not touch WAL files\n"));
 	printf(_("  -V, --version          output version information, then exit\n"));
 	printf(_("  -?, --help             show this help, then exit\n"));
 

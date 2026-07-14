@@ -321,23 +321,19 @@ main(int argc, char **argv)
 		PQclear(executeQueryOrDie(conn, "SELECT pg_flush_upgrade_slru()"));
 
 		/*
-		 * LEE: capture CN — the LSN of the checkpoint we just took.  This, not
-		 * the initdb checkpoint (C0), is the recovery anchor: replay starts here
-		 * and applies ONLY the end-of-upgrade full-page images that follow, so
-		 * it never re-runs pg_restore's CREATE DATABASE FILE_COPY records (which
-		 * would need the template databases on disk).  Anchoring at CN is what
-		 * lets the cluster be reconstructed from an empty data directory.
+		 * LEE: the CHECKPOINT above is CN — the recovery anchor.  This, not the
+		 * initdb checkpoint (C0), is where replay starts: it applies ONLY the
+		 * end-of-upgrade full-page images that follow, so it never re-runs
+		 * pg_restore's CREATE DATABASE FILE_COPY records (which would need the
+		 * template databases on disk).  Anchoring at CN is what lets the cluster
+		 * be reconstructed from an empty data directory.
+		 *
+		 * We no longer capture CN's LSN here: the new cluster's first startup
+		 * (PerformWalUpgradeIfNeeded) derives it directly from the WAL — it is
+		 * "the last checkpoint preceding XLOG_PG_UPGRADE_START" — and arms
+		 * pg_control at CN in-process.  Deriving it from the WAL is what lets a
+		 * physical standby recover the same anchor from the streamed WAL.
 		 */
-		{
-			PGresult   *cres = executeQueryOrDie(conn,
-												 "SELECT checkpoint_lsn, redo_lsn FROM pg_control_checkpoint()");
-
-			strlcpy(user_opts.upgrade_recovery_lsn, PQgetvalue(cres, 0, 0),
-					sizeof(user_opts.upgrade_recovery_lsn));
-			strlcpy(user_opts.upgrade_recovery_redo_lsn, PQgetvalue(cres, 0, 1),
-					sizeof(user_opts.upgrade_recovery_redo_lsn));
-			PQclear(cres);
-		}
 
 		/*
 		 * LEE: write the upgrade WAL as full-page images, all into the still-
@@ -475,36 +471,20 @@ main(int argc, char **argv)
 	 * LEE: for --wal-log-upgrade, the upgrade WAL in pg_wal/ must not be
 	 * recycled by a server restart.  issue_warnings_and_set_wal_level()
 	 * unconditionally starts/stops the server, which would checkpoint and
-	 * recycle that WAL — so we skip it here and instead preserve the WAL and
-	 * arm crash recovery from CN.  This is the atomic commit point: the whole
-	 * upgrade is applied at once on next startup, with no midway rollback.
+	 * recycle that WAL — so we skip it here and leave the WAL intact.
+	 *
+	 * We no longer stamp pg_control here (the former "pg_resetwal
+	 * --upgrade-recovery" step is gone).  Instead, the new cluster's first
+	 * startup runs PerformWalUpgradeIfNeeded(), which scans pg_wal/, derives the
+	 * end-of-upgrade checkpoint (CN) from the WAL itself, arms pg_control at CN
+	 * (state = DB_IN_PRODUCTION, wal_level = replica) in-process, and
+	 * crash-recovers from CN through PG_UPGRADE_COMPLETE.  Deriving the anchor
+	 * from the WAL — rather than pre-stamping it — is what lets the same WAL
+	 * stream drive recovery on a physical standby too.  This is the atomic
+	 * commit point: the whole upgrade is applied at once on next startup, with
+	 * no midway rollback.
 	 */
-	if (user_opts.wal_log_upgrade)
-	{
-		/*
-		 * LEE: arm crash recovery — set pg_control.checkPoint = CN (the
-		 * end-of-upgrade checkpoint) and state = DB_IN_PRODUCTION.  We pass both
-		 * the checkpoint record LSN and its redo LSN: for an online checkpoint
-		 * the redo precedes the record (with an XLOG_CHECKPOINT_REDO marker
-		 * there), and StartupXLOG uses pg_control.checkPointCopy.redo directly.
-		 * The upgrade WAL stays in pg_wal/; on next startup StartupXLOG()
-		 * crash-recovers from CN through PG_UPGRADE_COMPLETE, applying the whole
-		 * upgrade at once.  No rename is needed — the WAL content itself (the
-		 * START/COMPLETE records) is the signal.
-		 */
-		if (user_opts.upgrade_recovery_lsn[0])
-		{
-			prep_status("Setting pg_control for upgrade WAL recovery");
-			exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-					  "\"%s/pg_resetwal\" --upgrade-recovery=%s,%s \"%s\"",
-					  new_cluster.bindir,
-					  user_opts.upgrade_recovery_lsn,
-					  user_opts.upgrade_recovery_redo_lsn,
-					  new_cluster.pgdata);
-			check_ok();
-		}
-	}
-	else
+	if (!user_opts.wal_log_upgrade)
 		issue_warnings_and_set_wal_level();
 
 	pg_log(PG_REPORT,

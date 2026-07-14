@@ -141,18 +141,37 @@ UpgradeWalPageRead(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 }
 
 /*
- * Properly parse the WAL in "waldir" and return true iff it contains a genuine
- * XLOG_PG_UPGRADE_COMPLETE record.
+ * Properly parse the WAL in "waldir" and locate the pg_upgrade markers plus the
+ * end-of-upgrade checkpoint (CN) that recovery must anchor at.
+ *
+ * Out-params:
+ *   found_start / found_complete — the START / COMPLETE markers were seen.
+ *   cn        — the CheckPoint struct of the LAST online checkpoint that
+ *               precedes START.  This is CN, the recovery anchor written by
+ *               pg_upgrade right before the full-page-image burst; it carries
+ *               the transplanted XID/OID/multixact counters.
+ *   cn_lsn    — the record LSN of that checkpoint (goes to ControlFile.checkPoint).
+ *   applied   — true if a checkpoint appears AFTER COMPLETE.  Such a checkpoint
+ *               can only have been written by normal operation once the upgrade
+ *               was already replayed (the end-of-recovery checkpoint, or a later
+ *               one), so its presence means "the upgrade is already applied —
+ *               do NOT re-arm and re-replay it."  This is what makes startup
+ *               idempotent without a side flag: the WAL itself records whether
+ *               the window has been consumed.
+ *
+ * Returns false if there is no readable WAL at all.
  *
  * This must NOT be a byte-pattern heuristic: the upgrade WAL is full of
  * arbitrary full-page-image bytes, so any fixed byte pair appears many times by
- * chance.  Detecting the terminal marker with a real XLogReader is what makes
- * the atomicity guarantee sound — a crash mid-upgrade (START but no COMPLETE)
- * is reliably distinguished from a completed one.
+ * chance.  Detecting the markers and checkpoints with a real XLogReader is what
+ * makes the atomicity guarantee sound — a crash mid-upgrade (START but no
+ * COMPLETE) is reliably distinguished from a completed one, and an
+ * already-applied upgrade from a pending one.
  */
 static bool
 upgrade_wal_scan_markers(const char *waldir, bool *found_start,
-						 bool *found_complete)
+						 bool *found_complete, CheckPoint *cn,
+						 XLogRecPtr *cn_lsn, bool *applied)
 {
 	DIR		   *dir;
 	struct dirent *de;
@@ -164,9 +183,15 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 	XLogReaderState *reader;
 	XLogRecPtr	startptr;
 	XLogRecPtr	first;
+	CheckPoint	last_ckpt;
+	XLogRecPtr	last_ckpt_lsn = InvalidXLogRecPtr;
 
 	*found_start = false;
 	*found_complete = false;
+	*cn_lsn = InvalidXLogRecPtr;
+	*applied = false;
+	MemSet(cn, 0, sizeof(CheckPoint));
+	MemSet(&last_ckpt, 0, sizeof(CheckPoint));
 
 	/*
 	 * First pass over the directory: determine the segment size (all WAL
@@ -236,21 +261,40 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 	{
 		char	   *errormsg;
 		XLogRecord *record = XLogReadRecord(reader, &errormsg);
+		uint8		rmid;
+		uint8		info;
 
 		if (record == NULL)
 			break;				/* end of WAL or unreadable — stop */
 
-		if (XLogRecGetRmid(reader) == RM_PG_UPGRADE_ID)
-		{
-			uint8		info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+		rmid = XLogRecGetRmid(reader);
+		info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 
+		if (rmid == RM_XLOG_ID &&
+			(info == XLOG_CHECKPOINT_ONLINE || info == XLOG_CHECKPOINT_SHUTDOWN))
+		{
+			/*
+			 * Track the most recent checkpoint.  Before START this lets us
+			 * capture CN (the last checkpoint preceding START).  After COMPLETE
+			 * a checkpoint means the upgrade has already been applied by a prior
+			 * startup — record that so we do not re-arm and re-replay it.
+			 */
+			memcpy(&last_ckpt, XLogRecGetData(reader), sizeof(CheckPoint));
+			last_ckpt_lsn = reader->ReadRecPtr;
+			if (*found_complete)
+				*applied = true;
+		}
+		else if (rmid == RM_PG_UPGRADE_ID)
+		{
 			if (info == XLOG_PG_UPGRADE_START)
-				*found_start = true;
-			else if (info == XLOG_PG_UPGRADE_COMPLETE)
 			{
-				*found_complete = true;
-				break;			/* window is closed; nothing more to learn */
+				*found_start = true;
+				/* CN is the checkpoint immediately preceding START */
+				*cn = last_ckpt;
+				*cn_lsn = last_ckpt_lsn;
 			}
+			else if (info == XLOG_PG_UPGRADE_COMPLETE)
+				*found_complete = true;
 		}
 	}
 
@@ -274,6 +318,9 @@ PerformWalUpgradeIfNeeded(void)
 	char		wal_dir[MAXPGPATH];
 	bool		found_start = false;
 	bool		found_complete = false;
+	bool		applied = false;
+	CheckPoint	cn;
+	XLogRecPtr	cn_lsn = InvalidXLogRecPtr;
 
 	/* Skip during pg_upgrade internal server starts (-b binary upgrade mode) */
 	if (IsBinaryUpgrade)
@@ -283,23 +330,32 @@ PerformWalUpgradeIfNeeded(void)
 
 	/*
 	 * Parse pg_wal/ with a real XLogReader and look for the pg_upgrade
-	 * START/COMPLETE markers.  The upgrade WAL lives in pg_wal/ (no rename): a
-	 * completed --wal-log-upgrade run leaves a START..COMPLETE window there and
-	 * arms pg_control (checkPoint = CN, state = DB_IN_PRODUCTION), so
-	 * StartupXLOG() then crash-recovers the whole window.  Here we only decide
-	 * whether to allow that:
+	 * START/COMPLETE markers plus the end-of-upgrade checkpoint (CN).  The
+	 * upgrade WAL lives in pg_wal/ (no rename): a completed --wal-log-upgrade
+	 * run leaves a START..COMPLETE window there.  Here we decide what to do:
 	 *
-	 *   START + COMPLETE -> upgrade completed; arm the bootstrap and let
-	 *                       StartupXLOG() replay it.
+	 *   START + COMPLETE, no later checkpoint -> upgrade pending; DERIVE CN from
+	 *                       the WAL, arm pg_control in-process (checkPoint = CN,
+	 *                       state = DB_IN_PRODUCTION), and let StartupXLOG()
+	 *                       crash-recover the whole window.
+	 *   START + COMPLETE, checkpoint AFTER COMPLETE -> already applied by a prior
+	 *                       startup; do nothing, normal startup.
 	 *   START, no COMPLETE -> crash mid-upgrade; refuse to start (old cluster
 	 *                       is intact — re-run pg_upgrade).
 	 *   no START         -> not an upgrade; normal startup.
+	 *
+	 * Deriving CN here (rather than requiring a prior "pg_resetwal
+	 * --upgrade-recovery" to have stamped it) is what lets the SAME WAL stream
+	 * drive recovery on the primary and, eventually, on a physical standby: the
+	 * anchor is recovered from the CN checkpoint record itself.  It is also the
+	 * default and only path — there is no flag to enable it.
 	 *
 	 * This must NOT be a byte-pattern heuristic: the upgrade WAL is full of
 	 * arbitrary full-page-image bytes, so a real XLogReader is what makes the
 	 * atomicity guarantee sound.
 	 */
-	if (!upgrade_wal_scan_markers(wal_dir, &found_start, &found_complete))
+	if (!upgrade_wal_scan_markers(wal_dir, &found_start, &found_complete,
+								  &cn, &cn_lsn, &applied))
 		return false;			/* no readable upgrade WAL — normal startup */
 
 	if (!found_start)
@@ -310,8 +366,37 @@ PerformWalUpgradeIfNeeded(void)
 				(errmsg("pg_upgrade failed mid-upgrade: new cluster is unusable"),
 				 errhint("Re-run pg_upgrade from the old cluster to start fresh.")));
 
+	/*
+	 * A checkpoint after COMPLETE means a prior startup already replayed the
+	 * whole window and resumed normal operation.  Re-arming at CN now would
+	 * re-replay the upgrade over live post-upgrade data — so treat it as an
+	 * ordinary startup.
+	 */
+	if (applied)
+		return false;
+
+	/*
+	 * The upgrade is pending.  We must have found CN (the checkpoint preceding
+	 * START); if not, the WAL is malformed and re-arming at an invalid LSN would
+	 * corrupt recovery, so fail loudly instead.
+	 */
+	if (XLogRecPtrIsInvalid(cn_lsn))
+		ereport(FATAL,
+				(errmsg("pg_upgrade WAL is missing the end-of-upgrade checkpoint"),
+				 errhint("Re-run pg_upgrade from the old cluster to start fresh.")));
+
 	ereport(LOG,
-			(errmsg("pg_upgrade WAL found in pg_wal/; replaying upgrade from end-of-upgrade checkpoint")));
+			(errmsg("pg_upgrade WAL found in pg_wal/; arming recovery from end-of-upgrade checkpoint at %X/%08X",
+					LSN_FORMAT_ARGS(cn_lsn))));
+
+	/*
+	 * Arm the control file in-process: point recovery at CN with state =
+	 * DB_IN_PRODUCTION and wal_level = replica.  StartupXLOG() (called right
+	 * after us) reads ControlFile->checkPointCopy, so this takes effect for this
+	 * recovery cycle.  This replaces the old offline pg_resetwal
+	 * --upgrade-recovery step.
+	 */
+	ArmControlFileForUpgradeRecovery(&cn, cn_lsn);
 
 	/*
 	 * Arm the sanctioned bootstrap: the pg_upgrade redo handlers may now apply

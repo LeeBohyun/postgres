@@ -279,6 +279,10 @@ extern XLogRecPtr XLogWritePgUpgrade(bool is_start,
 									 uint32 new_major_version);
 /* LEE: SLRU bulk image for pg_upgrade WAL replay */
 extern XLogRecPtr XLogWriteUpgradeSlruData(uint8 slru_type);
+/* LEE: arm pg_control at CN for in-process --wal-log-upgrade recovery */
+struct CheckPoint;
+extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
+											  XLogRecPtr cn_lsn);
 /* LEE: batched relation-file images live in access/pgupgrade_wal.h */
 extern void UpdateFullPageWrites(void);
 extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p);

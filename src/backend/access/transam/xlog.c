@@ -4639,6 +4639,40 @@ UpdateControlFile(void)
 }
 
 /*
+ * LEE: Arm the control file for pg_upgrade --wal-log-upgrade recovery.
+ *
+ * Sets checkPoint = CN (the end-of-upgrade checkpoint record LSN), its redo and
+ * embedded counters from the CN CheckPoint struct, and state = DB_IN_PRODUCTION
+ * so StartupXLOG() crash-recovers from CN through XLOG_PG_UPGRADE_COMPLETE.
+ * wal_level is forced to replica so recovery can apply the records (and so a
+ * physical standby doing archive recovery is not rejected).
+ *
+ * Called by PerformWalUpgradeIfNeeded() from the startup process, before
+ * StartupXLOG() reads ControlFile->checkPointCopy — so the update is picked up
+ * by this recovery cycle.  This replaces the former offline
+ * "pg_resetwal --upgrade-recovery" step: the anchor is now derived in-process
+ * from the CN checkpoint record found in pg_wal/, with no extra flag.
+ *
+ * The control file is fsync'd (do_sync=true) so the armed anchor is durable.
+ */
+void
+ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn)
+{
+	Assert(ControlFile != NULL);
+
+	ControlFile->checkPoint = cn_lsn;
+	ControlFile->checkPointCopy = *cn;
+	ControlFile->state = DB_IN_PRODUCTION;
+	/* minRecoveryPoint=0 lets recovery stop at the end of available WAL */
+	ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
+	ControlFile->minRecoveryPointTLI = 0;
+	/* keep wal_level=replica so crash/archive recovery can apply the records */
+	ControlFile->wal_level = WAL_LEVEL_REPLICA;
+
+	UpdateControlFile();
+}
+
+/*
  * Returns the unique system identifier from control file.
  */
 uint64
