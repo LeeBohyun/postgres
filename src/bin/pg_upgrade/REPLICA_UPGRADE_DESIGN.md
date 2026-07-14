@@ -378,10 +378,41 @@ while the upgrade WAL is replaying. Two layers enforce this:
    standby FOLLOW the primary's WAL, rather than each node independently bumping
    the timeline.  The real remaining work is the streaming-follow path: a standby
    applies the primary's upgrade WAL AS IT STREAMS (same timeline), which needs
-   the `pg_upgrade_redo()` START guard turned into a sanctioned non-serving apply
-   for a streaming standby (FPI-LSN safety), NOT a local upgrade + independent
-   timeline switch.  The anchor still carries in-band via the CN checkpoint
-   record; no binary-swap sentinel and no timeline bump are required.
+   the `pg_upgrade_redo()` START guard turned into a sanctioned apply for a
+   streaming standby, WITH the standby blocked from serving any connection while
+   the START..COMPLETE window replays (a stricter version of the existing
+   `pgUpgradeReplayInProgress` gate, which today only prevents hot-standby
+   ACTIVATION, not an already-active standby).
+
+   **THE ACTUAL BLOCKER (measured): WAL DISCONTIGUITY, not timelines.** A live
+   streaming standby cannot even reach the upgrade window.  Measured with a real
+   streaming setup:
+     - old cluster (and a caught-up standby) end at WAL segment 3
+       (`Latest checkpoint's REDO WAL file: 0000000100000000000000 03`).
+     - the upgraded new cluster's WAL -- including the CN checkpoint and the
+       whole START..COMPLETE window -- BEGINS at segment 8; segments 4-7 do not
+       exist.
+     - the standby, caught up at segment 3, requests segment 3/4 from the
+       upgraded primary and gets `requested WAL segment ...03 has already been
+       removed` -- there is no contiguous path from where it is to where the
+       upgrade WAL lives.
+
+   Nothing was recycled and no checkpoint discarded the window (it is intact in
+   seg 8).  The gap is created by pg_upgrade's stock "Resetting WAL archives"
+   step (`pg_resetwal -l 00000001<nextxlogfile>`, pg_upgrade.c) PLUS the burst
+   server's own WAL generation (counter-transplant resets, CHECKPOINT, the FPI
+   burst), which together position the new cluster's WAL at a HIGHER segment than
+   the old cluster's end, leaving a hole (4-7 here).  Physical streaming requires
+   a contiguous (TLI, LSN) sequence; the hole makes streaming impossible even
+   though the window is present.
+
+   So the true fix for streaming-follow is to make the upgrade WAL CONTIGUOUS
+   with the old cluster's WAL end -- i.e. the new cluster's WAL (CN + window)
+   must start exactly at the old cluster's next segment, with no skipped
+   segments through the burst -- so a caught-up standby streams seg N -> N+1
+   straight into the window and ingests it like any other WAL.  The alternative
+   is out-of-band delivery of the gap (the file-delivered model, which works but
+   is not pure streaming).  Neither needs a timeline bump.
 
 2. **Orphaned old-cluster files.** The standby still has the OLD cluster's files
    on disk (old system-catalog relfilenodes). The upgrade WAL *creates* the new
