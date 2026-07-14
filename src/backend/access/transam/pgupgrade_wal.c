@@ -458,18 +458,38 @@ pg_upgrade_redo(XLogReaderState *record)
 		 * (DIRSKEL/RELFILE/SLRU/RAWFILE) carry the OLD cluster's page LSNs and
 		 * are only safe to apply from the sanctioned bootstrap replay set up by
 		 * PerformWalUpgradeIfNeeded() (which anchors at CN into a non-serving
-		 * data directory).  A physical standby streaming the primary's WAL will
-		 * reach this START record during ordinary replay, WITHOUT that bootstrap
-		 * armed; applying the images live would violate replay LSN invariants.
-		 * So we stop here and require a restart, at which point startup re-enters
-		 * PerformWalUpgradeIfNeeded() and replays the upgrade from CN safely.
+		 * data directory).  A server that reaches START WITHOUT that bootstrap
+		 * armed must NOT apply the window live -- doing so would violate replay
+		 * LSN invariants.  We stop the recovery process (FATAL) at the boundary.
+		 *
+		 * This FATAL is the INTENTIONAL halt for a physical standby that streamed
+		 * up to the pg_upgrade boundary: the standby stops here; the operator
+		 * installs the new-version binary and relaunches; on relaunch, startup
+		 * re-enters PerformWalUpgradeIfNeeded(), which anchors at CN and replays
+		 * the self-contained upgrade window into the (skeleton) data directory.
+		 * A FATAL is the right mechanism -- the old-version binary cannot proceed
+		 * past the boundary anyway (it is about to be replaced), and a
+		 * recovery-process FATAL cleanly brings the server down for that swap; we
+		 * deliberately do NOT attempt a graceful in-loop shutdown from a redo
+		 * callback.  StandbyMode distinguishes that expected case from an
+		 * unsupported attempt to replay upgrade WAL in some other context, so the
+		 * operator sees which happened.
 		 */
 		if (!in_upgrade_bootstrap)
-			ereport(FATAL,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("pg_upgrade WAL encountered during replay"),
-					 errhint("Restart this server to apply the pg_upgrade; "
-							 "the upgrade cannot be replayed on a running standby.")));
+		{
+			if (StandbyMode)
+				ereport(FATAL,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("reached pg_upgrade boundary on standby; halting to apply the upgrade"),
+						 errdetail("A --wal-log-upgrade was performed on the primary; the standby cannot apply it while streaming."),
+						 errhint("Install the new-version binaries and restart this standby; it will replay the upgrade from the end-of-upgrade checkpoint.")));
+			else
+				ereport(FATAL,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("pg_upgrade WAL encountered during replay"),
+						 errhint("Restart this server to apply the pg_upgrade; "
+								 "the upgrade cannot be replayed on a running standby.")));
+		}
 
 		/*
 		 * LEE: the upgrade window is now open.  Suppress hot standby activation

@@ -106,17 +106,22 @@ if [ $? -ne 0 ]; then
 fi
 STBY_SUM=$("$BIN/psql" -h "$W" -p $SPORT -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint) FROM t" 2>&1)
 STBY_ID=$("$BIN/pg_controldata" -D "$STBY" | grep -i "system identifier" | grep -oE "[0-9]+")
+# WRITABILITY: writing exercises catalog access, which fails if any (empty)
+# catalog relfile was not reconstructed by replay.  Must succeed.
+"$BIN/psql" -h "$W" -p $SPORT -U postgres -qc "INSERT INTO t VALUES (999999,'post-upgrade')" >/dev/null 2>&1
+STBY_WOK=$("$BIN/psql" -h "$W" -p $SPORT -U postgres -tAc "SELECT count(*) FROM t WHERE id=999999" 2>&1)
 "$BIN/pg_ctl" -D "$STBY" -w stop >/dev/null 2>&1
-log "standby after upgrade: data=$STBY_SUM sysid=$STBY_ID"
+log "standby after upgrade: data=$STBY_SUM sysid=$STBY_ID writable=$STBY_WOK"
 
 FAIL=0
 # Prove the anchor was derived IN-BAND from the WAL (not copied): the startup
 # log must show PerformWalUpgradeIfNeeded arming recovery from CN.
 if grep -q "arming recovery from end-of-upgrade checkpoint" "$W/stby2.log"; then
-    log "  ✓ standby derived CN in-band ($(grep 'arming recovery' "$W/stby2.log" | tail -1 | sed 's/.*checkpoint //'))"
+    log "  standby derived CN in-band ($(grep 'arming recovery' "$W/stby2.log" | tail -1 | sed 's/.*checkpoint //'))"
 else
     echo "MISSING: standby log has no in-band CN arming message (did it use a copied anchor?)"; FAIL=1
 fi
+[ "$STBY_WOK" = "1" ] || { echo "MISMATCH: upgraded standby not writable (a catalog relfile missing?)"; FAIL=1; }
 [ "$STBY_SUM" = "$NEW_SUM" ] || { echo "MISMATCH: standby data ($STBY_SUM) != upgraded primary ($NEW_SUM)"; FAIL=1; }
 [ "$STBY_ID"  = "$NEW_ID"  ] || { echo "MISMATCH: standby sysid ($STBY_ID) != upgraded primary ($NEW_ID)"; FAIL=1; }
 [ "$FAIL" = 0 ] && log "PASS: standby upgraded via in-band WAL replay; data + sysid match upgraded primary" \
