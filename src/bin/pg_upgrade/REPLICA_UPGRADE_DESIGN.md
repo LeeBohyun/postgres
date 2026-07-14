@@ -414,6 +414,31 @@ while the upgrade WAL is replaying. Two layers enforce this:
    is out-of-band delivery of the gap (the file-delivered model, which works but
    is not pure streaming).  Neither needs a timeline bump.
 
+   **PARTIAL FIX LANDED: pg_resetwal --control-only (see commit).** The
+   counter-transplant resets no longer march the WAL a segment each; measured on
+   a small cluster the gap dropped from ~5 segments to 0 (CN lands immediately
+   after the old cluster's WAL end).  This is committed and the primary path +
+   file-delivered standby path both still pass.
+
+   **STILL NOT sufficient for pure live streaming (measured).** Two residual
+   obstacles remain, both about the exact segment boundary:
+     1. The old cluster's LAST segment is usually PARTIAL (e.g. it ends at
+        0/0300B720, mid-segment 3).  The `-l` reset positions the new WAL at the
+        old cluster's NEXT segment (4), so the old cluster's partial segment 3 is
+        not carried into the new cluster.  A caught-up standby streamed to
+        0/03000000 then asks the new primary for segment 3 and gets "already
+        removed" -- the new cluster starts at 4.  The new WAL must instead
+        CONTINUE the old cluster's last partial segment (start at the old end
+        LSN, same segment), not the next segment.
+     2. Residual burst drift: even with --control-only, the CHECKPOINT (CN) and
+        the burst server restart still advance the position a couple of segments
+        past the -l point (observed CN at segment 6 when the new WAL began at 4).
+        For strict contiguity the CN/window must begin at the old end LSN with no
+        intervening advance.
+   Until both are addressed, pure live streaming of the window is not possible;
+   the file-delivered model (copy the upgrade segments to the standby, in-band
+   CN derivation) remains the working path and is what the tests exercise.
+
 2. **Orphaned old-cluster files.** The standby still has the OLD cluster's files
    on disk (old system-catalog relfilenodes). The upgrade WAL *creates* the new
    files but nothing *deletes* the old ones (the primary deletes them locally in
