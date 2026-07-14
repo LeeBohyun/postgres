@@ -26,6 +26,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_tablespace_d.h"	/* LEE: DEFAULTTABLESPACE_OID */
 #include "catalog/pg_type.h"
+#include "common/relpath.h"		/* LEE: PG_TBLSPC_DIR, TABLESPACE_VERSION_DIRECTORY */
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -578,6 +579,69 @@ pg_write_upgrade_relfile_data(PG_FUNCTION_ARGS)
 							  (Oid) dboid);
 		}
 		FreeDir(basedir);
+	}
+
+	/*
+	 * LEE: relations in USER-DEFINED tablespaces.  Each pg_tblspc/<spcoid> is a
+	 * symlink to a location holding TABLESPACE_VERSION_DIRECTORY/<dboid>/<files>.
+	 * Walk every tablespace, every db subdir under its version directory, and
+	 * capture the relfiles with tsoid=<spcoid> so RELFILE redo (which resolves
+	 * rlocator.spcOid via the symlink) places them correctly.  Without this,
+	 * tablespace relations are silently omitted from the upgrade WAL.
+	 */
+	{
+		DIR		   *tsdir = AllocateDir(PG_TBLSPC_DIR);
+
+		if (tsdir != NULL)
+		{
+			struct dirent *tde;
+
+			while ((tde = ReadDir(tsdir, PG_TBLSPC_DIR)) != NULL)
+			{
+				char		verpath[MAXPGPATH];
+				char	   *endp;
+				unsigned long spcoid;
+				DIR		   *verdir;
+				struct dirent *vde;
+
+				if (tde->d_name[0] < '1' || tde->d_name[0] > '9')
+					continue;
+				errno = 0;
+				spcoid = strtoul(tde->d_name, &endp, 10);
+				if (errno != 0 || *endp != '\0')
+					continue;
+
+				/* pg_tblspc/<spcoid>/<TABLESPACE_VERSION_DIRECTORY>/ */
+				snprintf(verpath, sizeof(verpath), "%s/%s/%s",
+						 PG_TBLSPC_DIR, tde->d_name,
+						 TABLESPACE_VERSION_DIRECTORY);
+
+				verdir = AllocateDir(verpath);
+				if (verdir == NULL)
+					continue;
+
+				while ((vde = ReadDir(verdir, verpath)) != NULL)
+				{
+					char		dbpath[MAXPGPATH];
+					char	   *dendp;
+					unsigned long dboid;
+
+					if (vde->d_name[0] < '1' || vde->d_name[0] > '9')
+						continue;
+					errno = 0;
+					dboid = strtoul(vde->d_name, &dendp, 10);
+					if (errno != 0 || *dendp != '\0')
+						continue;
+
+					snprintf(dbpath, sizeof(dbpath), "%s/%s",
+							 verpath, vde->d_name);
+					capture_dir_files(&batch, dbpath, (Oid) spcoid,
+									  (Oid) dboid);
+				}
+				FreeDir(verdir);
+			}
+			FreeDir(tsdir);
+		}
 	}
 
 	/* Flush the last partial record of relation-file images. */

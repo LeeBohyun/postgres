@@ -1521,6 +1521,59 @@ revert_wal_logged_disk_writes(void)
 	}
 
 	/*
+	 * LEE: relation files in USER-DEFINED tablespaces, under
+	 * pg_tblspc/<spcoid>/<TABLESPACE_VERSION_DIRECTORY>/<dboid>/.  These are
+	 * captured as RELFILE_DATA (see pg_write_upgrade_relfile_data), so wipe them
+	 * too -- otherwise a same-node upgrade would silently read them off disk
+	 * instead of reconstructing from WAL, and the WAL-recoverability guarantee
+	 * would be unproven (and false on a fresh target/standby).  We wipe the
+	 * relfiles but LEAVE the pg_tblspc/<spcoid> symlink and version directory in
+	 * place (recreating those from scratch needs the external location, which is
+	 * the tablespace-symlink bootstrap tracked in REPLICA_UPGRADE_DESIGN.md).
+	 */
+	snprintf(path, sizeof(path), "%s/%s", new_cluster.pgdata, "pg_tblspc");
+	{
+		DIR		   *tsdir = opendir(path);
+
+		if (tsdir != NULL)
+		{
+			struct dirent *tde;
+
+			while ((tde = readdir(tsdir)) != NULL)
+			{
+				char		verpath[MAXPGPATH];
+				DIR		   *verdir;
+				struct dirent *vde;
+
+				if (tde->d_name[0] < '1' || tde->d_name[0] > '9')
+					continue;
+
+				snprintf(verpath, sizeof(verpath), "%s/pg_tblspc/%s/%s",
+						 new_cluster.pgdata, tde->d_name,
+						 TABLESPACE_VERSION_DIRECTORY);
+				verdir = opendir(verpath);
+				if (verdir == NULL)
+					continue;
+
+				while ((vde = readdir(verdir)) != NULL)
+				{
+					char		dbpath[MAXPGPATH];
+
+					if (vde->d_name[0] < '1' || vde->d_name[0] > '9')
+						continue;
+					snprintf(dbpath, sizeof(dbpath), "%s/%s",
+							 verpath, vde->d_name);
+					wipe_dir_files(dbpath, NULL);
+					if (rmdir(dbpath) != 0 && errno != ENOENT)
+						pg_fatal("could not remove directory \"%s\": %m", dbpath);
+				}
+				closedir(verdir);
+			}
+			closedir(tsdir);
+		}
+	}
+
+	/*
 	 * SLRU segments (pg_xact, pg_multixact) — captured as SLRU_DATA.  As with
 	 * base/ above, removing the directories (not just their files) is a
 	 * testing measure only (see the function header note): DIRSKEL redo
