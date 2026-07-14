@@ -7,31 +7,6 @@ the skeleton model; tablespaces (in-place + capture/wipe); empty-catalog
 reconstruction; crash-mid-upgrade atomicity; all 5 transfer modes; 10GB +
 concurrent-client stress; multixact members long-name SLRU segments.
 
-## Resolved this session (kept as short notes; see git history for detail)
-
-- Live-streaming standby halt: settled.  A streaming standby cannot follow the
-  upgrade burst across a major version -- WAL page magic is version-stamped
-  (v18=0xD118, v20=0xD120), so no single running binary can read both the old
-  tail and the new burst.  Delivery is therefore inherently OUT-OF-BAND: the
-  self-contained new-version window is delivered and replayed from the
-  end-of-upgrade checkpoint (CN) into a fresh new-version skeleton (proven by
-  run_standby_xversion_test.sh / run_e2e_equivalence_test.sh).
-  The clean-handoff signal is the OLD-FORMAT XLOG_PG_UPGRADE_HANDOFF trigger
-  (SQL pg_write_pg_upgrade_handoff), emitted into the OLD primary's own WAL so a
-  streaming standby reads it and shuts itself down for the swap
-  (run_handoff_trigger_test.sh, run_standby_handoff_e2e_test.sh).
-- "Make the WAL gap zero": settled as impossible cross-version (same
-  version-stamped-page-magic reason).  Not a fixable gap; the out-of-band model
-  does not need contiguity.
-- pg_resetwal --control-only: REVERTED.  It existed only to keep the upgrade WAL
-  contiguous for live streaming; since streaming-follow is impossible
-  cross-version, the contiguity bought nothing.  The counter transplants are back
-  to stock pg_resetwal (which reposition/rewrite the WAL); counters are still
-  captured by the CN checkpoint recovery replays from, so the delivered upgrade
-  artifact is unchanged.  (--system-identifier stamping in the "Resetting WAL
-  archives" step is kept -- the burst must carry the old sysid so a re-provisioned
-  standby accepts it.)
-
 ## 1. Remaining wiring for the handoff trigger
 
 The XLOG_PG_UPGRADE_HANDOFF record + the standby self-shutdown are implemented
@@ -39,10 +14,34 @@ and tested.  Still to wire for a complete operator flow:
 - Decide WHO calls pg_write_pg_upgrade_handoff() on the live old primary before
   shutdown: pg_upgrade core vs. an HA/orchestration layer.  (Lean: HA layer --
   pg_upgrade never connects to the old primary as a standby-visible writer.)
-- Block the standby from serving ANY connection during the handoff window.  Today
-  pgUpgradeReplayInProgress only prevents hot-standby ACTIVATION, not an
-  already-active standby -- verify/extend so no client sees a half-upgraded
-  cluster.  (see run_connblock_test.sh)
+
+CONNECTION BLOCKING -- investigated 2026-07-14, found NO reachable exposure, no
+code change warranted:
+  The worry was that pgUpgradeReplayInProgress only SUPPRESSES hot-standby
+  activation and does not revoke an ALREADY-ACTIVE one, so an active hot standby
+  might serve a half-upgraded cluster while the window replays.  Tracing the two
+  real paths shows this cannot happen:
+    1. File-delivered / bootstrap path (the working model):
+       ArmControlFileForUpgradeRecovery() sets state = DB_IN_PRODUCTION, so
+       StartupXLOG runs the window as CRASH RECOVERY, not archive/standby
+       recovery.  Hot standby only activates under InArchiveRecovery; in crash
+       recovery CheckRecoveryConsistency's hot-standby block never runs, so NO
+       connections are accepted during the window at all.  Proven by
+       run_connblock_test.sh (0 anomalies while hammering during replay).
+    2. Streaming / archive standby: cannot even REACH the window -- replay stops
+       at the version/format boundary (and the WAL gap) before START, so it keeps
+       serving the pre-upgrade state and never applies anything half-upgraded.
+       Attempted to build an "already-active standby applies the window" test
+       (archive recovery + hot_standby); it could not reach the window (restored
+       old segs 4-6, upgrade window is in segs A-D, segs 7-9 absent), confirming
+       the boundary.  The test was therefore VACUOUS and NOT added to the repo.
+       If a same-version streaming standby ever DID reach START, the START guard
+       FATALs (StandbyMode && !in_upgrade_bootstrap) -> server down -> connections
+       dropped, so still no half-upgraded read.
+  PostgreSQL core also cannot de-activate hot standby once active (see comment in
+  HotStandbyActive(), xlogrecovery.c) -- which is fine, because no reachable path
+  applies the window under an active hot standby.  Nothing to fix here; keep this
+  note so the concern is not re-opened without a concrete reachable path.
 
 ## 2. Hand over the system identifier WITHOUT the pg_resetwal --system-identifier flag
 
