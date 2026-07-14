@@ -8,87 +8,91 @@ empty-catalog reconstruction; crash-mid-upgrade atomicity; all 5 transfer modes;
 
 The items below are deferred.
 
-## 1. Live-streaming standby: halt at START, then relaunch to replay
+## 1. Live-streaming standby: OLD-FORMAT trigger record for clean handoff
 
-The intended model: a working standby streams the primary's WAL, reaches
-`XLOG_PG_UPGRADE_START`, HALTS cleanly (does not apply the window live), the
-operator installs the new-version binary and restarts, and on relaunch the
-standby re-anchors at the end-of-upgrade checkpoint (CN) and replays the
-self-contained window.
+STATUS (2026-07-14): IMPLEMENTED + TESTED (same-version trigger mechanism).
+  * New WAL record XLOG_PG_UPGRADE_HANDOFF (0x60) in RM_PG_UPGRADE_ID, struct
+    xl_pg_upgrade_handoff (pg_control.h).  Emitted by XLogWritePgUpgradeHandoff()
+    (xlog.c), exposed as SQL pg_write_pg_upgrade_handoff(target_major int) -> pg_lsn
+    (oid 9706), redo/desc/identify handlers added.
+  * The record is written by the OLD binary on the LIVE OLD primary (via the SQL
+    fn), so it is old-format and chained onto the old stream (waldump: prev points
+    at the prior old record, NOT 0/0).  A streaming standby replays it and, under
+    StandbyMode, FATALs with "reached pg_upgrade handoff on standby; halting for
+    upgrade" + a re-provision hint.
+  * PROVEN by run_handoff_trigger_test.sh: caught-up streaming standby (500 rows)
+    receives the trigger and halts cleanly at it -- the halt that was UNREACHABLE
+    via the new-format START burst.
+  * REMAINING to fully wire the operator flow: (i) have pg_upgrade / an
+    orchestration step actually CALL pg_write_pg_upgrade_handoff() on the live old
+    primary before shutdown (today the test calls it directly; decide whether
+    pg_upgrade drives it or it stays an operator/HA-tool primitive -- pg_upgrade
+    itself never connects to the old primary as a standby-visible writer, so this
+    likely belongs to the HA/orchestration layer, not pg_upgrade core); (ii) block
+    the standby from serving any connection during the handoff window (see below);
+    (iii) chain to the out-of-band replay-from-CN provisioning (already proven).
 
-Status:
-- The re-anchor + replay-from-CN half WORKS and is tested (run_standby_test.sh):
-  deliver the upgrade WAL, first startup arms the bootstrap and replays from CN.
-- The halt-at-START half is CODED (pg_upgrade_redo START guard FATALs with a
-  standby-specific message when StandbyMode && !in_upgrade_bootstrap) but NOT
-  exercised end to end, because:
-    * file-delivering the window into pg_wal/ makes the startup scan arm the
-      bootstrap and apply directly -> it never halts;
-    * the halt is intrinsically a LIVE-STREAMING behavior (window arrives after
-      startup), and live streaming currently cannot reach START (see item 2).
+DESIGN CORRECTION (2026-07-14): the original "standby streams into
+XLOG_PG_UPGRADE_START on the new binary and halts" model is IMPOSSIBLE
+cross-version.  WAL page magic is version-stamped (v18=0xD118, v20=0xD120), so:
+  * a v18 standby cannot read the v20 upgrade burst (wrong magic), and
+  * a v20 standby cannot read the v18 tail it is sitting in.
+No single running standby can walk from the old WAL into the new upgrade WAL.
+(See item 2 for the full proof.)  So the burst's v20 XLOG_PG_UPGRADE_START can
+NEVER be the thing that stops a streaming standby -- it is unreadable by the
+streaming (old) binary.  The v20 START record is correct as-is for its ONLY real
+consumer: PerformWalUpgradeIfNeeded() on the v20 replayer, to bound the window
+and derive CN.
 
-ROOT CAUSE of "the guard never fires" (2026-07-14, resolved): the START guard in
-pg_upgrade_redo() is fine and IS dispatched for every replayed record.  The
-reason a streaming/archive standby never triggers it is that REPLAY NEVER REACHES
-START: the upgrade window is not contiguous with where the standby's replay
-stops.  Traced with guardtrace.sh (same-version, window in archive only): the old
-cluster ended at seg 5, but the upgrade window is at segs 8-9 (segs 6-7 do not
-exist); archive recovery restored segs 2-4, reached consistency, and STOPPED at
-the gap -- long before START.  So:
-  * "the guard didn't fire" == "replay stopped at the WAL gap before START",
-    NOT "the guard is bypassed".
-  * the halt-at-START and the live-streaming-follow are the SAME problem: both
-    need the window CONTIGUOUS with the standby's replay position.  Until item 2
-    (full contiguity: continue the old cluster's last partial segment + no burst
-    drift) is solved, neither streaming-follow NOR halt-at-START is reachable.
-  * the earlier "archive recovery replayed the window without the guard" reading
-    was WRONG: it stopped before the window; the same-version data match was the
-    untouched basebackup, not a replay (see 1b -- only the cross-version test can
-    tell the difference).
+TRIGGER vs TRANSPORT (the corrected design):
+  * TRANSPORT of the upgrade is inherently OUT-OF-BAND: the self-contained v20
+    window is delivered to the standby (file copy) and replayed into a fresh v20
+    skeleton from CN.  This is done and proven (run_standby_xversion_test.sh,
+    run_e2e_equivalence_test.sh).  Nothing streams the burst.
+  * TRIGGER (this item, to build): an OLD-FORMAT WAL record emitted into the OLD
+    cluster's OWN WAL stream, just before pg_upgrade shuts the old cluster down.
+    Because it is old-format and chained onto the old stream, a streaming
+    old-version standby READS it normally.  On seeing it, the standby performs a
+    clean HANDOFF: stop applying at that known LSN, shut down cleanly, and signal
+    the operator/automation "upgrade beginning -- swap to the new binary/VM and
+    fetch the new-version window".  It is a CONTROL SIGNAL, not a data path: it
+    initiates shutdown + new-cluster preparation, then the out-of-band transport
+    above takes over.
 
-The window-in-pg_wal path is different and WORKS: PerformWalUpgradeIfNeeded()'s
-startup scan finds the window in pg_wal/, arms, and replays from CN directly
-(no streaming contiguity needed).  This is the skeleton model proven by
-run_standby_xversion_test.sh.
+FORWARD-LOOKING CONSTRAINT: the trigger record must be emitted by the version
+being upgraded FROM, so it only helps upgrades OUT OF a version that already
+ships it (e.g. helps vN->vN+1 once vN emits it; cannot retrofit a stock-v18
+source).  On this fork, old and new are both the fork, so it is implementable and
+testable same-fork now.
 
-OLD (superseded) note kept for history --
-run_standby_stream_half_test.sh drives the standby via ARCHIVE recovery
-(recovery.signal + restore_command; window in the archive only, NOT pre-staged
-in pg_wal, so the startup scan cannot pre-arm the bootstrap).  Result:
-  - PerformWalUpgradeIfNeeded did NOT run/arm (0 "arming" messages),
-  - the START guard did NOT FATAL (no "pg_upgrade WAL encountered"),
-  - yet the upgrade window (START/DIRSKEL/RELFILE/SLRU/COMPLETE) REPLAYED via
-    ordinary archive redo and the cluster converged (fingerprint matched the
-    primary) and was WRITABLE.
-This contradicts the guard's stated premise that the image records are "only
-safe from the sanctioned bootstrap".  Two possibilities to run down:
-  (a) the guard is over-conservative and archive recovery can just replay the
-      window -- in which case the halt may be unnecessary for the archive path;
-      OR
-  (b) the records applied in a subtly-unsafe way (old-cluster page LSNs below
-      the replay point) that a row-count/writable check does NOT catch -- needs
-      the PHYSICAL page comparison (run_compare_test-style, LSN/checksum-aware)
-      against the upgraded primary to confirm byte-correctness, not just logical.
-Do NOT trust "logical fingerprint matched + writable" as proof of FPI-LSN
-safety here.  Resolve (a) vs (b) before relying on the archive-recovery path.
-Also note: recovery.signal is ARCHIVE recovery, NOT StandbyMode, so the
-StandbyMode-specific halt message added in this work would not fire on this
-path anyway.
+TWO START-LIKE RECORDS, complementary (do not conflate):
+  | record            | format | lives in           | consumer            | job                      |
+  | old TRIGGER (new) | old    | old cluster WAL    | streaming old stby  | halt + prepare handoff   |
+  | v20 START (exists)| new    | upgrade burst      | v20 replayer        | bound window + derive CN |
 
-TODO:
-- Investigate the finding above (a vs b) FIRST -- it may change the whole halt
-  design.
-- Build the live-streaming trigger: on reaching START mid-stream, confirm the
-  whole START..COMPLETE window is present, then stop cleanly (the halt) rather
-  than relying on the walreceiver erroring out.
-- Decide the halt mechanism: keep the recovery-process FATAL (chosen: the old
-  binary is about to be swapped anyway) vs. a graceful shutdown. Do NOT attempt
-  a graceful in-loop shutdown without confirming it is safe.
-- Block the standby from serving ANY connection while the window replays. Today
-  pgUpgradeReplayInProgress only prevents hot-standby ACTIVATION, not an
-  already-active standby -- verify/extend so no client sees a half-upgraded
-  cluster.
-- Add an end-to-end test once live streaming can reach START.
+IMPLEMENTATION PLAN:
+- New WAL record emitted on the OLD (still-running-under-pg_upgrade) primary,
+  before the final shutdown, via a SQL function on the old cluster (old binary
+  has it because it is the fork).  Carries no upgrade data -- just a marker +
+  maybe the target major version for logging.
+- Redo/replay handler in the OLD binary: when a StandbyMode server replays the
+  trigger, stop cleanly at that LSN with a clear "prepare for upgrade handoff"
+  message (do NOT apply anything past it).  Decide mechanism: pause-and-promote
+  vs. clean shutdown; a controlled shutdown at the trigger LSN is the goal so the
+  operator can swap binaries and re-provision from the delivered v20 window.
+- The standby must serve NO writes/connections in a half-upgraded state during
+  the handoff window (extend pgUpgradeReplayInProgress semantics if needed).
+- End-to-end test: old fork primary + streaming standby -> emit trigger ->
+  assert the standby halts cleanly at the trigger LSN with the handoff message
+  (this IS reachable, unlike the old v20-START streaming model) -> then out-of-band
+  deliver + replay-from-CN as today -> converged v-new standby.
+
+SUPERSEDED history (kept brief): earlier the halt was coded as a
+pg_upgrade_redo() FATAL guard on the v20 START under StandbyMode.  That guard is
+DEAD for the streaming case (the v20 START is unreadable by the streaming old
+binary) -- it remains only as a defensive check for the file-delivered replayer.
+The guardtrace.sh "replay stopped at a WAL gap before START" finding was a
+symptom of the same version/format boundary, not a fixable contiguity gap.
 
 ## 1b. CROSS-VERSION standby: PG_VERSION pre-replay gate blocks it (PROVEN)
 
@@ -148,21 +152,70 @@ TODO for cross-version standby:
 ## 2. Residual WAL contiguity for live streaming
 
 `pg_resetwal --control-only` (introduced this session) closed the gross gap
-(measured ~5 segments -> 0; CN now lands right after the old cluster's WAL end).
-But pure live streaming still cannot follow, for two segment-boundary reasons:
+(measured ~5 segments -> 0).
 
-  1. The old cluster's LAST segment is usually PARTIAL; the `-l` reset starts the
-     new WAL at the NEXT segment, so a caught-up standby (at the start of that
-     partial segment) asks the new primary for a segment it does not have
-     ("requested WAL segment ... has already been removed").  The new WAL would
-     need to continue the old cluster's last partial segment, not skip to the
-     next.
-  2. Residual burst drift: CHECKPOINT (CN) + the burst-server restart still
-     advance a couple of segments past the `-l` point.
+MEASURED DEFINITIVELY (2026-07-14, gapdiag.sh, clean single-INSERT run):
+  old cluster last WAL:  0/017A30D0  seg 000000010000000000000001 (MID-segment)
+  new cluster first WAL: 0/02000028  seg 000000010000000000000002 (boundary),
+                         record = CHECKPOINT_SHUTDOWN ... prev 0/00000000
+So:
+  * SEGMENT-level gap is ZERO -- old ends in seg 1, new begins in seg 2,
+    consecutive, nothing missing.  The task "make the gap zero" is DONE at the
+    granularity pg_resetwal controls; the earlier 2->4 / 5->8 gaps were an
+    artifact of extra pg_switch_wal in those runs, not the real flow.
+  * What REMAINS is NOT a segment gap but a WAL-CHAIN discontinuity, and it is
+    NOT closable with pg_resetwal:
+      (a) the old cluster ends MID-segment (0/017A30D0); `pg_resetwal -l` can
+          only position at SEGMENT-BOUNDARY granularity, so the new WAL must
+          start at the next boundary (0/02000000), leaving the sub-segment tail
+          0/017A30D0 -> 0/02000000 with no valid continuation; and
+      (b) the new cluster's first record is a FRESH WAL START (prev 0/00000000),
+          not a continuation of the old chain.  A streaming standby at 0/017A30D0
+          cannot chain forward into a record whose prev is 0/0 -- the redo chain
+          is broken, independent of segment adjacency.
 
-NOTE: this only matters for the pure live-streaming path (item 1).  The
-file-delivered standby path re-anchors at CN and does NOT need contiguity, so
-this is not blocking the tested capability.
+CONSEQUENCE: pure live-streaming follow would require the new cluster's WAL to
+GENUINELY CONTINUE the old chain -- start at the exact old-end LSN with prev
+pointing at the old cluster's last record.  The only Postgres mechanism for
+"fork the WAL at an exact LSN and continue" is a TIMELINE SWITCH (.history fork
+at 0/017A30D0).  That is exactly the approach the earlier experiment DISPROVED
+for two independently-reset clusters (primary lands on TLI 2, standby computes
+TLI 3, "highest timeline 2 behind recovery timeline 3").  pg_resetwal's
+segment-granular fresh-start positioning fundamentally cannot synthesize
+chain-continuous WAL.
+
+ROOT CAUSE, cross-version (2026-07-14, magictest -- SUPERSEDES the above for the
+real use case): even a PERFECTLY chain-continuous stream is unreadable across a
+major version, because WAL PAGE MAGIC is version-stamped:
+    v18 pages = 0xD118   (seg header bytes 18 d1)
+    v20 pages = 0xD120   (seg header bytes 20 d1)
+After halting to upgrade, the standby runs on the NEW (v20) binary; its WAL
+reader validates every page against XLOG_PAGE_MAGIC == 0xD120 and REJECTS the
+old cluster's v18 (0xD118) pages -- the very segment it is sitting in at the
+halt LSN -- BEFORE it can chain forward into the burst.  So there is no single
+contiguous WAL stream simultaneously readable by the version that wrote the tail
+(v18) and the version that must replay the head (v20).  The major-version WAL
+format change IS a hard WAL-stream boundary.
+
+Consequences that this settles definitively:
+  * "continue the old chain in the first place" is IMPOSSIBLE cross-version --
+    the old tail is physically v18-format pages the v20 replayer cannot read.
+  * splicing the old cluster's last segment into the new pg_wal (the "skip
+    pg_resetwal" idea) also dies here: that segment is v18-format.
+  * the timeline-fork idea dies here too: a .history fork does not change page
+    magic.
+  * therefore LIVE-STREAMING halt-at-START is fundamentally UNREACHABLE for a
+    cross-version upgrade; replay stops at the VERSION boundary, not a fixable
+    gap.  (Same-version streaming could be made continuous by splicing the old
+    last segment + --control-only anchoring at the old shutdown checkpoint, but
+    same-version upgrade is not the use case and proves nothing -- see 1b.)
+
+NOTE: none of this blocks the tested capability.  The file-delivered / skeleton
+standby path re-anchors at CN and never tries to read across the v18->v20 WAL
+boundary: it replays the self-contained v20 burst into a fresh v20 skeleton from
+CN.  That is not a workaround -- given the version-stamped page magic it is the
+ONLY correct model.  Proven by run_standby_xversion_test.sh and
+run_e2e_equivalence_test.sh (both pass).
 
 ## 3. Decide the fate of `pg_resetwal --control-only`
 

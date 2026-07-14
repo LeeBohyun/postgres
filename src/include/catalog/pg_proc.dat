@@ -6832,6 +6832,11 @@
   proname => 'pg_write_pg_upgrade_complete', provolatile => 'v',
   prorettype => 'pg_lsn', proargtypes => 'int4 int4',
   prosrc => 'pg_write_pg_upgrade_complete' },
+# LEE: old-format streaming-handoff trigger, emitted on the live old primary
+{ oid => '9706', descr => 'write pg_upgrade streaming-handoff trigger WAL marker',
+  proname => 'pg_write_pg_upgrade_handoff', provolatile => 'v',
+  prorettype => 'pg_lsn', proargtypes => 'int4',
+  prosrc => 'pg_write_pg_upgrade_handoff' },
 # LEE: force-flush SLRU dirty pages for --wal-log-upgrade (bypasses fsync=off)
 { oid => '9705', descr => 'flush upgrade SLRU pages to disk',
   proname => 'pg_flush_upgrade_slru', provolatile => 'v',

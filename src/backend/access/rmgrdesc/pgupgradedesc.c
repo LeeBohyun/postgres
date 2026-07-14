@@ -87,6 +87,16 @@ pg_upgrade_desc(StringInfo buf, XLogReaderState *record)
 						 xlrec.nsymlinks, xlrec.sym_bytes,
 						 xlrec.ndirs > 0 ? first : "");
 	}
+	else if (info == XLOG_PG_UPGRADE_HANDOFF)
+	{
+		xl_pg_upgrade_handoff xlrec;
+
+		memcpy(&xlrec, rec, SizeOfXLPgUpgradeHandoff);
+		appendStringInfo(buf, "old_major_version %u; target_major_version %u; time %lld",
+						 xlrec.old_major_version,
+						 xlrec.target_major_version,
+						 (long long) xlrec.handoff_time);
+	}
 }
 
 const char *
@@ -106,6 +116,8 @@ pg_upgrade_identify(uint8 info)
 			return "UPGRADE_RAWFILE";
 		case XLOG_UPGRADE_DIRSKEL:
 			return "UPGRADE_DIRSKEL";
+		case XLOG_PG_UPGRADE_HANDOFF:
+			return "PG_UPGRADE_HANDOFF";
 	}
 	return NULL;
 }

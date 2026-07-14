@@ -99,6 +99,10 @@ typedef struct CheckPoint
 												 * (pg_filenode.map, PG_VERSION) */
 #define XLOG_UPGRADE_DIRSKEL			0x40	/* logged after-image of the initdb
 												 * directory tree */
+#define XLOG_PG_UPGRADE_HANDOFF			0x60	/* OLD-format streaming-handoff
+												 * trigger, emitted in the OLD
+												 * cluster's own WAL just before
+												 * pg_upgrade shuts it down */
 #define XLOG_CHECKPOINT_REDO			0xE0
 #define XLOG_LOGICAL_DECODING_STATUS_CHANGE	0xF0
 
@@ -123,6 +127,37 @@ typedef struct xl_pg_upgrade
 } xl_pg_upgrade;
 
 #define SizeOfXLPgUpgrade	sizeof(xl_pg_upgrade)
+
+/*
+ * LEE: XLOG_PG_UPGRADE_HANDOFF — the streaming-standby handoff TRIGGER.
+ *
+ * Unlike every other pg_upgrade WAL record (which is written by the NEW cluster
+ * in the NEW WAL page format and is only readable by the new binary), this
+ * record is emitted into the OLD cluster's OWN WAL stream, in the OLD format,
+ * just before pg_upgrade shuts the old primary down.  Because it is chained onto
+ * the old stream in the old page format, a physical standby still streaming the
+ * old primary READS it normally -- which the new-format upgrade burst can never
+ * be (see pgupgrade_wal.c: the major-version WAL page magic differs, so a v18
+ * standby cannot read v20 WAL and vice versa).
+ *
+ * It carries NO upgrade data.  Its only job is to be a control signal: when a
+ * StandbyMode server replays it, the standby stops cleanly at this LSN and
+ * reports that an upgrade handoff is beginning, so the operator/automation can
+ * swap to the new-version binary/host and re-provision from the delivered
+ * new-version upgrade window (which is replayed from CN, out of band).  It is a
+ * TRIGGER, not a TRANSPORT.
+ *
+ * target_major_version is informational (for the log message); the standby does
+ * not act on it beyond reporting.
+ */
+typedef struct xl_pg_upgrade_handoff
+{
+	uint32		old_major_version;	/* this (old) cluster's major version */
+	uint32		target_major_version;	/* major version being upgraded to */
+	pg_time_t	handoff_time;		/* wall-clock time of this record */
+} xl_pg_upgrade_handoff;
+
+#define SizeOfXLPgUpgradeHandoff	sizeof(xl_pg_upgrade_handoff)
 
 /*
  * LEE: XLOG_UPGRADE_SLRU_DATA — full page image of one SLRU segment, emitted

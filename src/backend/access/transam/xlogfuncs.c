@@ -361,6 +361,43 @@ pg_write_pg_upgrade_complete(PG_FUNCTION_ARGS)
 }
 
 /*
+ * LEE: pg_write_pg_upgrade_handoff(target_major_version integer) → pg_lsn
+ *
+ * Emit the OLD-format streaming-handoff TRIGGER into THIS (old) cluster's WAL.
+ * Called by an operator/orchestrator on the LIVE OLD PRIMARY just before it is
+ * shut down for a --wal-log-upgrade, so a physical standby still streaming the
+ * old primary receives the trigger and halts cleanly for the upgrade handoff.
+ *
+ * This is emitted by the OLD binary on the OLD primary -- NOT by pg_upgrade's
+ * private new-cluster postmaster -- because only the old primary's WAL stream
+ * reaches the standby, and only the old page format is readable by the standby
+ * (still on the old binary).  See xl_pg_upgrade_handoff.
+ *
+ * Restricted to superusers; only valid outside recovery (it is a primary that
+ * is about to be upgraded).
+ */
+Datum
+pg_write_pg_upgrade_handoff(PG_FUNCTION_ARGS)
+{
+	uint32		target_major = PG_GETARG_UINT32(0);
+	XLogRecPtr	lsn;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to write pg_upgrade WAL markers")));
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("WAL control functions cannot be executed during recovery.")));
+
+	lsn = XLogWritePgUpgradeHandoff(PG_VERSION_NUM / 10000, target_major);
+	PG_RETURN_LSN(lsn);
+}
+
+/*
  * LEE: pg_write_upgrade_slru_data(slru_type integer) → pg_lsn
  *
  * Emit XLOG_UPGRADE_SLRU_DATA records for all segment files in the given SLRU

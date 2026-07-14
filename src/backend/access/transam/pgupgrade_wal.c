@@ -530,6 +530,50 @@ pg_upgrade_redo(XLogReaderState *record)
 		 */
 		pgUpgradeReplayInProgress = false;
 	}
+	else if (info == XLOG_PG_UPGRADE_HANDOFF)
+	{
+		/*
+		 * LEE: the OLD-format streaming-handoff TRIGGER.  This record was emitted
+		 * into the OLD primary's own WAL (old page format) just before pg_upgrade
+		 * shut it down, and a physical standby still streaming the old primary
+		 * has now replayed it.  It carries NO upgrade data -- it is purely a
+		 * control signal.
+		 *
+		 * When a StandbyMode server reaches it, stop cleanly at this LSN: an
+		 * upgrade is beginning on the primary, and everything past this point in
+		 * the old stream is either nonexistent (the primary is shutting down) or,
+		 * once the upgrade completes, in the NEW WAL page format that this OLD
+		 * binary cannot read.  So there is nothing more to stream; the operator
+		 * must swap to the new-version binary/host and re-provision this standby
+		 * from the delivered new-version upgrade window (replayed from CN, out of
+		 * band -- see PerformWalUpgradeIfNeeded()).
+		 *
+		 * A recovery-process FATAL is the right mechanism: the old-version binary
+		 * cannot proceed past the handoff anyway (it is about to be replaced), and
+		 * this cleanly brings the standby down for that swap.  We deliberately do
+		 * NOT attempt a graceful in-loop shutdown from a redo callback.
+		 *
+		 * Outside StandbyMode (e.g. ordinary crash recovery of the old primary
+		 * that itself wrote this record before shutdown), the trigger is a no-op:
+		 * it means only "an upgrade was initiated from here", and normal recovery
+		 * of the old cluster continues.
+		 */
+		if (StandbyMode)
+		{
+			xl_pg_upgrade_handoff *xlrec =
+				(xl_pg_upgrade_handoff *) XLogRecGetData(record);
+
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("reached pg_upgrade handoff on standby; halting for upgrade"),
+					 errdetail("The primary initiated a --wal-log-upgrade to major version %u; "
+							   "this standby cannot follow the upgrade in the old WAL format.",
+							   xlrec->target_major_version),
+					 errhint("Install the new-version binaries and re-provision this standby "
+							 "from the delivered upgrade WAL; it will replay the upgrade from "
+							 "the end-of-upgrade checkpoint.")));
+		}
+	}
 	else if (info == XLOG_UPGRADE_DIRSKEL)
 	{
 		/*

@@ -23,6 +23,8 @@ extern const char *pg_upgrade_identify(uint8 info);
 /* Emit functions called via SQL wrappers in xlogfuncs.c */
 extern XLogRecPtr XLogWritePgUpgrade(bool is_start, uint32 old_major_version,
 									 uint32 new_major_version);
+extern XLogRecPtr XLogWritePgUpgradeHandoff(uint32 old_major_version,
+											uint32 target_major_version);
 extern XLogRecPtr XLogWriteUpgradeSlruData(uint8 slru_type);
 extern XLogRecPtr XLogWriteUpgradeRawFile(const char *path);
 extern XLogRecPtr XLogWriteUpgradeDirSkel(void);

@@ -8762,6 +8762,44 @@ XLogWritePgUpgrade(bool is_start, uint32 old_major_version,
 }
 
 /*
+ * LEE: XLogWritePgUpgradeHandoff — emit the OLD-format streaming-handoff trigger.
+ *
+ * Called on the LIVE OLD primary (via pg_write_pg_upgrade_handoff()) just before
+ * pg_upgrade shuts it down.  This runs under the OLD binary, so the record is
+ * written in the OLD WAL page format and streamed to a physical standby that is
+ * still following the old primary.  See xl_pg_upgrade_handoff for why this is a
+ * separate record from the new-format XLOG_PG_UPGRADE_START burst.
+ */
+XLogRecPtr
+XLogWritePgUpgradeHandoff(uint32 old_major_version, uint32 target_major_version)
+{
+	xl_pg_upgrade_handoff xlrec;
+	XLogRecPtr	RecPtr;
+
+	xlrec.old_major_version = old_major_version;
+	xlrec.target_major_version = target_major_version;
+	xlrec.handoff_time = (pg_time_t) time(NULL);
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfXLPgUpgradeHandoff);
+	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_PG_UPGRADE_HANDOFF);
+
+	/*
+	 * Flush it: the whole point is that a streaming standby receives this record
+	 * before the primary shuts down, so it must be on disk / sent, not buffered.
+	 */
+	XLogFlush(RecPtr);
+
+	ereport(LOG,
+			(errmsg("pg_upgrade handoff trigger recorded at %X/%X "
+					"(old major version %u, target major version %u)",
+					LSN_FORMAT_ARGS(RecPtr),
+					old_major_version, target_major_version)));
+
+	return RecPtr;
+}
+
+/*
  * LEE: recursively collect PGDATA-relative subdirectory paths under "abspath"
  * (whose PGDATA-relative prefix is "relpath"), appending each as a
  * NUL-terminated string to "buf" and counting them in *ndirs.  Parent
