@@ -27,7 +27,31 @@ Status:
     * the halt is intrinsically a LIVE-STREAMING behavior (window arrives after
       startup), and live streaming currently cannot reach START (see item 2).
 
-UNEXPECTED FINDING (2026-07-14, needs investigation) --
+ROOT CAUSE of "the guard never fires" (2026-07-14, resolved): the START guard in
+pg_upgrade_redo() is fine and IS dispatched for every replayed record.  The
+reason a streaming/archive standby never triggers it is that REPLAY NEVER REACHES
+START: the upgrade window is not contiguous with where the standby's replay
+stops.  Traced with guardtrace.sh (same-version, window in archive only): the old
+cluster ended at seg 5, but the upgrade window is at segs 8-9 (segs 6-7 do not
+exist); archive recovery restored segs 2-4, reached consistency, and STOPPED at
+the gap -- long before START.  So:
+  * "the guard didn't fire" == "replay stopped at the WAL gap before START",
+    NOT "the guard is bypassed".
+  * the halt-at-START and the live-streaming-follow are the SAME problem: both
+    need the window CONTIGUOUS with the standby's replay position.  Until item 2
+    (full contiguity: continue the old cluster's last partial segment + no burst
+    drift) is solved, neither streaming-follow NOR halt-at-START is reachable.
+  * the earlier "archive recovery replayed the window without the guard" reading
+    was WRONG: it stopped before the window; the same-version data match was the
+    untouched basebackup, not a replay (see 1b -- only the cross-version test can
+    tell the difference).
+
+The window-in-pg_wal path is different and WORKS: PerformWalUpgradeIfNeeded()'s
+startup scan finds the window in pg_wal/, arms, and replays from CN directly
+(no streaming contiguity needed).  This is the skeleton model proven by
+run_standby_xversion_test.sh.
+
+OLD (superseded) note kept for history --
 run_standby_stream_half_test.sh drives the standby via ARCHIVE recovery
 (recovery.signal + restore_command; window in the archive only, NOT pre-staged
 in pg_wal, so the startup scan cannot pre-arm the bootstrap).  Result:
