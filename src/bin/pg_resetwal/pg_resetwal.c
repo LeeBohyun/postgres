@@ -104,6 +104,12 @@ static int	WalSegSz;
 /* LEE: --system-identifier: overwrite pg_control's sysid (preserve old cluster's) */
 static bool set_system_identifier = false;
 static uint64 new_system_identifier = 0;
+/* LEE: --control-only: edit control-file counters but do NOT reposition/rewrite
+ * the WAL (skip newXlogSegNo++, KillExistingXLOG, WriteEmptyXLOG).  Used by
+ * pg_upgrade --wal-log-upgrade so the counter transplants do not march the WAL
+ * forward a segment each, which would leave a hole a streaming standby cannot
+ * cross.  The existing checkpoint/redo LSN and WAL segments are left intact. */
+static bool control_only = false;
 
 static void CheckDataVersion(void);
 static bool read_controlfile(void);
@@ -140,6 +146,8 @@ main(int argc, char *argv[])
 		{"char-signedness", required_argument, NULL, 2},
 		/* LEE: preserve the old cluster's system identifier for --wal-log-upgrade */
 		{"system-identifier", required_argument, NULL, 3},
+		/* LEE: edit control-file counters WITHOUT repositioning/rewriting WAL */
+		{"control-only", no_argument, NULL, 4},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -373,6 +381,11 @@ main(int argc, char *argv[])
 					}
 					break;
 
+				/* LEE: --control-only (edit counters, leave WAL in place) */
+				case 4:
+					control_only = true;
+					break;
+
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -576,14 +589,25 @@ main(int argc, char *argv[])
 
 	/*
 	 * Else, do the dirty deed.
+	 *
+	 * LEE: in --control-only mode we ONLY rewrite the control file (with the
+	 * requested counter overrides applied above); we do NOT reposition the redo
+	 * pointer to a fresh segment and do NOT kill/rewrite the WAL.  This lets
+	 * pg_upgrade --wal-log-upgrade transplant the XID/OID/multixact counters
+	 * without marching the WAL forward a segment per call, so the end-of-upgrade
+	 * checkpoint stays contiguous with the old cluster's WAL end.
 	 */
 	RewriteControlFile();
-	KillExistingXLOG();
-	KillExistingArchiveStatus();
-	KillExistingWALSummaries();
-	WriteEmptyXLOG();
-
-	printf(_("Write-ahead log reset\n"));
+	if (!control_only)
+	{
+		KillExistingXLOG();
+		KillExistingArchiveStatus();
+		KillExistingWALSummaries();
+		WriteEmptyXLOG();
+		printf(_("Write-ahead log reset\n"));
+	}
+	else
+		printf(_("Control file updated (WAL left in place)\n"));
 	return 0;
 }
 
@@ -935,6 +959,23 @@ PrintNewControlValues(void)
 static void
 RewriteControlFile(void)
 {
+	/*
+	 * LEE: --control-only — write the control file with the requested counter
+	 * overrides already applied by main(), but leave ALL WAL-position and
+	 * recovery state untouched: do not move the redo pointer to newXlogSegNo, do
+	 * not reset the checkpoint LSN, minRecoveryPoint, backup fields, or the
+	 * max_* / wal_level fields.  Preserving checkPoint/redo (and not killing the
+	 * WAL in main()) keeps the new cluster's WAL contiguous with the old
+	 * cluster's end, which a streaming standby requires.
+	 */
+	if (control_only)
+	{
+		ControlFile.checkPointCopy.time = (pg_time_t) time(NULL);
+		/* The control file gets flushed here. */
+		update_controlfile(".", &ControlFile, true);
+		return;
+	}
+
 	/*
 	 * Adjust fields as needed to force an empty XLOG starting at
 	 * newXlogSegNo.
