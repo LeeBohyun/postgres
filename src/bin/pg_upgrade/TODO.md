@@ -27,7 +27,33 @@ Status:
     * the halt is intrinsically a LIVE-STREAMING behavior (window arrives after
       startup), and live streaming currently cannot reach START (see item 2).
 
+UNEXPECTED FINDING (2026-07-14, needs investigation) --
+run_standby_stream_half_test.sh drives the standby via ARCHIVE recovery
+(recovery.signal + restore_command; window in the archive only, NOT pre-staged
+in pg_wal, so the startup scan cannot pre-arm the bootstrap).  Result:
+  - PerformWalUpgradeIfNeeded did NOT run/arm (0 "arming" messages),
+  - the START guard did NOT FATAL (no "pg_upgrade WAL encountered"),
+  - yet the upgrade window (START/DIRSKEL/RELFILE/SLRU/COMPLETE) REPLAYED via
+    ordinary archive redo and the cluster converged (fingerprint matched the
+    primary) and was WRITABLE.
+This contradicts the guard's stated premise that the image records are "only
+safe from the sanctioned bootstrap".  Two possibilities to run down:
+  (a) the guard is over-conservative and archive recovery can just replay the
+      window -- in which case the halt may be unnecessary for the archive path;
+      OR
+  (b) the records applied in a subtly-unsafe way (old-cluster page LSNs below
+      the replay point) that a row-count/writable check does NOT catch -- needs
+      the PHYSICAL page comparison (run_compare_test-style, LSN/checksum-aware)
+      against the upgraded primary to confirm byte-correctness, not just logical.
+Do NOT trust "logical fingerprint matched + writable" as proof of FPI-LSN
+safety here.  Resolve (a) vs (b) before relying on the archive-recovery path.
+Also note: recovery.signal is ARCHIVE recovery, NOT StandbyMode, so the
+StandbyMode-specific halt message added in this work would not fire on this
+path anyway.
+
 TODO:
+- Investigate the finding above (a vs b) FIRST -- it may change the whole halt
+  design.
 - Build the live-streaming trigger: on reaching START mid-stream, confirm the
   whole START..COMPLETE window is present, then stop cleanly (the halt) rather
   than relying on the walreceiver erroring out.
@@ -39,6 +65,61 @@ TODO:
   already-active standby -- verify/extend so no client sees a half-upgraded
   cluster.
 - Add an end-to-end test once live streaming can reach START.
+
+## 1b. CROSS-VERSION standby: PG_VERSION pre-replay gate blocks it (PROVEN)
+
+run_standby_xversion_test.sh does a REAL cross-version test (old = PG18.4, new =
+20devel), which is the only way to actually prove the standby replayed the
+upgrade (a same-version test can't -- the v18 basebackup already matches the
+"upgraded" v-same primary whether or not anything replayed).
+
+Result: the standby FAILS to start on the new binary:
+  FATAL: database files are incompatible with server
+  DETAIL: The data directory was initialized by PostgreSQL version 18, which is
+          not compatible with this version 20devel.
+Cause: ValidatePgVersion() reads the on-disk PG_VERSION (=18, from the v18
+basebackup) at startup, BEFORE any WAL is replayed, and refuses.  So the upgrade
+WAL -- whose XLOG_PG_UPGRADE_START record carries and would install the new
+PG_VERSION -- never gets to run.  PG_VERSION is a pre-replay BOOTSTRAP file, like
+pg_control: it gates whether replay starts, so it cannot be supplied by the WAL
+itself.
+
+This also invalidates the earlier same-version "standby works" confidence: those
+tests passed only because 18-vs-18 (really 20devel-vs-20devel) sails through the
+version gate and the on-disk copy already matched.  The cross-version test is the
+real acceptance test and it currently fails at the version gate.
+
+There are TWO pre-replay version gates, both v18 in the basebackup:
+  1. PG_VERSION file (=18): ValidatePgVersion() FATAL.
+  2. pg_control (PG_CONTROL_VERSION 1800): "cluster initialized with
+     PG_CONTROL_VERSION 1800, server compiled with 1902" FATAL.
+Bumping only PG_VERSION is not enough; the pg_control gate fires next.
+
+CONCLUSION (matches the "skeleton" model): a cross-version standby CANNOT reuse
+its old v18 data directory -- the new binary rejects it before replay on both
+gates.  It needs a FRESH NEW-VERSION SKELETON (a v20 initdb, or at least v20
+PG_VERSION + v20-initialized pg_control) into which the upgrade WAL replays from
+CN.  This is exactly what run_e2e_equivalence_test.sh already does (fresh initdb
+target + sysid stamp + upgrade WAL, in-band CN derivation) -- and why THAT test
+works while reusing the old standby dir cannot.
+
+So the real cross-version standby flow is:
+  standby streams to START -> halts -> operator builds/points at a NEW-version
+  skeleton (fresh initdb of the new binary, sysid stamped to the old cluster) ->
+  deliver the upgrade WAL -> replay from CN into the skeleton -> v20 standby.
+The "reuse the old data dir in place" idea does not work across versions; the
+old files are the wrong version and are only unreferenced garbage after replay
+anyway (design-doc Q2).
+
+TODO for cross-version standby:
+- Adapt run_standby_xversion_test.sh to the skeleton model: instead of relaunching
+  the v18 standby dir on the new binary, build a fresh v20 initdb skeleton, stamp
+  the old sysid, deliver the upgrade WAL, and replay -- then assert catalog
+  version changed 202506291 -> 202607022, data matches, writable.  That is the
+  real proof the standby upgraded via WAL.
+- Binaries on the Arca dev box: old PG18.4 at
+  /home/bohyun.lee/postgres/pg18-src/tmp_install/.../pg18-initdb/bin; new 20devel
+  at ~/wal_test/inst/bin.
 
 ## 2. Residual WAL contiguity for live streaming
 
