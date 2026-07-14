@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full end-to-end validation of the "spawn fresh cluster, replay upgrade WAL"
-# path (the Neon / upgraded-standby workflow), checked against a VANILLA
+# path (the fresh-target / upgraded-standby workflow), checked against a VANILLA
 # pg_upgrade of identical data.
 #
 #   1. Seed one old cluster with representative data.
@@ -23,7 +23,7 @@
 # physically identical modulo the page LSN that replay legitimately rewrites.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"; BIN="${PGBIN:-$ROOT/pginst/bin}"
-W=/tmp/pgu_neon_e2e; P=55540; export PGDATABASE=postgres
+W=/tmp/pgu_e2e_equiv; P=55540; export PGDATABASE=postgres
 rm -rf "$W"; mkdir -p "$W"
 log(){ echo "=== $* ==="; }
 

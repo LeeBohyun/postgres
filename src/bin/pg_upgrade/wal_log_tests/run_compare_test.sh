@@ -61,7 +61,7 @@ common = sorted(set(A) & set(B))
 onlyA = sorted(set(A) - set(B)); onlyB = sorted(set(B) - set(A))
 
 # Non-data files that legitimately differ between vanilla and replay and are
-# NOT authoritative cluster content (matches run_neon_e2e):
+# NOT authoritative cluster content (matches run_e2e_equivalence):
 #   pg_control        -- checkpoint LSN, timestamps, etc.
 #   pg_internal.init  -- ephemeral relcache init file, regenerated per cluster
 IGNORE = {'pg_control', 'pg_internal.init'}
@@ -126,7 +126,7 @@ for rel in common:
         cat['identical'] += 1; continue
     # _fsm / _vm are lazily-maintained derived forks (free-space / visibility
     # map): not authoritative data, legitimately differ between a vanilla
-    # upgrade and a WAL replay.  Report but do not fail (matches run_neon_e2e).
+    # upgrade and a WAL replay.  Report but do not fail (matches run_e2e_equivalence).
     if is_vm_fsm(rel):
         cat['vmfsm'] += 1; continue
     if len(da) != len(db):
@@ -163,7 +163,7 @@ print(f"  differ in real content:    {cat['other_diff']}")
 # Postgres (smgr creates/extends on demand).  The --wal-log-upgrade FPI capture
 # deliberately skips empty files (nothing to image), so replay never recreates
 # them.  Only a NON-empty file present on one side but not the other is a real
-# divergence; empty-only files are expected and benign (same as run_neon_e2e).
+# divergence; empty-only files are expected and benign (same as run_e2e_equivalence).
 onlyA_nonempty = [r for r in onlyA if os.path.getsize(A[r]) > 0]
 onlyB_nonempty = [r for r in onlyB if os.path.getsize(B[r]) > 0]
 if onlyA: print(f"  files only in NORMAL: {len(onlyA)} ({len(onlyA_nonempty)} non-empty) e.g. {onlyA[:5]}")

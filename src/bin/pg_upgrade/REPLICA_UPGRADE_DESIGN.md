@@ -418,7 +418,7 @@ while the upgrade WAL is replaying. Two layers enforce this:
    production `--wal-log-upgrade` leaves the reconstructed files on disk and
    replay is idempotent over them rather than rebuilding from an empty tree.
    NOTE: keep it while the end-to-end equivalence tests
-   (`run_neon_e2e_test.sh`, `run_compare_test.sh`) still depend on the
+   (`run_e2e_equivalence_test.sh`, `run_compare_test.sh`) still depend on the
    wiped-then-replayed cluster to prove WAL completeness.
 
 7. **User tablespaces are NOT handled — silent data loss (CONFIRMED BUG).**
@@ -479,4 +479,4 @@ Already done (independent of the streaming-standby path above):
   - sysid preservation (new cluster carries the old cluster's identifier)
   - connection blocking during replay (pgUpgradeReplayInProgress guard +
     crash-recovery consistency gate) — see "Connection blocking during replay"
-  - end-to-end WAL-replay-vs-vanilla equivalence test (run_neon_e2e_test.sh)
+  - end-to-end WAL-replay-vs-vanilla equivalence test (run_e2e_equivalence_test.sh)
