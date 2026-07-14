@@ -336,16 +336,33 @@ while the upgrade WAL is replaying. Two layers enforce this:
    archive-recovery finalization in place instead of the primary's CN-anchored
    crash-recovery finalization.
 
-   **The one narrow remaining obstacle.** The `pg_upgrade_redo()`
-   XLOG_PG_UPGRADE_START guard FATALs unless `in_upgrade_bootstrap` is armed, and
-   arming happens only via the primary's `pg_wal/` startup scan. A streaming/
-   archive-recovery standby therefore FATALs at START. Applying the FPI images
-   (old, below-replay-point LSNs) must also be NON-serving (FPI-LSN safety).
-   So the constructive work is: arm the bootstrap for a standby that reaches a
-   confirmed START..COMPLETE window, apply it non-serving, and let the existing
-   timeline-switch finalization do the rest. The anchor carries in-band via the
-   CN checkpoint record; no binary-swap sentinel is required if delivery is via
-   recovery.signal + archive recovery.
+   **Status: WORKING for the file-delivered archive-recovery path.** Verified by
+   `run_standby_tli_test.sh`: delivering the upgrade WAL to a standby with
+   `recovery.signal` present (archive recovery) makes it (1) apply the window
+   in-band from CN, (2) finalize via the end-of-recovery TIMELINE SWITCH (to TLI
+   2, no same-timeline fork), and (3) survive a subsequent restart without
+   re-arming.  The `PerformWalUpgradeIfNeeded` startup scan already arms the
+   bootstrap here (the window is present in pg_wal/ at startup), so the START
+   guard does not FATAL in this delivery model.
+
+   Two fixes made this correct across the timeline switch:
+     - "already applied?" is now decided from the CONTROL FILE
+       (`GetControlFileCheckPointLSN() >= COMPLETE's LSN`), not by scanning for a
+       post-COMPLETE checkpoint -- that checkpoint lands on a later timeline the
+       TLI-1 scan cannot read.  Authoritative and timeline-independent.
+     - the pg_wal/ directory scan now bounds itself to TLI-1 segments; after the
+       switch, TLI-2 segments coexist in pg_wal/ and previously pushed the TLI-1
+       reader off the end (FATAL: could not open 00000001...05).
+
+   **What remains (true live-streaming path).** The above delivers WAL as files
+   and keeps the window in pg_wal/ at startup, so the startup scan arms it.  A
+   standby that reaches START by LIVE STREAMING (window not present at startup)
+   still hits the `pg_upgrade_redo()` FATAL, and applying FPI images while
+   serving would violate FPI-LSN safety.  The remaining constructive work is the
+   streaming trigger: pause at a confirmed COMPLETE, re-enter through the
+   sanctioned non-serving path, then let the same timeline-switch finalization
+   run.  The anchor still carries in-band via the CN checkpoint record; no
+   binary-swap sentinel is required for the file-delivered path.
 
 2. **Orphaned old-cluster files.** The standby still has the OLD cluster's files
    on disk (old system-catalog relfilenodes). The upgrade WAL *creates* the new

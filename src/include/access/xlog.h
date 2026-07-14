@@ -283,6 +283,8 @@ extern XLogRecPtr XLogWriteUpgradeSlruData(uint8 slru_type);
 struct CheckPoint;
 extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
 											  XLogRecPtr cn_lsn);
+/* LEE: control-file checkpoint LSN, for the "upgrade already applied?" test */
+extern XLogRecPtr GetControlFileCheckPointLSN(void);
 /* LEE: batched relation-file images live in access/pgupgrade_wal.h */
 extern void UpdateFullPageWrites(void);
 extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p);

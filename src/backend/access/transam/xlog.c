@@ -4673,6 +4673,24 @@ ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn)
 }
 
 /*
+ * LEE: the checkpoint LSN currently recorded in the control file (the position
+ * recovery would start from).  Used by PerformWalUpgradeIfNeeded() to decide
+ * whether a pg_upgrade window has ALREADY been applied: after first startup
+ * replays through XLOG_PG_UPGRADE_COMPLETE and finalizes, this advances PAST
+ * COMPLETE's LSN (on whatever timeline, since LSNs keep increasing across a
+ * timeline switch).  A pending upgrade, by contrast, still points at/before the
+ * end-of-upgrade checkpoint (CN), which precedes COMPLETE.  This is the
+ * authoritative, timeline-independent "already applied?" signal -- no extra
+ * pg_control field or marker is needed.
+ */
+XLogRecPtr
+GetControlFileCheckPointLSN(void)
+{
+	Assert(ControlFile != NULL);
+	return ControlFile->checkPoint;
+}
+
+/*
  * Returns the unique system identifier from control file.
  */
 uint64

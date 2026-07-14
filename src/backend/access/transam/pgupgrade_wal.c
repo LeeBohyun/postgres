@@ -151,13 +151,17 @@ UpgradeWalPageRead(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
  *               pg_upgrade right before the full-page-image burst; it carries
  *               the transplanted XID/OID/multixact counters.
  *   cn_lsn    — the record LSN of that checkpoint (goes to ControlFile.checkPoint).
- *   applied   — true if a checkpoint appears AFTER COMPLETE.  Such a checkpoint
- *               can only have been written by normal operation once the upgrade
- *               was already replayed (the end-of-recovery checkpoint, or a later
- *               one), so its presence means "the upgrade is already applied —
- *               do NOT re-arm and re-replay it."  This is what makes startup
- *               idempotent without a side flag: the WAL itself records whether
- *               the window has been consumed.
+ *   complete_lsn — the record LSN of XLOG_PG_UPGRADE_COMPLETE (InvalidXLogRecPtr
+ *               if not found).  The CALLER decides "already applied?" by
+ *               comparing the control file's current checkpoint LSN against
+ *               this: once first startup has replayed through COMPLETE and
+ *               finalized, pg_control's checkpoint advances PAST complete_lsn
+ *               (on any timeline, since LSNs keep increasing across a timeline
+ *               switch), so the window must not be re-armed.  Reading the answer
+ *               from pg_control (authoritative, durable) rather than scanning
+ *               for a post-COMPLETE checkpoint (transient, and unreachable once
+ *               the scan's timeline diverges) is what keeps this correct after a
+ *               standby's end-of-recovery timeline switch.
  *
  * Returns false if there is no readable WAL at all.
  *
@@ -165,13 +169,12 @@ UpgradeWalPageRead(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
  * arbitrary full-page-image bytes, so any fixed byte pair appears many times by
  * chance.  Detecting the markers and checkpoints with a real XLogReader is what
  * makes the atomicity guarantee sound — a crash mid-upgrade (START but no
- * COMPLETE) is reliably distinguished from a completed one, and an
- * already-applied upgrade from a pending one.
+ * COMPLETE) is reliably distinguished from a completed one.
  */
 static bool
 upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 						 bool *found_complete, CheckPoint *cn,
-						 XLogRecPtr *cn_lsn, bool *applied)
+						 XLogRecPtr *cn_lsn, XLogRecPtr *complete_lsn)
 {
 	DIR		   *dir;
 	struct dirent *de;
@@ -189,7 +192,7 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 	*found_start = false;
 	*found_complete = false;
 	*cn_lsn = InvalidXLogRecPtr;
-	*applied = false;
+	*complete_lsn = InvalidXLogRecPtr;
 	MemSet(cn, 0, sizeof(CheckPoint));
 	MemSet(&last_ckpt, 0, sizeof(CheckPoint));
 
@@ -220,6 +223,16 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 		}
 
 		XLogFromFileName(de->d_name, &ftli, &segno, segsize);
+		/*
+		 * The upgrade WAL (CN..COMPLETE) is always on timeline 1.  Only consider
+		 * TLI-1 segments when bounding the scan: after a standby's end-of-recovery
+		 * timeline switch, higher-TLI segments (e.g. 00000002...) also live in
+		 * pg_wal/, and including them would push the scan's end past the last
+		 * TLI-1 segment, making the TLI-1 reader try to open a nonexistent
+		 * 00000001... segment and FATAL.
+		 */
+		if (ftli != 1)
+			continue;
 		if (!any || segno < lowseg)
 			lowseg = segno;
 		if (!any || segno > highseg)
@@ -274,15 +287,16 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 			(info == XLOG_CHECKPOINT_ONLINE || info == XLOG_CHECKPOINT_SHUTDOWN))
 		{
 			/*
-			 * Track the most recent checkpoint.  Before START this lets us
-			 * capture CN (the last checkpoint preceding START).  After COMPLETE
-			 * a checkpoint means the upgrade has already been applied by a prior
-			 * startup — record that so we do not re-arm and re-replay it.
+			 * Track the most recent checkpoint so that, when we hit START, we
+			 * can capture CN (the last checkpoint preceding START).  We do NOT
+			 * try to detect a post-COMPLETE checkpoint here to infer
+			 * "already applied": after a standby's end-of-recovery timeline
+			 * switch that checkpoint is on a later timeline this TLI-1 scan
+			 * cannot read.  The caller decides "already applied?" authoritatively
+			 * from the control file vs complete_lsn instead.
 			 */
 			memcpy(&last_ckpt, XLogRecGetData(reader), sizeof(CheckPoint));
 			last_ckpt_lsn = reader->ReadRecPtr;
-			if (*found_complete)
-				*applied = true;
 		}
 		else if (rmid == RM_PG_UPGRADE_ID)
 		{
@@ -294,7 +308,11 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 				*cn_lsn = last_ckpt_lsn;
 			}
 			else if (info == XLOG_PG_UPGRADE_COMPLETE)
+			{
 				*found_complete = true;
+				*complete_lsn = reader->ReadRecPtr;
+				break;			/* window is closed; nothing after COMPLETE matters */
+			}
 		}
 	}
 
@@ -318,9 +336,9 @@ PerformWalUpgradeIfNeeded(void)
 	char		wal_dir[MAXPGPATH];
 	bool		found_start = false;
 	bool		found_complete = false;
-	bool		applied = false;
 	CheckPoint	cn;
 	XLogRecPtr	cn_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	complete_lsn = InvalidXLogRecPtr;
 
 	/* Skip during pg_upgrade internal server starts (-b binary upgrade mode) */
 	if (IsBinaryUpgrade)
@@ -334,12 +352,15 @@ PerformWalUpgradeIfNeeded(void)
 	 * upgrade WAL lives in pg_wal/ (no rename): a completed --wal-log-upgrade
 	 * run leaves a START..COMPLETE window there.  Here we decide what to do:
 	 *
-	 *   START + COMPLETE, no later checkpoint -> upgrade pending; DERIVE CN from
-	 *                       the WAL, arm pg_control in-process (checkPoint = CN,
+	 *   pending (control file not yet past COMPLETE) -> DERIVE CN from the WAL,
+	 *                       arm pg_control in-process (checkPoint = CN,
 	 *                       state = DB_IN_PRODUCTION), and let StartupXLOG()
-	 *                       crash-recover the whole window.
-	 *   START + COMPLETE, checkpoint AFTER COMPLETE -> already applied by a prior
-	 *                       startup; do nothing, normal startup.
+	 *                       recover the whole window.
+	 *   already applied (control file checkpoint > COMPLETE's LSN) -> do nothing,
+	 *                       normal startup.  The upgrade was replayed and
+	 *                       finalized by a prior startup; its end-of-recovery
+	 *                       checkpoint sits past COMPLETE (on this or a later
+	 *                       timeline).
 	 *   START, no COMPLETE -> crash mid-upgrade; refuse to start (old cluster
 	 *                       is intact — re-run pg_upgrade).
 	 *   no START         -> not an upgrade; normal startup.
@@ -355,7 +376,7 @@ PerformWalUpgradeIfNeeded(void)
 	 * atomicity guarantee sound.
 	 */
 	if (!upgrade_wal_scan_markers(wal_dir, &found_start, &found_complete,
-								  &cn, &cn_lsn, &applied))
+								  &cn, &cn_lsn, &complete_lsn))
 		return false;			/* no readable upgrade WAL — normal startup */
 
 	if (!found_start)
@@ -367,12 +388,17 @@ PerformWalUpgradeIfNeeded(void)
 				 errhint("Re-run pg_upgrade from the old cluster to start fresh.")));
 
 	/*
-	 * A checkpoint after COMPLETE means a prior startup already replayed the
-	 * whole window and resumed normal operation.  Re-arming at CN now would
-	 * re-replay the upgrade over live post-upgrade data — so treat it as an
-	 * ordinary startup.
+	 * Already applied?  Ask the control file, not the WAL: if its current
+	 * checkpoint already sits at or past COMPLETE's LSN, a prior startup
+	 * replayed the window and finalized (writing an end-of-recovery checkpoint
+	 * past COMPLETE, possibly on a later timeline after a standby's timeline
+	 * switch).  Re-arming at CN would re-replay the upgrade over live
+	 * post-upgrade data, so treat it as an ordinary startup.  This is
+	 * authoritative and timeline-independent -- unlike scanning for a
+	 * post-COMPLETE checkpoint, which cannot see a checkpoint on a timeline the
+	 * TLI-1 scan does not follow.
 	 */
-	if (applied)
+	if (GetControlFileCheckPointLSN() >= complete_lsn)
 		return false;
 
 	/*
