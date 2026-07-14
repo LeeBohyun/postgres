@@ -82,29 +82,7 @@ was dropped by deriving CN in-process).  Investigate a flag-free handover:
 - Q2: orphaned old-cluster relfiles on the standby (unreferenced garbage) --
   confirm benign / clean up.
 
-## 4. BUG: rich-schema RELFILE/RAWFILE redo collision (run_extreme_test.sh)
-
-run_extreme_test.sh FAILS (pre-existing, NOT caused by the --control-only revert
--- verified: fails identically on the pre-revert binary).  On replay of a rich
-schema, startup FATALs:
-    redo done at ...
-    FATAL: could not create file "base/5/16439": File exists
-The empty-relfile branch of XLOG_UPGRADE_RELFILE_DATA redo (pgupgrade_wal.c)
-calls smgrcreate(), which mdcreate()s with O_EXCL and fails because the file
-already exists -- i.e. some earlier record in the burst (a RAWFILE, or another
-RELFILE entry for the same relfilenode) already created base/5/16439.  Likely a
-capture/redo ORDERING or DEDUP problem for certain object types present in the
-extreme schema (toast/partition/matview/seq/LO/enum/composite/unlogged) that the
-simpler tests do not exercise.
-TODO:
-- Identify which object type / which record pair collides on 16439 (dump the
-  burst with pg_waldump, find the two records that both target that relfile).
-- Fix the empty-relfile redo to tolerate an already-created file (smgrexists
-  check is already there for the fork -- verify it covers the base relation
-  case), OR fix the capture side to not emit two creators for one relfilenode.
-- run_extreme_test.sh is the reproducer; it must go green.
-
-## 5. All-version upgrade permutation test
+## 4. All-version upgrade permutation test
 
 Add a test matrix that exercises --wal-log-upgrade across EVERY supported
 old->new major-version pair, not just the single 18->20 pair currently proven by

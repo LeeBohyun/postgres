@@ -533,9 +533,60 @@ capture_dir_files(UpgradeRelfileBatch *batch, const char *reldir,
 	struct dirent *de;
 	char		path[MAXPGPATH];
 
+	/*
+	 * LEE: UNLOGGED relations must NOT have their main/fsm/vm forks captured.
+	 * An unlogged relation is identified on disk by the presence of an _init
+	 * fork (relfilenode "<n>_init").  At the end of recovery the server runs
+	 * ResetUnloggedRelations(), which rebuilds each unlogged relation's main
+	 * fork by copy_file()'ing the _init fork over it -- and copy_file() opens
+	 * the destination with O_CREAT|O_EXCL, so it FATALs ("could not create file
+	 * ...: File exists") if the main fork already exists.  If we captured the
+	 * main fork here, RELFILE redo would recreate it and that reset would
+	 * collide.  So: capture ONLY the _init fork of an unlogged relation (redo
+	 * recreates that empty fork; the standard reset then builds the main fork).
+	 * Capturing the unlogged main fork's data would be pointless anyway -- an
+	 * unlogged relation is always truncated/reset on crash recovery.
+	 *
+	 * Pass 1: collect the set of relfilenumbers that have an _init fork.
+	 */
+	RelFileNumber *unlogged = NULL;
+	int			n_unlogged = 0;
+	int			unlogged_alloc = 0;
+
 	dir = AllocateDir(reldir);
 	if (dir == NULL)
 		return;
+
+	while ((de = ReadDir(dir, reldir)) != NULL)
+	{
+		RelFileNumber rfnum;
+		uint8		forknum;
+		uint32		segno;
+
+		if (parse_relfile_name(de->d_name, &rfnum, &forknum, &segno) &&
+			forknum == INIT_FORKNUM)
+		{
+			if (n_unlogged >= unlogged_alloc)
+			{
+				unlogged_alloc = (unlogged_alloc == 0) ? 16 : unlogged_alloc * 2;
+				if (unlogged == NULL)
+					unlogged = palloc_array(RelFileNumber, unlogged_alloc);
+				else
+					unlogged = repalloc_array(unlogged, RelFileNumber, unlogged_alloc);
+			}
+			unlogged[n_unlogged++] = rfnum;
+		}
+	}
+	FreeDir(dir);
+
+	/* Pass 2: capture files, skipping the main/fsm/vm forks of unlogged rels. */
+	dir = AllocateDir(reldir);
+	if (dir == NULL)
+	{
+		if (unlogged != NULL)
+			pfree(unlogged);
+		return;
+	}
 
 	while ((de = ReadDir(dir, reldir)) != NULL)
 	{
@@ -549,14 +600,36 @@ capture_dir_files(UpgradeRelfileBatch *batch, const char *reldir,
 		snprintf(path, sizeof(path), "%s/%s", reldir, de->d_name);
 
 		if (parse_relfile_name(de->d_name, &rfnum, &forknum, &segno))
+		{
+			/* Skip main/fsm/vm forks of unlogged relations (see comment). */
+			if (forknum != INIT_FORKNUM)
+			{
+				bool		is_unlogged = false;
+
+				for (int i = 0; i < n_unlogged; i++)
+				{
+					if (unlogged[i] == rfnum)
+					{
+						is_unlogged = true;
+						break;
+					}
+				}
+				if (is_unlogged)
+					continue;
+			}
+
 			XLogUpgradeRelfileBatchAddFile(batch, path, tsoid, dboid, rfnum,
 										   forknum, segno);
+		}
 		else if (strcmp(de->d_name, "pg_filenode.map") == 0 ||
 				 strcmp(de->d_name, "PG_VERSION") == 0)
 			(void) XLogWriteUpgradeRawFile(path);
 		/* else: pg_internal.init, etc. — regenerated, skip */
 	}
 	FreeDir(dir);
+
+	if (unlogged != NULL)
+		pfree(unlogged);
 }
 
 /*
