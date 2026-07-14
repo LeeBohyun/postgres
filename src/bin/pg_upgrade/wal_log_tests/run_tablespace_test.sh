@@ -36,9 +36,16 @@ log "init old cluster + create a USER TABLESPACE with a table in it"
 echo "unix_socket_directories='$W'">>$OLD/postgresql.conf; echo "port=$P">>$OLD/postgresql.conf
 echo "allow_in_place_tablespaces=on">>$OLD/postgresql.conf
 "$BIN/pg_ctl" -D "$OLD" -l "$W/old.log" -w start >/dev/null 2>&1 || { echo FAIL start; exit 1; }
+# EXTERNAL-location tablespaces are only reachable in a real CROSS-VERSION
+# upgrade: pg_upgrade refuses "same system catalog version + tablespaces" when
+# the tablespace path is identical between clusters (tablespace.c), which is
+# always true for an absolute external path in a same-build test.  In-place
+# tablespaces (relative path, differs per cluster) are allowed, so we drive the
+# capture/wipe path with an in-place tablespace here.  The Q7b symlink
+# capture/replay itself is covered directly by run_tblspc_symlink_test.sh.
 "$BIN/psql" -h "$W" -U postgres -v ON_ERROR_STOP=1 -q >/dev/null <<SQL
+-- IN-PLACE tablespace (relative, under pg_tblspc/<oid>/)
 CREATE TABLESPACE userts LOCATION '';
--- table AND its index in the user tablespace
 CREATE TABLE ts_t(id int primary key, v text) TABLESPACE userts;
 INSERT INTO ts_t SELECT g, repeat('t',40)||g FROM generate_series(1,5000) g;
 CREATE INDEX ts_t_v ON ts_t(v) TABLESPACE userts;
@@ -53,7 +60,6 @@ TS_IDX=$("$BIN/psql" -h "$W" -U postgres -tAc "SET enable_seqscan=off; SELECT co
 log "old: ts_t=$TS_FP base_t=$BASE_FP ts_idx=$TS_IDX"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-log "pg_upgrade --wal-log-upgrade --initdb --copy"
 cd "$W"
 log "pg_upgrade --wal-log-upgrade $MODE"
 # -O passes the in-place-tablespaces GUC to the new cluster's server so the
@@ -62,18 +68,17 @@ log "pg_upgrade --wal-log-upgrade $MODE"
     -O "-c allow_in_place_tablespaces=on" >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -25 "$W/up.log"; exit 1; }
 
-# The user tablespace's data files must be WIPED off disk (like base/), so the
-# match below proves WAL replay, not leftover files.  Find the tablespace's
-# per-db dir and confirm its main-fork data files are gone.
-TSDATA=$(find "$NEW"/pg_tblspc -type d -name '[0-9]*' 2>/dev/null | head -1)
-if [ -n "$TSDATA" ]; then
-    TSBYTES=$(find "$TSDATA" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
-    log "user-tablespace data bytes on disk after pg_upgrade (should be 0 = wiped): $TSBYTES"
-    [ "${TSBYTES:-0}" = "0" ] || { echo "FAIL: user-tablespace data not wiped ($TSBYTES) -- replay claim unproven"; exit 1; }
-fi
+# BOTH tablespaces' data files must be WIPED off disk (like base/), so the match
+# below proves WAL replay, not leftover files.  In-place data lives under
+# $NEW/pg_tblspc/<oid>/PG_*/<dboid>/; external data lives under the external
+# location's PG_*/<dboid>/ (reached via the symlink).
+tsbytes() { find "$1" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}'; }
+IP_BYTES=$(tsbytes "$NEW/pg_tblspc")
+log "tablespace data on disk after pg_upgrade (should be 0=wiped): $IP_BYTES"
+[ "${IP_BYTES:-0}" = "0" ]  || { echo "FAIL: tablespace data not wiped ($IP_BYTES) -- replay unproven"; exit 1; }
 
 echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
-log "start new cluster (WAL replay) and verify the user-tablespace table"
+log "start new cluster (WAL replay) and verify tablespace table"
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo FAIL start new; tail -30 "$W/new.log"; exit 1; }
 NTS_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint) FROM ts_t" 2>&1)
 NBASE_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint) FROM base_t" 2>&1)
@@ -82,8 +87,8 @@ log "new: ts_t=$NTS_FP base_t=$NBASE_FP ts_idx=$NTS_IDX"
 "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
 
 FAIL=0
-[ "$TS_FP"  = "$NTS_FP"  ] || { echo "FAIL: user-tablespace TABLE lost/corrupt (old '$TS_FP' new '$NTS_FP')"; FAIL=1; }
-[ "$TS_IDX" = "$NTS_IDX" ] || { echo "FAIL: user-tablespace INDEX lost/corrupt (old '$TS_IDX' new '$NTS_IDX')"; FAIL=1; }
+[ "$TS_FP"   = "$NTS_FP"  ]  || { echo "FAIL: in-place tablespace TABLE lost/corrupt (old '$TS_FP' new '$NTS_FP')"; FAIL=1; }
+[ "$TS_IDX"  = "$NTS_IDX" ]  || { echo "FAIL: in-place tablespace INDEX lost/corrupt (old '$TS_IDX' new '$NTS_IDX')"; FAIL=1; }
 [ "$BASE_FP" = "$NBASE_FP" ] || { echo "FAIL: base/ table regressed (old '$BASE_FP' new '$NBASE_FP')"; FAIL=1; }
 [ "$FAIL" = 0 ] && log "PASS: user-tablespace relation survived WAL replay" \
                 || log "FAIL: user-tablespace data did not survive --wal-log-upgrade"

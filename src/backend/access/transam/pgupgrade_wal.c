@@ -496,14 +496,15 @@ pg_upgrade_redo(XLogReaderState *record)
 		xl_upgrade_dirskel *xlrec =
 			(xl_upgrade_dirskel *) XLogRecGetData(record);
 		char	   *p = (char *) xlrec + SizeOfXLUpgradeDirskel;
-		char	   *end = p + xlrec->total_bytes;
+		char	   *dir_end = p + xlrec->dir_bytes;
+		char	   *sym_end = dir_end + xlrec->sym_bytes;
 		uint32		done = 0;
 
-		while (p < end && done < xlrec->ndirs)
+		while (p < dir_end && done < xlrec->ndirs)
 		{
-			Size		plen = strnlen(p, end - p);
+			Size		plen = strnlen(p, dir_end - p);
 
-			if (plen == 0 || p + plen >= end)	/* need the NUL terminator */
+			if (plen == 0 || p + plen >= dir_end)	/* need the NUL terminator */
 				break;
 
 			if (mkdir(p, pg_dir_create_mode) != 0 && errno != EEXIST)
@@ -520,6 +521,53 @@ pg_upgrade_redo(XLogReaderState *record)
 			ereport(PANIC,
 					(errmsg("pg_upgrade_redo: dirskel record damaged: created %u of %u directories",
 							done, xlrec->ndirs)));
+
+		/*
+		 * Recreate captured symlinks (pg_tblspc/<spcoid> -> external tablespace
+		 * location).  Each entry is two NUL-terminated strings: linkpath, target.
+		 * We create the target directory (idempotent) then the symlink, so the
+		 * tablespace exists before its RELFILE images replay through smgr.  An
+		 * existing correct symlink is fine; EEXIST is tolerated.
+		 */
+		p = dir_end;
+		done = 0;
+		while (p < sym_end && done < xlrec->nsymlinks)
+		{
+			char	   *linkpath = p;
+			Size		llen = strnlen(linkpath, sym_end - p);
+			char	   *target;
+			Size		tlen;
+
+			if (llen == 0 || p + llen >= sym_end)
+				break;
+			target = p + llen + 1;
+			if (target >= sym_end)
+				break;
+			tlen = strnlen(target, sym_end - target);
+			if (p + llen + 1 + tlen >= sym_end)
+				break;
+
+			/* ensure the external target directory exists */
+			if (mkdir(target, pg_dir_create_mode) != 0 && errno != EEXIST)
+				ereport(PANIC,
+						(errcode_for_file_access(),
+						 errmsg("pg_upgrade_redo: could not create tablespace directory \"%s\": %m",
+								target)));
+
+			if (symlink(target, linkpath) != 0 && errno != EEXIST)
+				ereport(PANIC,
+						(errcode_for_file_access(),
+						 errmsg("pg_upgrade_redo: could not create symlink \"%s\" -> \"%s\": %m",
+								linkpath, target)));
+
+			p = target + tlen + 1;
+			done++;
+		}
+
+		if (done != xlrec->nsymlinks)
+			ereport(PANIC,
+					(errmsg("pg_upgrade_redo: dirskel record damaged: created %u of %u symlinks",
+							done, xlrec->nsymlinks)));
 	}
 	else if (info == XLOG_UPGRADE_SLRU_DATA)
 	{

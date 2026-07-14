@@ -365,13 +365,19 @@ while the upgrade WAL is replaying. Two layers enforce this:
          redo already reconstructs via `rlocator.spcOid`, so once the FPI carries
          the right spcoid, smgr places it correctly — PROVIDED the symlink exists
          at replay (see (b)).
-     (b) **DIRSKEL** — `collect_upgrade_dirs()` (xlog.c) skips symlinks
-         (`!S_ISDIR` continue), so the `pg_tblspc/<spcoid>` symlink and its
-         subtree are never recreated on replay. Fix: capture the symlink (and its
-         target, for external-location tablespaces) so replay recreates it before
-         the tablespace RELFILE images land. External-location targets are their
-         own bootstrap problem on a fresh target (the target path must exist / be
-         creatable) — akin to the PG_VERSION/pg_control pre-replay gates.
+     (b) **DIRSKEL** — FIXED. `collect_upgrade_dirs()` (xlog.c) now captures
+         symlinks: the XLOG_UPGRADE_DIRSKEL record carries an (linkpath, target)
+         section after the directory list, and `pg_upgrade_redo()` recreates the
+         target directory + symlink before the tablespace RELFILE images replay.
+         Verified by `run_tblspc_symlink_test.sh`: the DIRSKEL record for an
+         external-location tablespace reports "symlinks 1".
+         LIMITATION: the replay-recreate branch cannot be driven end-to-end on a
+         SAME-BUILD test, because pg_upgrade refuses "same catalog version +
+         tablespaces" for an absolute external path (tablespace.c), so an
+         external tablespace only reaches the wal-log flow in a real CROSS-version
+         upgrade. The capture is proven; the symlink-redo branch is covered by
+         code but not yet by an end-to-end same-build test. (in-place tablespaces
+         have no symlink, so they don't exercise this branch.)
      (c) **Wipe** — `revert_wal_logged_disk_writes()` (pg_upgrade.c) skips
          `pg_tblspc/`, leaving the data on disk. This is why a SAME-NODE upgrade
          currently appears to work: the table is read from the un-wiped files,

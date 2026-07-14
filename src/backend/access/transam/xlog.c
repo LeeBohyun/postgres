@@ -8755,7 +8755,8 @@ XLogWritePgUpgrade(bool is_start, uint32 old_major_version,
  */
 static void
 collect_upgrade_dirs(const char *abspath, const char *relpath,
-					 StringInfo buf, uint32 *ndirs)
+					 StringInfo dbuf, uint32 *ndirs,
+					 StringInfo sbuf, uint32 *nsymlinks)
 {
 	DIR		   *dir;
 	struct dirent *de;
@@ -8778,19 +8779,42 @@ collect_upgrade_dirs(const char *abspath, const char *relpath,
 			continue;
 
 		snprintf(childabs, sizeof(childabs), "%s/%s", abspath, de->d_name);
-		if (lstat(childabs, &st) != 0 || !S_ISDIR(st.st_mode))
-			continue;			/* only directories; skip files and symlinks */
 
 		if (relpath[0] == '\0')
 			snprintf(childrel, sizeof(childrel), "%s", de->d_name);
 		else
 			snprintf(childrel, sizeof(childrel), "%s/%s", relpath, de->d_name);
 
+		/*
+		 * A symlink (e.g. pg_tblspc/<spcoid> -> external tablespace location)
+		 * is captured as (linkpath, target) so replay can recreate it; we do
+		 * NOT recurse through it (its contents are captured as RELFILE images
+		 * and land via smgr once the symlink exists).
+		 */
+		if (lstat(childabs, &st) == 0 && S_ISLNK(st.st_mode))
+		{
+			char		target[MAXPGPATH];
+			ssize_t		tlen;
+
+			tlen = readlink(childabs, target, sizeof(target) - 1);
+			if (tlen < 0 || tlen >= (ssize_t) sizeof(target))
+				continue;		/* unreadable / too long — skip */
+			target[tlen] = '\0';
+
+			appendBinaryStringInfo(sbuf, childrel, strlen(childrel) + 1);
+			appendBinaryStringInfo(sbuf, target, strlen(target) + 1);
+			(*nsymlinks)++;
+			continue;
+		}
+
+		if (lstat(childabs, &st) != 0 || !S_ISDIR(st.st_mode))
+			continue;			/* only directories and symlinks; skip files */
+
 		/* append this directory, then recurse into it (parent-before-child) */
-		appendBinaryStringInfo(buf, childrel, strlen(childrel) + 1);
+		appendBinaryStringInfo(dbuf, childrel, strlen(childrel) + 1);
 		(*ndirs)++;
 
-		collect_upgrade_dirs(childabs, childrel, buf, ndirs);
+		collect_upgrade_dirs(childabs, childrel, dbuf, ndirs, sbuf, nsymlinks);
 	}
 	FreeDir(dir);
 }
@@ -8809,25 +8833,33 @@ XLogRecPtr
 XLogWriteUpgradeDirSkel(void)
 {
 	xl_upgrade_dirskel xlrec;
-	StringInfoData buf;
+	StringInfoData dbuf;			/* directory paths */
+	StringInfoData sbuf;			/* symlink entries */
 	XLogRecPtr	RecPtr;
 
-	initStringInfo(&buf);
+	initStringInfo(&dbuf);
+	initStringInfo(&sbuf);
 	xlrec.ndirs = 0;
-	collect_upgrade_dirs(DataDir, "", &buf, &xlrec.ndirs);
-	xlrec.total_bytes = (uint32) buf.len;
+	xlrec.nsymlinks = 0;
+	collect_upgrade_dirs(DataDir, "", &dbuf, &xlrec.ndirs,
+						 &sbuf, &xlrec.nsymlinks);
+	xlrec.dir_bytes = (uint32) dbuf.len;
+	xlrec.sym_bytes = (uint32) sbuf.len;
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfXLUpgradeDirskel);
-	if (buf.len > 0)
-		XLogRegisterData(buf.data, buf.len);
+	if (dbuf.len > 0)
+		XLogRegisterData(dbuf.data, dbuf.len);
+	if (sbuf.len > 0)
+		XLogRegisterData(sbuf.data, sbuf.len);
 	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_DIRSKEL);
 
 	ereport(LOG,
-			(errmsg("pg_upgrade directory after-image recorded at %X/%X (%u directories)",
-					LSN_FORMAT_ARGS(RecPtr), xlrec.ndirs)));
+			(errmsg("pg_upgrade directory after-image recorded at %X/%X (%u directories, %u symlinks)",
+					LSN_FORMAT_ARGS(RecPtr), xlrec.ndirs, xlrec.nsymlinks)));
 
-	pfree(buf.data);
+	pfree(dbuf.data);
+	pfree(sbuf.data);
 	return RecPtr;
 }
 

@@ -82,8 +82,9 @@ pg_upgrade_desc(StringInfo buf, XLogReaderState *record)
 		char	   *first = rec + SizeOfXLUpgradeDirskel;
 
 		memcpy(&xlrec, rec, SizeOfXLUpgradeDirskel);
-		appendStringInfo(buf, "dirs %u; bytes %u; first \"%s\"",
-						 xlrec.ndirs, xlrec.total_bytes,
+		appendStringInfo(buf, "dirs %u (%u bytes); symlinks %u (%u bytes); first \"%s\"",
+						 xlrec.ndirs, xlrec.dir_bytes,
+						 xlrec.nsymlinks, xlrec.sym_bytes,
 						 xlrec.ndirs > 0 ? first : "");
 	}
 }

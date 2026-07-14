@@ -221,17 +221,28 @@ typedef struct xl_upgrade_rawfile
  * standby they largely already exist (it is a physical copy of the old cluster,
  * whose DB OIDs pg_upgrade preserves) so most creations are no-ops.
  *
- * The payload is this header followed by ndirs NUL-terminated PGDATA-relative
- * directory paths, emitted parent-before-child so a plain mkdir() suffices.
+ * The payload is this header followed by:
+ *   1. ndirs NUL-terminated PGDATA-relative directory paths (dir_bytes long),
+ *      emitted parent-before-child so a plain mkdir() suffices; then
+ *   2. nsymlinks symlink entries (sym_bytes long), each two NUL-terminated
+ *      strings: the PGDATA-relative link path, then its target.  These capture
+ *      user-tablespace symlinks (pg_tblspc/<spcoid> -> external location) so a
+ *      fresh target / standby recreates them before tablespace RELFILE images
+ *      replay -- without this, external-location tablespaces are unrecoverable.
+ *
+ * Redo mkdir()s each directory, then symlink()s each entry (creating the target
+ * directory too), all idempotently (EEXIST is fine).
  */
 typedef struct xl_upgrade_dirskel
 {
-	uint32		ndirs;			/* number of directory paths that follow */
-	uint32		total_bytes;	/* total bytes of path data that follow */
-	/* followed by ndirs NUL-terminated relative paths, total_bytes long */
+	uint32		ndirs;			/* number of directory paths */
+	uint32		dir_bytes;		/* total bytes of directory-path data */
+	uint32		nsymlinks;		/* number of symlink entries */
+	uint32		sym_bytes;		/* total bytes of symlink-entry data */
+	/* followed by dir_bytes of dir paths, then sym_bytes of symlink entries */
 } xl_upgrade_dirskel;
 
-#define SizeOfXLUpgradeDirskel	offsetof(xl_upgrade_dirskel, total_bytes) + sizeof(uint32)
+#define SizeOfXLUpgradeDirskel	(offsetof(xl_upgrade_dirskel, sym_bytes) + sizeof(uint32))
 
 
 /*
