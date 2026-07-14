@@ -8971,11 +8971,25 @@ XLogWriteUpgradeSlruData(uint8 slru_type)
 	while ((de = ReadDir(dir, slru_dir)) != NULL)
 	{
 		int64		segno;
+		size_t		len = strlen(de->d_name);
 
 		if (de->d_name[0] == '.')
 			continue;
-		if (sscanf(de->d_name, "%04" SCNx64, (uint64 *) &segno) != 1)
+
+		/*
+		 * LEE: parse the FULL hex segment name, mirroring SlruScanDirectory()
+		 * in slru.c.  Do NOT use sscanf("%04" SCNx64): the "%04" caps the read
+		 * at 4 hex digits, but modern SLRUs use long (15-digit) segment names
+		 * (e.g. pg_multixact/members with long_segment_names=true), and even
+		 * short-name SLRUs emit 5- and 6-digit names at high segment counts.
+		 * A capped read would truncate those to a wrong (often 0) segment
+		 * number, so replay would install the captured pages at the wrong SLRU
+		 * offset and silently corrupt the cache.  Accept only names that are
+		 * entirely hex digits and parse the whole string.
+		 */
+		if (strspn(de->d_name, "0123456789ABCDEF") != len)
 			continue;
+		segno = strtoi64(de->d_name, NULL, 16);
 
 		if (nsegs >= segs_alloc)
 		{
