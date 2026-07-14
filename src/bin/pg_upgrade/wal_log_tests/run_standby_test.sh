@@ -7,12 +7,12 @@
 #   2. Run pg_upgrade --wal-log-upgrade --initdb on the (stopped) primary.
 #      The new cluster keeps the OLD cluster's system identifier, so its upgrade
 #      WAL is stamped with an id the standby accepts.
-#   3. Deliver the upgrade to the standby the way a real deployment would:
-#      stop it, copy in the new cluster's pg_control + PG_VERSION + the upgrade
-#      WAL (the pieces recovery needs before/while replaying), and restart on
-#      the new binary.
+#   3. Deliver ONLY the upgrade WAL to the standby and restart on the new binary.
+#      The standby keeps its OWN pg_control and PG_VERSION; first startup derives
+#      the CN recovery anchor in-band from the WAL (no pg_control/PG_VERSION copy).
 #   4. The standby replays the upgrade from CN and converges to the upgraded
-#      cluster; its data must match the upgraded primary.
+#      cluster; its data must match the upgraded primary, and its log must show
+#      it armed recovery from CN itself.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"; BIN="${PGBIN:-$ROOT/pginst/bin}"
 W=/tmp/pgu_standby; OLD=$W/old STBY=$W/stby NEW=$W/new
@@ -60,6 +60,12 @@ NEW_ID=$("$BIN/pg_controldata" -D "$NEW" | grep -i "system identifier" | grep -o
 log "sysid old=$OLD_ID new=$NEW_ID"
 [ "$OLD_ID" = "$NEW_ID" ] || { echo "FAIL: sysid not preserved — standby could not accept the WAL"; exit 1; }
 
+# Snapshot the upgrade WAL AS pg_upgrade LEFT IT, before starting NEW.  Starting
+# NEW runs recovery which recycles/overwrites the START..COMPLETE window, so we
+# must grab the segments now or they are gone by the time we deliver them.
+mkdir -p "$W/upwal"
+cp "$NEW/pg_wal"/[0-9A-F]* "$W/upwal/" 2>/dev/null || true
+
 # Bring up the upgraded primary and capture its post-upgrade fingerprint.
 echo "port=$PPORT
 unix_socket_directories='$W'" >> "$NEW/postgresql.conf"
@@ -68,22 +74,25 @@ NEW_SUM=$("$BIN/psql" -h "$W" -p $PPORT -U postgres -tAc "SELECT count(*), sum(h
 "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
 log "upgraded primary data: $NEW_SUM"
 
-log "4. deliver the upgrade to the standby and let it replay"
-# The standby is a physical copy of the OLD cluster.  To pivot it to the new
-# cluster it needs the new pg_control (the pre-WAL anchor: sysid + CN +
-# DB_IN_PRODUCTION) and the upgrade WAL.  Everything else (catalogs, SLRU, the
-# directory skeleton) it rebuilds by replaying that WAL.
+log "4. deliver ONLY the upgrade WAL to the standby — NO pg_control, NO PG_VERSION copy"
+# The standby is a physical copy of the OLD cluster and KEEPS ITS OWN pg_control.
+# We deliberately do NOT copy the primary's pg_control: first startup on the new
+# binary runs PerformWalUpgradeIfNeeded(), which scans pg_wal/, DERIVES the CN
+# recovery anchor from the CN checkpoint record in the upgrade WAL itself, and
+# arms the standby's own pg_control in-process.  If the standby still converges,
+# the anchor was recovered IN-BAND from the WAL — which is the whole point (and
+# the mechanism a real streaming standby must use).  Copying pg_control would
+# mask that, so it is intentionally omitted.
 #
-# NOTE: we take these from the upgraded primary's data dir AS LEFT BY pg_upgrade
-# (before it was started above, the primary was armed for replay).  Since we
-# already started it, re-derive the armed state by re-running the upgrade into a
-# throwaway dir would be cleaner; here we instead copy the armed control+WAL
-# that pg_upgrade produced, which we saved before first start.
-# For this harness we simply copy the whole new pg_control + pg_wal + PG_VERSION.
-cp "$NEW/global/pg_control" "$STBY/global/pg_control"
-cp "$NEW/PG_VERSION" "$STBY/PG_VERSION"
+# PG_VERSION is likewise NOT copied: the XLOG_PG_UPGRADE_START redo handler
+# writes $PGDATA/PG_VERSION from the version string embedded in the START record,
+# so it is reconstructed from the WAL like everything else.  (In a real
+# cross-major upgrade the on-disk PG_VERSION still reflects the OLD version and
+# the NEW binary's pre-replay ValidatePgVersion() gate would reject it before
+# replay -- a separate bootstrap problem for the replica path, tracked in
+# REPLICA_UPGRADE_DESIGN.md; it does not arise in this same-build test.)
 rm -f "$STBY/pg_wal"/[0-9A-F]*
-cp "$NEW/pg_wal"/[0-9A-F]* "$STBY/pg_wal/" 2>/dev/null || true
+cp "$W/upwal"/[0-9A-F]* "$STBY/pg_wal/" 2>/dev/null || true
 # Remove standby.signal so it does normal crash recovery of the upgrade WAL.
 rm -f "$STBY/standby.signal" "$STBY/recovery.signal"
 
@@ -101,7 +110,15 @@ STBY_ID=$("$BIN/pg_controldata" -D "$STBY" | grep -i "system identifier" | grep 
 log "standby after upgrade: data=$STBY_SUM sysid=$STBY_ID"
 
 FAIL=0
+# Prove the anchor was derived IN-BAND from the WAL (not copied): the startup
+# log must show PerformWalUpgradeIfNeeded arming recovery from CN.
+if grep -q "arming recovery from end-of-upgrade checkpoint" "$W/stby2.log"; then
+    log "  ✓ standby derived CN in-band ($(grep 'arming recovery' "$W/stby2.log" | tail -1 | sed 's/.*checkpoint //'))"
+else
+    echo "MISSING: standby log has no in-band CN arming message (did it use a copied anchor?)"; FAIL=1
+fi
 [ "$STBY_SUM" = "$NEW_SUM" ] || { echo "MISMATCH: standby data ($STBY_SUM) != upgraded primary ($NEW_SUM)"; FAIL=1; }
-[ "$FAIL" = 0 ] && log "PASS: standby upgraded via WAL replay; data matches upgraded primary" \
+[ "$STBY_ID"  = "$NEW_ID"  ] || { echo "MISMATCH: standby sysid ($STBY_ID) != upgraded primary ($NEW_ID)"; FAIL=1; }
+[ "$FAIL" = 0 ] && log "PASS: standby upgraded via in-band WAL replay; data + sysid match upgraded primary" \
                 || log "FAIL: standby did not converge"
 exit $FAIL

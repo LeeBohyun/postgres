@@ -34,10 +34,27 @@ cd "$WORK"
     --initdb --wal-log-upgrade --copy > "$WORK/upgrade.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -30 "$WORK/upgrade.log"; exit 1; }
 
-log "chunked RELFILE records for the big table (expect seg 0 split into >=2)"
-for seg in "$NEW/pg_wal_upgrade"/[0-9A-F]*; do
-    "$BIN/pg_waldump" "$seg" 2>/dev/null
-done | grep "UPGRADE_RELFILE_DATA" | awk '$0 ~ /seg 0 blkoff/' | grep -E "blkoff (0|1305) " | head
+# The upgrade WAL lives in pg_wal/ (there is no pg_wal_upgrade/ rename).  Assert
+# the big table's relfile was split across MULTIPLE RELFILE records (chunking):
+# a >1GB relation cannot fit in one XLOG_UPGRADE_RELFILE_DATA record, so we must
+# see more than one.
+#
+# NOTE: waldump the DIRECTORY (-p) from the lowest segment, NOT file-by-file.
+# The RELFILE records are large and span segment boundaries, so waldumping each
+# segment file in isolation fails to find a record start ("could not find a
+# valid record") and silently reports zero.
+log "chunked RELFILE records for the big table (expect >=2 RELFILE records)"
+LOSEG=$(ls "$NEW/pg_wal/" | grep -E '^[0-9A-F]{24}$' | sort | head -1)
+LOLSN=$("$BIN/pg_waldump" -p "$NEW/pg_wal" "$LOSEG" -n 1 2>&1 | grep -oE 'lsn: [0-9A-F]+/[0-9A-F]+' | head -1 | awk '{print $2}')
+NCHUNK=$("$BIN/pg_waldump" -p "$NEW/pg_wal" -s "${LOLSN:-0/0}" 2>/dev/null | grep -c "UPGRADE_RELFILE_DATA")
+log "UPGRADE_RELFILE_DATA record count: $NCHUNK"
+[ "${NCHUNK:-0}" -ge 2 ] || { echo "FAIL: expected >=2 RELFILE records (chunking), got $NCHUNK"; exit 1; }
+
+# Verify the data was actually WIPED from disk, so the match below proves WAL
+# replay rather than leftover files.
+TOTAL_BASE=$(find "$NEW/base" -type f -name '[0-9]*' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+log "base/ data-file bytes on disk after pg_upgrade (should be 0 = wiped): $TOTAL_BASE"
+[ "${TOTAL_BASE:-0}" = "0" ] || { echo "FAIL: data not wiped ($TOTAL_BASE bytes) — WAL-replay claim unproven"; exit 1; }
 
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"

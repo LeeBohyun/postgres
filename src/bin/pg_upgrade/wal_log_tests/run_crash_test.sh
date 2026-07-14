@@ -29,6 +29,8 @@ PG_UPGRADE_TEST_SKIP_COMPLETE=1 "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "
 # holds a START but no COMPLETE.  Just confirm segments are present there.
 ls "$NEW/pg_wal"/[0-9A-F]* >/dev/null 2>&1 && echo "upgrade WAL present in pg_wal/ (START, but no COMPLETE)" || { echo "no upgrade WAL in pg_wal/"; exit 1; }
 
+FAIL=0
+
 log "attempt to start NEW cluster (expect FATAL: mid-upgrade, no COMPLETE)"
 echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1
@@ -36,35 +38,39 @@ RC=$?
 if [ $RC -eq 0 ]; then
     echo "UNEXPECTED: new cluster started (should have FATALed)"
     "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
-    NEWCRASHOK=0
+    FAIL=1
+elif grep -qiE "failed mid-upgrade|new cluster is unusable" "$W/new.log"; then
+    # Refusal must be for the RIGHT reason (mid-upgrade), not any random error.
+    echo "new cluster refused to start with the mid-upgrade FATAL (good):"
+    grep -iE "failed mid-upgrade|re-run pg_upgrade" "$W/new.log" | head -2
 else
-    echo "new cluster refused to start (good). Log:"
-    grep -iE "failed mid-upgrade|re-run pg_upgrade|FATAL" "$W/new.log" | head -3
-    NEWCRASHOK=1
+    echo "FAIL: new cluster did not start, but NOT with the mid-upgrade FATAL:"
+    tail -6 "$W/new.log"; FAIL=1
 fi
-
-log "verify pg_wal/ was NOT populated (nothing copied on the failed path)"
-COPIED=$(ls "$NEW/pg_wal"/[0-9A-F]* 2>/dev/null | wc -l)
-echo "pg_wal/ segment count: $COPIED"
 
 log "verify OLD cluster is still fully usable"
 "$BIN/pg_ctl" -D "$OLD" -l "$W/old2.log" -w start >/dev/null 2>&1
 OLD_FP2=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*), sum(hashtext(b)::bigint) FROM t" 2>&1)
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 log "old cluster after: $OLD_FP2"
+[ "$OLD_FP" = "$OLD_FP2" ] || { echo "FAIL: old cluster damaged (was '$OLD_FP', now '$OLD_FP2')"; FAIL=1; }
 
-if [ "$NEWCRASHOK" = 1 ] && [ "$OLD_FP" = "$OLD_FP2" ]; then
-    log "PASS: mid-upgrade (no COMPLETE) refused startup; old cluster intact"
-else
-    log "FAIL: crash-atomicity not upheld"
-fi
-
-# --- Also confirm a NORMAL (with COMPLETE) upgrade of the same data DOES start ---
-log "control: same upgrade WITH COMPLETE must start and recover"
+# --- Control: a NORMAL (with COMPLETE) upgrade of the same data MUST start AND
+# recover the exact data -- proving the FATAL above is specific to the missing
+# COMPLETE, not a general inability to start these clusters.
+log "control: same upgrade WITH COMPLETE must start and recover the data"
 rm -rf "$W/new2"
 cd "$W"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" -U postgres --initdb --wal-log-upgrade --copy >"$W/up2.log" 2>&1
 echo "unix_socket_directories='$W'">>$W/new2/postgresql.conf; echo "port=$P">>$W/new2/postgresql.conf
-"$BIN/pg_ctl" -D "$W/new2" -l "$W/new2.log" -w start >/dev/null 2>&1 \
-  && echo "control started; data=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(b)::bigint) FROM t")" \
-  && "$BIN/pg_ctl" -D "$W/new2" -w stop >/dev/null 2>&1 \
-  || { echo "control FAILED to start"; tail -10 "$W/new2.log"; }
+if "$BIN/pg_ctl" -D "$W/new2" -l "$W/new2.log" -w start >/dev/null 2>&1; then
+    CTRL_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(b)::bigint) FROM t")
+    "$BIN/pg_ctl" -D "$W/new2" -w stop >/dev/null 2>&1
+    log "control recovered: $CTRL_FP"
+    [ "$CTRL_FP" = "$OLD_FP" ] || { echo "FAIL: control data mismatch (old '$OLD_FP' vs control '$CTRL_FP')"; FAIL=1; }
+else
+    echo "FAIL: control (with COMPLETE) did not start"; tail -10 "$W/new2.log"; FAIL=1
+fi
+
+[ "$FAIL" = 0 ] && log "PASS: mid-upgrade refused (correct FATAL); old cluster intact; control recovers" \
+                || log "FAIL: crash-atomicity not upheld"
+exit $FAIL

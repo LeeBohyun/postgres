@@ -193,6 +193,75 @@ restart → no bootstrap armed (no `pg_wal_upgrade/`, no replica path yet) → F
 again. The constructive half below is what turns the FATAL into a clean
 pause-and-resume. Until then the guard only *protects*; it does not *complete*.
 
+## Post-replay history divergence (measured) and how to continue replication
+
+A standby that converges by *standalone crash recovery* of the upgrade WAL
+(deliver the segments, remove `standby.signal`, start) reaches the correct data
+but **forks the primary's WAL history** — so ordinary streaming cannot resume.
+Measured with `run_standby_replication_test.sh` + `pg_waldump` (both nodes on
+timeline 1, having replayed byte-identical upgrade WAL through COMPLETE):
+
+```
+shared:   0/0A000028  CHECKPOINT_SHUTDOWN   (end-of-upgrade-replay checkpoint,
+                                             identical on both nodes)
+P' only:  0/0A0000A8  PARAMETER_CHANGE      (primary's postgresql.conf gained
+                                             max_wal_senders etc.)
+          ...FPI_FOR_HINT burst...          (both nodes, but +54B offset on P')
+P' ends:  0/0A00E928  CHECKPOINT_SHUTDOWN   (P' stays in segment 0A)
+S  only:  0/0A0093B8  SWITCH                (standby forced a segment switch)
+S  ends:  0/0B000028  CHECKPOINT_SHUTDOWN   (standby lands in segment 0B, AHEAD)
+```
+
+The fork is NOT in the replayed upgrade window (that is identical); it is in the
+**post-replay finalization**: each node independently writes its own
+end-of-recovery checkpoint, and the primary additionally writes a
+PARAMETER_CHANGE from its differing config. The standby ends up *ahead* of the
+primary on the same timeline, so `START_REPLICATION` fails with "requested
+starting point ... is ahead of the WAL flush position".
+
+The root cause is that the test finalizes the standby into its OWN primary: it
+delivers the upgrade WAL, removes `standby.signal`, and starts — which tells the
+server "you are standalone now, finish crash recovery and come up as a primary."
+Finishing recovery is what writes the divergent end-of-recovery checkpoint (and
+the primary independently writes PARAMETER_CHANGE from its config). The standby
+briefly *became its own primary* on a parallel branch of timeline 1.
+
+The fix is NOT to repair the divergence after the fact (e.g. `pg_rewind` back to
+the shared checkpoint) — that only pays to undo damage we inflicted. The fix is
+to never create the divergence: the standby must **stay a standby** through the
+whole upgrade and never finalize its own history. A server in archive/standby
+recovery does not write end-of-recovery checkpoints; it only mirrors the
+primary's checkpoints as restartpoints. So a standby that keeps `standby.signal`
+and remains in recovery would replay the upgrade window and then simply continue
+following the primary's stream — receiving the primary's post-COMPLETE
+PARAMETER_CHANGE and end-of-recovery checkpoint as ordinary replayed records
+rather than inventing its own. No divergence, nothing to rewind.
+
+The obstacle to doing that today is the safety guard in `pg_upgrade_redo()`:
+
+```c
+if (!in_upgrade_bootstrap)
+    ereport(FATAL, "pg_upgrade WAL encountered during replay ...");
+```
+
+A standby replaying in ordinary standby mode reaches START without
+`in_upgrade_bootstrap` armed and FATALs — deliberately, because applying the
+RELFILE full-page images (which carry OLD page LSNs, below the replay point) on
+a *serving* standby would violate minRecoveryPoint / LSN-monotonicity. So the
+constructive path (`PerformReplicaUpgradeIfNeeded`, Open Q1) must:
+
+  1. arm a *sanctioned replica bootstrap* so the standby applies the window in
+     NON-serving mode (CN-anchored, hot-standby suppressed — exactly like the
+     primary bootstrap; the FPI-LSN-safety section below is why this is
+     mandatory), and
+  2. keep recovery in standby mode ACROSS the window rather than ending it, so
+     the standby never writes its own end-of-recovery checkpoint and stays on
+     the primary's history.
+
+The CN-derivation half already exists (PerformWalUpgradeIfNeeded derives CN from
+the WAL). What remains is arming that bootstrap from the standby side and holding
+standby mode through the window.
+
 ## FPI-LSN safety (must hold for the replica path)
 
 RELFILE redo keeps each page's **old-cluster LSN verbatim** (to byte-match a
@@ -232,11 +301,16 @@ while the upgrade WAL is replaying. Two layers enforce this:
 
 ## Open questions / risks
 
-1. **CN/REDO anchor on the standby.** The primary captures CN via
-   `pg_control_checkpoint()` and arms it with `pg_resetwal --upgrade-recovery`.
-   The standby must obtain the same anchor. Likely from the checkpoint record in
-   the stream itself (the CN checkpoint is in the WAL the standby receives), but
-   the mechanism needs to be worked out — this is the biggest unknown.
+1. **CN/REDO anchor on the standby.** The primary now derives CN *in-process* at
+   first startup: `PerformWalUpgradeIfNeeded()` scans `pg_wal/`, takes CN to be
+   the last checkpoint record preceding `XLOG_PG_UPGRADE_START`, and arms
+   pg_control via `ArmControlFileForUpgradeRecovery()` (the former offline
+   `pg_resetwal --upgrade-recovery` step is gone). This same derivation is what
+   the standby needs: the CN checkpoint record is in the WAL stream it receives,
+   so it can recover the anchor in-band with no copied pg_control and no flag.
+   The remaining unknown is carrying that anchor across the binary swap (the
+   old-binary startup that pauses at START learns CN, but the new binary starts
+   cold) — see the sentinel-file marker in Q5.
 
 2. **Orphaned old-cluster files.** The standby still has the OLD cluster's files
    on disk (old system-catalog relfilenodes). The upgrade WAL *creates* the new
@@ -257,6 +331,54 @@ while the upgrade WAL is replaying. Two layers enforce this:
    state (`DB_UPGRADE_PENDING`). Sentinel file is least-coupled and survives the
    binary swap; pg_control state is cleaner but touches on-disk layout and both
    binaries must agree. Leaning sentinel file.
+
+6. **Remove `revert_wal_logged_disk_writes` before the final patch submission.**
+   Today, after emitting the upgrade WAL, pg_upgrade wipes the on-disk data
+   image (relation files, SLRU segments, and the directory tree) so first
+   startup is *forced* to reconstruct the entire cluster purely from WAL replay.
+   This is a **testing device**, not a correctness requirement: it proves every
+   byte is captured in WAL (if any image were missing the cluster would come
+   back wrong or fail to start) and it exercises the DIRSKEL redo path. In the
+   real feature the data is already on disk from the normal upgrade, and replay
+   would simply overwrite it — so the wipe is wasted work and, for `--link`
+   mode, it deletes files that share inodes with the old cluster. Before the
+   patch is proposed upstream, `revert_wal_logged_disk_writes` (and the manifest
+   plumbing that feeds it) should be removed or gated behind a test-only knob, so
+   production `--wal-log-upgrade` leaves the reconstructed files on disk and
+   replay is idempotent over them rather than rebuilding from an empty tree.
+   NOTE: keep it while the end-to-end equivalence tests
+   (`run_neon_e2e_test.sh`, `run_compare_test.sh`) still depend on the
+   wiped-then-replayed cluster to prove WAL completeness.
+
+7. **User tablespaces are NOT handled — silent data loss (CONFIRMED BUG).**
+   `--wal-log-upgrade` ignores `pg_tblspc/` in three places, so any relation in a
+   user-defined tablespace is not WAL-logged and would be lost on a real
+   fresh-target/standby replay. Demonstrated by `run_tablespace_test.sh` (which
+   currently FAILS). The three gaps:
+
+     (a) **Capture** — `pg_write_upgrade_relfile_data()` (xlogfuncs.c) walks only
+         `global/` and `base/<dboid>/`; it never descends
+         `pg_tblspc/<spcoid>/PG_*/<dboid>/`, so no RELFILE FPI is emitted for
+         tablespace relations. Fix: after base/, iterate `pg_tblspc/`, resolve
+         each `<spcoid>` symlink, and `capture_dir_files(..., tsoid=<spcoid>,
+         dboid=<dboid>)` for every db subdir under its version directory. RELFILE
+         redo already reconstructs via `rlocator.spcOid`, so once the FPI carries
+         the right spcoid, smgr places it correctly — PROVIDED the symlink exists
+         at replay (see (b)).
+     (b) **DIRSKEL** — `collect_upgrade_dirs()` (xlog.c) skips symlinks
+         (`!S_ISDIR` continue), so the `pg_tblspc/<spcoid>` symlink and its
+         subtree are never recreated on replay. Fix: capture the symlink (and its
+         target, for external-location tablespaces) so replay recreates it before
+         the tablespace RELFILE images land. External-location targets are their
+         own bootstrap problem on a fresh target (the target path must exist / be
+         creatable) — akin to the PG_VERSION/pg_control pre-replay gates.
+     (c) **Wipe** — `revert_wal_logged_disk_writes()` (pg_upgrade.c) skips
+         `pg_tblspc/`, leaving the data on disk. This is why a SAME-NODE upgrade
+         currently appears to work: the table is read from the un-wiped files,
+         not reconstructed from WAL. The disk-wipe assertion in the test exposes
+         this. When (a)+(b) are fixed, (c) must also wipe pg_tblspc/ so the test
+         proves real WAL recovery. (If Q6's wipe removal lands first, (c) becomes
+         moot for production but the test still needs to wipe to stay honest.)
 
 ## Build order (when we proceed)
 

@@ -9,9 +9,11 @@
 #      the new cluster as an empty skeleton + pg_control + PG_VERSION + the
 #      upgrade WAL in pg_wal/ (no user/catalog data on disk).
 #   4. Simulate a fresh target: build a BRAND-NEW empty skeleton with initdb,
-#      then feed it the WAL cluster's pg_control + PG_VERSION + upgrade WAL
-#      (NOT any data files).  This is exactly what a new-version compute/standby
-#      would receive: its own initdb skeleton + the anchor + the WAL.
+#      stamp ONLY the old cluster's sysid into its own pg_control (pg_resetwal
+#      --system-identifier), then feed it ONLY the upgrade WAL (NO pg_control /
+#      PG_VERSION copy, NO data files).  First startup must derive the CN anchor
+#      IN-BAND from the WAL.  This is what a new-version compute/standby would
+#      receive: its own skeleton + the correct sysid + the WAL.
 #   5. Start that target -> it must replay the upgrade purely from WAL.
 #   6. Compare the replayed cluster against the vanilla upgrade:
 #        - logical: row counts + content hashes of every user table
@@ -98,9 +100,28 @@ rm -f "$T"/global/[0-9]* "$T"/global/pg_filenode.map 2>/dev/null
 rm -f "$T"/pg_xact/* "$T"/pg_multixact/offsets/* "$T"/pg_multixact/members/* 2>/dev/null
 rm -f "$T"/pg_wal/[0-9A-F]* 2>/dev/null
 
-log "feed the target the WAL cluster's anchor + upgrade WAL (no data files)"
-cp "$L/new/global/pg_control" "$T/global/pg_control"
-cp "$L/new/PG_VERSION" "$T/PG_VERSION"
+log "feed the target ONLY the upgrade WAL + the old cluster's sysid (no pg_control/PG_VERSION copy)"
+# The fresh initdb target has its OWN random sysid; the upgrade WAL is stamped
+# with the OLD cluster's sysid (preserved by --wal-log-upgrade).  Recovery
+# rejects WAL whose sysid does not match pg_control, so the target must adopt
+# the old sysid.  We do that with pg_resetwal --system-identifier -- stamping
+# ONLY the sysid -- rather than copying the whole pg_control.  Copying
+# pg_control would ALSO hand over the CN anchor and mask the in-band derivation;
+# by stamping only the sysid we force first startup to derive CN from the WAL
+# itself (PerformWalUpgradeIfNeeded), proving a fresh target needs nothing but
+# its own initdb pg_control + the correct sysid + the upgrade WAL.
+#
+# PG_VERSION is NOT copied: the XLOG_PG_UPGRADE_START redo writes it from the
+# embedded version string.  (Same-build test, so the target's initdb PG_VERSION
+# already matches; a real cross-major target needs it set before the pre-replay
+# version gate -- see REPLICA_UPGRADE_DESIGN.md.)
+# Stamp the sysid FIRST: pg_resetwal resets the WAL (KillExistingXLOG +
+# WriteEmptyXLOG), so it must run BEFORE we deliver the upgrade segments, or it
+# would delete them.
+WAL_SYSID=$("$BIN/pg_controldata" -D "$L/new" | grep -i "system identifier" | grep -oE "[0-9]+")
+"$BIN/pg_resetwal" -f --system-identifier="$WAL_SYSID" "$T" >/dev/null 2>&1 \
+  || { echo "FAIL: could not stamp sysid into target"; exit 1; }
+rm -f "$T/pg_wal"/[0-9A-F]* 2>/dev/null
 cp "$L/new/pg_wal"/[0-9A-F]* "$T/pg_wal/" 2>/dev/null || true
 
 log "start target -> replay the upgrade purely from WAL"

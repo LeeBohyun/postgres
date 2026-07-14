@@ -71,29 +71,31 @@ if [ $UPG_RC -ne 0 ]; then
     echo "---- upgrade.log tail ----"; tail -40 "$WORK/upgrade.log"; exit 1
 fi
 
-# Show the upgrade WAL
-if [ -d "$NEW/pg_wal_upgrade" ]; then
-    log "pg_wal_upgrade/ contents"
-    ls -la "$NEW/pg_wal_upgrade" | head
-    log "pg_waldump of upgrade WAL (RM_PG_UPGRADE records)"
-    for seg in "$NEW/pg_wal_upgrade"/[0-9A-F]*; do
-        "$BIN/pg_waldump" "$seg" 2>/dev/null | grep -i "pgupgrade\|pg_upgrade\|Upgrade" | head -40
-    done
-else
-    log "WARNING: no pg_wal_upgrade/ directory"
-fi
+# Show the upgrade WAL.  It lives in pg_wal/ (there is no pg_wal_upgrade/
+# rename), and must contain the RM_PG_UPGRADE records.  Waldump the DIRECTORY
+# from the lowest segment (not file-by-file: large records span segments and a
+# per-file dump cannot find their start).
+log "pg_waldump of upgrade WAL in pg_wal/ (RM_PG_UPGRADE records)"
+LOSEG=$(ls "$NEW/pg_wal/" | grep -E '^[0-9A-F]{24}$' | sort | head -1)
+LOLSN=$("$BIN/pg_waldump" -p "$NEW/pg_wal" "$LOSEG" -n 1 2>&1 | grep -oE 'lsn: [0-9A-F]+/[0-9A-F]+' | head -1 | awk '{print $2}')
+NPGU=$("$BIN/pg_waldump" -p "$NEW/pg_wal" -s "${LOLSN:-0/0}" 2>/dev/null | grep -icE "PG_UPGRADE_START|PG_UPGRADE_COMPLETE|UPGRADE_RELFILE|UPGRADE_SLRU|UPGRADE_DIRSKEL")
+log "RM_PG_UPGRADE record count in pg_wal/: $NPGU"
+[ "${NPGU:-0}" -ge 2 ] || { echo "FAIL: upgrade WAL not found in pg_wal/ (got $NPGU records)"; exit 1; }
 
-# --- PROOF the disk writes were skipped: the biggest user relfile must be 0 ---
-log "verify disk writes were skipped (relfiles truncated to baseline)"
+# --- PROOF the disk writes were skipped: user relfiles + pg_xact must be wiped.
+# These are ASSERTIONS, not just prints: if the data were still on disk the
+# data-match below would not prove WAL replay.
+log "verify disk writes were skipped (data files wiped to baseline)"
 BIGGEST=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(_fsm|_vm)?(\.[0-9]+)?' -printf '%s %p\n' 2>/dev/null | sort -rn | head -1)
-BIGSIZE=$(echo "$BIGGEST" | awk '{print $1}')
 echo "largest data file on disk after pg_upgrade: $BIGGEST"
-# A restored cluster of this size has multi-MB user tables. If skip worked they
-# are all 0 bytes; the only nonzero files are catalogs (< 1MB) still on disk.
+# A restored cluster of this size has multi-MB user tables; if the skip worked
+# every base/ main-fork data file is 0 bytes (relfilenodes were unlinked).
 TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
 echo "total bytes in base/ main-fork data files after pg_upgrade: $TOTAL_BASE"
+[ "${TOTAL_BASE:-0}" = "0" ] || { echo "FAIL: base/ data not wiped ($TOTAL_BASE bytes) — WAL-replay claim unproven"; exit 1; }
 XACT_BYTES=$(find "$NEW/pg_xact" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
 echo "pg_xact bytes on disk after pg_upgrade (should be 0 = skipped): $XACT_BYTES"
+[ "${XACT_BYTES:-0}" = "0" ] || { echo "FAIL: pg_xact not wiped ($XACT_BYTES bytes) — WAL-replay claim unproven"; exit 1; }
 
 # ------------------------------------------------------------------ new cluster
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
