@@ -66,18 +66,26 @@ INSERT INTO inv SELECT 'sku'||g, g, ARRAY['t'||(g%5)] FROM generate_series(1,400
 CREATE INDEX ON inv USING gin(tags);
 SQL
 
-# reference fingerprints
+# reference fingerprints.
+#
+# NOTE: this uses plain prefixed variables (OLDV_<key> / NEWV_<key>) via a
+# small set/get helper rather than `declare -A` associative arrays, because
+# macOS ships bash 3.2 which has no associative arrays.  KEYS lists every
+# fingerprint we capture and later compare.
 fp() { "$BIN/psql" -h "$WORK" -U postgres "$@"; }
-declare -A OLDV
-OLDV[toasted]=$(fp -tAc "SELECT count(*), sum(length(big))::bigint, sum(hashtext(big)::bigint) FROM toasted")
-OLDV[typed]=$(fp -tAc "SELECT count(*), sum(hashtext(m::text||a::text)::bigint) FROM typed")
-OLDV[part]=$(fp -tAc "SELECT count(*), sum(val)::bigint FROM part")
-OLDV[idxs]=$(fp -tAc "SET enable_seqscan=off; SELECT count(*), sum(id)::bigint FROM idxs WHERE id BETWEEN 100 AND 4000")
-OLDV[gin]=$(fp -tAc "SET enable_seqscan=off; SELECT count(*) FROM idxs WHERE arr @> ARRAY[5]")
-OLDV[mv]=$(fp -tAc "SELECT count(*), sum(val)::bigint FROM mv")
-OLDV[seq]=$(fp -tAc "SELECT last_value, is_called FROM seq1")
-OLDV[lo]=$(fp -tAc "SELECT length(lo_get(obj)) FROM lo_ref WHERE id=1")
-OLDV[db2]=$(fp -d db2 -tAc "SET enable_seqscan=off; SELECT count(*), sum(qty)::bigint FROM inv WHERE tags @> ARRAY['t3']")
+KEYS="toasted typed part idxs gin mv seq lo db2"
+setv() { eval "$1_$2=\$3"; }              # setv OLDV toasted "<value>"
+getv() { eval "printf '%s' \"\$$1_$2\""; } # getv OLDV toasted
+
+setv OLDV toasted "$(fp -tAc "SELECT count(*), sum(length(big))::bigint, sum(hashtext(big)::bigint) FROM toasted")"
+setv OLDV typed "$(fp -tAc "SELECT count(*), sum(hashtext(m::text||a::text)::bigint) FROM typed")"
+setv OLDV part "$(fp -tAc "SELECT count(*), sum(val)::bigint FROM part")"
+setv OLDV idxs "$(fp -tAc "SET enable_seqscan=off; SELECT count(*), sum(id)::bigint FROM idxs WHERE id BETWEEN 100 AND 4000")"
+setv OLDV gin "$(fp -tAc "SET enable_seqscan=off; SELECT count(*) FROM idxs WHERE arr @> ARRAY[5]")"
+setv OLDV mv "$(fp -tAc "SELECT count(*), sum(val)::bigint FROM mv")"
+setv OLDV seq "$(fp -tAc "SELECT last_value, is_called FROM seq1")"
+setv OLDV lo "$(fp -tAc "SELECT length(lo_get(obj)) FROM lo_ref WHERE id=1")"
+setv OLDV db2 "$(fp -d db2 -tAc "SET enable_seqscan=off; SELECT count(*), sum(qty)::bigint FROM inv WHERE tags @> ARRAY['t3']")"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
 log "pg_upgrade --wal-log-upgrade --initdb $MODE"
@@ -89,26 +97,26 @@ log "on-disk base/ bytes after pg_upgrade (should be ~0): $BASE_BYTES"
 echo "unix_socket_directories='$WORK'">>$NEW/postgresql.conf; echo "port=$PORT">>$NEW/postgresql.conf
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1 || { echo START-FAIL; tail -30 "$WORK/new.log"; exit 1; }
 
-declare -A NEWV
-NEWV[toasted]=$(fp -tAc "SELECT count(*), sum(length(big))::bigint, sum(hashtext(big)::bigint) FROM toasted")
-NEWV[typed]=$(fp -tAc "SELECT count(*), sum(hashtext(m::text||a::text)::bigint) FROM typed")
-NEWV[part]=$(fp -tAc "SELECT count(*), sum(val)::bigint FROM part")
-NEWV[idxs]=$(fp -tAc "SET enable_seqscan=off; SELECT count(*), sum(id)::bigint FROM idxs WHERE id BETWEEN 100 AND 4000")
-NEWV[gin]=$(fp -tAc "SET enable_seqscan=off; SELECT count(*) FROM idxs WHERE arr @> ARRAY[5]")
-NEWV[mv]=$(fp -tAc "SELECT count(*), sum(val)::bigint FROM mv")
-NEWV[seq]=$(fp -tAc "SELECT last_value, is_called FROM seq1")
-NEWV[lo]=$(fp -tAc "SELECT length(lo_get(obj)) FROM lo_ref WHERE id=1")
-NEWV[db2]=$(fp -d db2 -tAc "SET enable_seqscan=off; SELECT count(*), sum(qty)::bigint FROM inv WHERE tags @> ARRAY['t3']")
+setv NEWV toasted "$(fp -tAc "SELECT count(*), sum(length(big))::bigint, sum(hashtext(big)::bigint) FROM toasted")"
+setv NEWV typed "$(fp -tAc "SELECT count(*), sum(hashtext(m::text||a::text)::bigint) FROM typed")"
+setv NEWV part "$(fp -tAc "SELECT count(*), sum(val)::bigint FROM part")"
+setv NEWV idxs "$(fp -tAc "SET enable_seqscan=off; SELECT count(*), sum(id)::bigint FROM idxs WHERE id BETWEEN 100 AND 4000")"
+setv NEWV gin "$(fp -tAc "SET enable_seqscan=off; SELECT count(*) FROM idxs WHERE arr @> ARRAY[5]")"
+setv NEWV mv "$(fp -tAc "SELECT count(*), sum(val)::bigint FROM mv")"
+setv NEWV seq "$(fp -tAc "SELECT last_value, is_called FROM seq1")"
+setv NEWV lo "$(fp -tAc "SELECT length(lo_get(obj)) FROM lo_ref WHERE id=1")"
+setv NEWV db2 "$(fp -d db2 -tAc "SET enable_seqscan=off; SELECT count(*), sum(qty)::bigint FROM inv WHERE tags @> ARRAY['t3']")"
 # amcheck-style: verify btree index structural integrity
 fp -tAc "SELECT 'idx ok' FROM idxs WHERE id=2500" >/dev/null
 "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
 
 FAIL=0
-for k in toasted typed part idxs gin mv seq lo db2; do
-  if [ "${OLDV[$k]}" = "${NEWV[$k]}" ]; then
-    echo "  OK   $k = ${NEWV[$k]}"
+for k in $KEYS; do
+  ov=$(getv OLDV "$k"); nv=$(getv NEWV "$k")
+  if [ "$ov" = "$nv" ]; then
+    echo "  OK   $k = $nv"
   else
-    echo "  FAIL $k: old='${OLDV[$k]}' new='${NEWV[$k]}'"; FAIL=1
+    echo "  FAIL $k: old='$ov' new='$nv'"; FAIL=1
   fi
 done
 [ $FAIL -eq 0 ] && log "PASS extreme cases ($MODE)" || log "FAIL extreme cases ($MODE)"
