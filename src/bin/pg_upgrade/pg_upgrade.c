@@ -255,38 +255,13 @@ main(int argc, char **argv)
 	 * the restore.  For --wal-log-upgrade it MUST also happen HERE, before the
 	 * end-of-upgrade checkpoint below, so that checkpoint (CN) records the
 	 * transplanted OID counter; recovery replays from CN and reproduces every
-	 * counter for free.  (Doing it afterward, as a separate pg_resetwal on the
-	 * already-sealed cluster, would be discarded on recovery, which
-	 * re-initializes the counters from the CN checkpoint record -- that was the
-	 * old --control-only design, and it left the new cluster's OID counter too
-	 * low, risking collisions with preserved OIDs.)
+	 * counter for free.
 	 */
 	prep_status("Setting next OID for new cluster");
-	if (user_opts.wal_log_upgrade)
-	{
-		/*
-		 * LEE: --control-only: this is the LAST pg_resetwal before the burst, so
-		 * it determines where CN lands.  It edits the OID counter but must NOT
-		 * reposition the WAL -- otherwise it marches CN one segment past the old
-		 * cluster's WAL end and reopens the streaming gap that the --control-only
-		 * counter transplants above just closed.
-		 *
-		 * The OLD cluster's system identifier is NOT stamped here: changing the
-		 * sysid requires rewriting the WAL segment header (so WAL and pg_control
-		 * agree), which --control-only deliberately skips.  The sysid is instead
-		 * set by the WAL-rewriting "Resetting WAL archives" step in
-		 * copy_xact_xlog_xid(), which positions the WAL contiguously anyway.
-		 */
-		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/pg_resetwal\" --control-only -o %u \"%s\"",
-				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
-				  new_cluster.pgdata);
-	}
-	else
-		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/pg_resetwal\" -o %u \"%s\"",
-				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
-				  new_cluster.pgdata);
+	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+			  "\"%s/pg_resetwal\" -o %u \"%s\"",
+			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+			  new_cluster.pgdata);
 	check_ok();
 
 	migrate_logical_slots = count_old_cluster_logical_slots();
@@ -1185,38 +1160,15 @@ static void
 copy_xact_xlog_xid(void)
 {
 	/*
-	 * LEE: for --wal-log-upgrade, the counter-transplant pg_resetwal calls below
-	 * use --control-only so they do not reposition/rewrite the WAL (see the long
-	 * comment at the first call).  For a normal upgrade this is empty, i.e. stock
-	 * behavior.
-	 */
-	const char *CONTROL_ONLY_OPT = user_opts.wal_log_upgrade ? "--control-only" : "";
-
-	/*
 	 * Copy old commit logs to new data dir. pg_clog has been renamed to
 	 * pg_xact in post-10 clusters.
 	 */
 	copy_subdir_files("pg_xact", "pg_xact");
 
-	/*
-	 * LEE: for --wal-log-upgrade these counter transplants use --control-only:
-	 * they edit pg_control's counter fields WITHOUT repositioning/rewriting the
-	 * WAL.  A plain pg_resetwal marches the WAL forward one segment PER CALL
-	 * (RewriteControlFile forces redo to a fresh segment, FindEndOfXLOG does
-	 * newXlogSegNo++, then it kills+rewrites the WAL); seven such calls left a
-	 * multi-segment HOLE between the old cluster's WAL end and the end-of-upgrade
-	 * checkpoint (CN).  A streaming standby cannot cross that hole (it needs a
-	 * contiguous (TLI, LSN) sequence), so the upgrade WAL could not be followed
-	 * by streaming.  --control-only keeps checkPoint/redo and the WAL segments in
-	 * place, so CN stays contiguous with the old cluster's end and a caught-up
-	 * standby streams straight into the CN..COMPLETE window.  (Stock pg_upgrade
-	 * omits --control-only here.)  The counters are captured by the CN checkpoint
-	 * that recovery replays from, as before.
-	 */
 	prep_status("Setting oldest XID for new cluster");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -f %s -u %u \"%s\"",
-			  new_cluster.bindir, CONTROL_ONLY_OPT,
+			  "\"%s/pg_resetwal\" -f -u %u \"%s\"",
+			  new_cluster.bindir,
 			  old_cluster.controldata.chkpnt_oldstxid,
 			  new_cluster.pgdata);
 	check_ok();
@@ -1224,19 +1176,19 @@ copy_xact_xlog_xid(void)
 	/* set the next transaction id and epoch of the new cluster */
 	prep_status("Setting next transaction ID and epoch for new cluster");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -f %s -x %u \"%s\"",
-			  new_cluster.bindir, CONTROL_ONLY_OPT,
+			  "\"%s/pg_resetwal\" -f -x %u \"%s\"",
+			  new_cluster.bindir,
 			  old_cluster.controldata.chkpnt_nxtxid,
 			  new_cluster.pgdata);
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -f %s -e %u \"%s\"",
-			  new_cluster.bindir, CONTROL_ONLY_OPT,
+			  "\"%s/pg_resetwal\" -f -e %u \"%s\"",
+			  new_cluster.bindir,
 			  old_cluster.controldata.chkpnt_nxtepoch,
 			  new_cluster.pgdata);
 	/* must reset commit timestamp limits also */
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -f %s -c %u,%u \"%s\"",
-			  new_cluster.bindir, CONTROL_ONLY_OPT,
+			  "\"%s/pg_resetwal\" -f -c %u,%u \"%s\"",
+			  new_cluster.bindir,
 			  old_cluster.controldata.chkpnt_nxtxid,
 			  old_cluster.controldata.chkpnt_nxtxid,
 			  new_cluster.pgdata);
@@ -1260,8 +1212,8 @@ copy_xact_xlog_xid(void)
 		 * counters here and the oldest multi present on system.
 		 */
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/pg_resetwal\" %s -O %" PRIu64 " -m %u,%u \"%s\"",
-				  new_cluster.bindir, CONTROL_ONLY_OPT, new_nxtmxoff, new_nxtmulti,
+				  "\"%s/pg_resetwal\" -O %" PRIu64 " -m %u,%u \"%s\"",
+				  new_cluster.bindir, new_nxtmxoff, new_nxtmulti,
 				  old_cluster.controldata.chkpnt_oldstMulti,
 				  new_cluster.pgdata);
 		check_ok();
@@ -1300,8 +1252,8 @@ copy_xact_xlog_xid(void)
 
 		prep_status("Setting next multixact ID and offset for new cluster");
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/pg_resetwal\" %s -O %" PRIu64 " -m %u,%u \"%s\"",
-				  new_cluster.bindir, CONTROL_ONLY_OPT,
+				  "\"%s/pg_resetwal\" -O %" PRIu64 " -m %u,%u \"%s\"",
+				  new_cluster.bindir,
 				  nxtmxoff, nxtmulti, oldstMulti,
 				  new_cluster.pgdata);
 		check_ok();
@@ -1309,21 +1261,17 @@ copy_xact_xlog_xid(void)
 
 	/*
 	 * Now reset the WAL archives in the new cluster.  This positions the new
-	 * cluster's WAL at the old cluster's next segment (contiguous with the old
-	 * cluster's WAL end).
+	 * cluster's WAL at the old cluster's next segment.
 	 *
 	 * LEE: for --wal-log-upgrade this is also where the OLD cluster's system
 	 * identifier is stamped.  It is the RIGHT place because this call rewrites
 	 * the WAL (WriteEmptyXLOG), so pg_control AND the fresh WAL segment header
-	 * both get the old sysid -- consistent.  The later "Setting next OID" reset
-	 * runs --control-only (does not rewrite WAL), so it cannot carry the sysid;
-	 * doing it here keeps WAL and pg_control in agreement while the burst that
-	 * follows writes all upgrade WAL under the old sysid (so a physical standby
-	 * of the old cluster accepts it).  Since this positioning reset is the last
-	 * one that rewrites the WAL, and the counter/OID transplants are
-	 * --control-only, the end-of-upgrade checkpoint (CN) stays contiguous with
-	 * the old cluster's WAL end -- a streaming standby can follow straight into
-	 * the upgrade window.
+	 * both get the old sysid -- consistent.  The burst that follows writes all
+	 * upgrade WAL under the old sysid, so a physical standby re-provisioned from
+	 * the delivered upgrade window accepts it.  (The upgrade is delivered
+	 * out-of-band and replayed from the end-of-upgrade checkpoint (CN); it is not
+	 * followed by live streaming across the major-version WAL-page-format
+	 * boundary, so WAL contiguity with the old cluster is not required.)
 	 */
 	prep_status("Resetting WAL archives");
 	if (user_opts.wal_log_upgrade)
