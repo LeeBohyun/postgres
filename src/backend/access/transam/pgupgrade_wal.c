@@ -44,6 +44,7 @@
 #include "storage/bufpage.h"	/* PageSetLSN */
 #include "storage/fd.h"
 #include "storage/copydir.h"	/* copydir() for WAL segment migration */
+#include "storage/ipc.h"		/* proc_exit() for the quarantine hold */
 #include "storage/lwlock.h"
 #include "utils/elog.h"
 
@@ -362,6 +363,26 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
  */
 static bool in_upgrade_bootstrap = false;
 
+/*
+ * LEE: revertable upgrade commit request sentinel.
+ *
+ * "pg_upgrade --commit" drops this file in the new cluster's data directory,
+ * then starts the server.  Its presence tells PerformWalUpgradeIfNeeded() to
+ * FINALIZE a quarantined cluster (re-replay CN..COMPLETE and go live) instead
+ * of re-entering the hold.  The COMPLETE redo handler checks it too: with the
+ * sentinel present, it does NOT quarantine — it lets recovery finalize.  The
+ * file is removed once finalization begins so a later crash re-holds cleanly.
+ */
+#define UPGRADE_COMMIT_SENTINEL	"pg_upgrade_commit.signal"
+
+static bool
+upgrade_commit_requested(void)
+{
+	struct stat st;
+
+	return stat(UPGRADE_COMMIT_SENTINEL, &st) == 0;
+}
+
 bool
 PerformWalUpgradeIfNeeded(void)
 {
@@ -419,6 +440,38 @@ PerformWalUpgradeIfNeeded(void)
 		ereport(FATAL,
 				(errmsg("pg_upgrade failed mid-upgrade: new cluster is unusable"),
 				 errhint("Re-run pg_upgrade from the old cluster to start fresh.")));
+
+	/*
+	 * Already held in quarantine?  A prior startup replayed the window to
+	 * COMPLETE and entered DB_UPGRADE_QUARANTINED (the revertable hold), then
+	 * this cluster was restarted.  Its control-file checkpoint is still at CN
+	 * (before COMPLETE), so the LSN test below would wrongly re-arm and
+	 * re-replay the window.  Two sub-cases:
+	 *
+	 *   - commit requested ("pg_upgrade --commit" dropped the sentinel): remove
+	 *     the sentinel and fall through to re-arm + replay.  This time the
+	 *     COMPLETE handler sees the commit request and lets recovery FINALIZE
+	 *     (end-of-recovery record, go live) instead of re-holding.
+	 *   - otherwise: refuse to serve.  The operator must run "pg_upgrade
+	 *     --commit" to finalize or "--rollback" to discard.
+	 */
+	if (ControlFileInUpgradeQuarantine())
+	{
+		if (!upgrade_commit_requested())
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("new cluster is held in pg_upgrade quarantine"),
+					 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
+
+		/*
+		 * Commit: fall through to re-arm at CN and replay.  We must NOT remove
+		 * the sentinel here -- the COMPLETE redo handler checks it to decide to
+		 * finalize instead of re-holding, and removes it once finalization
+		 * begins.
+		 */
+		ereport(LOG,
+				(errmsg("pg_upgrade --commit: finalizing quarantined cluster")));
+	}
 
 	/*
 	 * Already applied?  Ask the control file, not the WAL: if its current
@@ -564,6 +617,51 @@ pg_upgrade_redo(XLogReaderState *record)
 		 * (CheckRecoveryConsistency will pick it up on the next call).
 		 */
 		pgUpgradeReplayInProgress = false;
+
+		/*
+		 * LEE: revertable upgrade quarantine hold.  When this COMPLETE is
+		 * reached under the sanctioned bootstrap (the first startup that
+		 * PerformWalUpgradeIfNeeded() armed for this new cluster), do NOT let
+		 * StartupXLOG() finalize and bring the cluster live.  The whole upgrade
+		 * has now been reconstructed on disk; hold it, dark, so the operator can
+		 * verify and then explicitly "pg_upgrade --commit" (adopt) or
+		 * "--rollback" (discard).  We mark pg_control DB_UPGRADE_QUARANTINED and
+		 * proc_exit(3) -- the same "shut down the postmaster" exit code that
+		 * recovery_target_action=shutdown uses -- BEFORE the end-of-recovery
+		 * record is written or a timeline is forked (xlog.c), so new_dir is
+		 * frozen exactly at COMPLETE and remains trivially discardable.
+		 *
+		 * A restart re-reads DB_UPGRADE_QUARANTINED and re-holds (the guard in
+		 * PerformWalUpgradeIfNeeded()), so this is idempotent.
+		 *
+		 * Only under in_upgrade_bootstrap: a standby or ordinary stream that
+		 * reaches COMPLETE without the sanctioned bootstrap must not be affected
+		 * (those paths are handled by the START-side guard above).
+		 */
+		if (in_upgrade_bootstrap)
+		{
+			if (!upgrade_commit_requested())
+			{
+				ereport(LOG,
+						(errmsg("pg_upgrade reached end-of-upgrade (COMPLETE); holding new cluster in quarantine"),
+						 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
+				SetControlFileUpgradeQuarantined();
+				proc_exit(3);
+			}
+
+			/*
+			 * Commit requested: consume the sentinel now (so a crash before
+			 * finalize re-holds cleanly) and let StartupXLOG() finalize normally
+			 * -- write the end-of-recovery record and bring the cluster live.
+			 */
+			if (unlink(UPGRADE_COMMIT_SENTINEL) != 0)
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("could not remove pg_upgrade commit sentinel \"%s\": %m",
+								UPGRADE_COMMIT_SENTINEL)));
+			ereport(LOG,
+					(errmsg("pg_upgrade --commit: end-of-upgrade reached; finalizing cluster")));
+		}
 	}
 	else if (info == XLOG_PG_UPGRADE_HANDOFF)
 	{
@@ -616,8 +714,9 @@ pg_upgrade_redo(XLogReaderState *record)
 		 * of initdb's directory tree) before any file image is replayed into
 		 * it.  Paths are PGDATA-relative and were emitted parent-before-child,
 		 * so a plain mkdir() per path suffices.  Idempotent: EEXIST is expected
-		 * (on the primary the wipe leaves some dirs; on a standby the tree
-		 * largely already exists as a copy of the old cluster).
+		 * because the target already has some of these directories (the
+		 * primary's wipe leaves a few behind; a re-provisioned standby starts
+		 * from a fresh initdb skeleton), so replay only fills in the rest.
 		 */
 		xl_upgrade_dirskel *xlrec =
 			(xl_upgrade_dirskel *) XLogRecGetData(record);

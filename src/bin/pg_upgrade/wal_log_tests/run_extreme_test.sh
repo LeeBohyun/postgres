@@ -91,6 +91,9 @@ setv OLDV db2 "$(fp -d db2 -tAc "SET enable_seqscan=off; SELECT count(*), sum(qt
 log "pg_upgrade --wal-log-upgrade --initdb $MODE"
 cd "$WORK"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade $MODE >"$WORK/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL-UPGRADE; tail -25 "$WORK/up.log"; exit 1; }
+# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$WORK/commit.log" 2>&1 \
+    || { echo FAIL commit; tail -20 "$WORK/commit.log"; exit 1; }
 BASE_BYTES=$(find "$NEW/base" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
 log "on-disk base/ bytes after pg_upgrade (should be ~0): $BASE_BYTES"
 

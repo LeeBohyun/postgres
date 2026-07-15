@@ -55,6 +55,11 @@ SQL
     local TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
     [ "${TOTAL_BASE:-0}" = "0" ] || { echo "[$name] FAIL: base/ not wiped ($TOTAL_BASE)"; return 1; }
 
+    # --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it
+    # (after the disk-wiped assertion above, before starting it below).
+    "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit >"$W/commit.log" 2>&1 \
+        || { echo "[$name] FAIL commit"; tail -20 "$W/commit.log"; return 1; }
+
     echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$port">>$NEW/postgresql.conf
     "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "[$name] FAIL start new"; tail -20 "$W/new.log"; return 1; }
     local NEW_FP=$("$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint), (SELECT count(*) FROM toast_t) FROM t")
@@ -102,14 +107,30 @@ SQL
     pkill -9 -f "postgres -D $NEW" 2>/dev/null
     lsof -ti :$port 2>/dev/null | xargs kill -9 2>/dev/null
     sleep 1
-    log "[$name] restart after crash -- must re-arm and converge (idempotent)"
+    # After a mid-replay crash, a restart must re-arm and converge idempotently
+    # to the quarantine HOLD (not silently go live).  A plain start therefore
+    # re-holds (exits at the recovery target); then --commit adopts it and it
+    # serves with the data intact.  This proves crash-idempotency AND that the
+    # quarantine gate still governs the outcome after a crash.
+    log "[$name] restart after crash -- must re-arm and re-hold (idempotent)"
     "$BIN/pg_ctl" -D "$NEW" -l "$W/new2.log" -w -t 120 start >/dev/null 2>&1
-    if [ $? -ne 0 ]; then echo "[$name] FAIL: restart after mid-replay crash did not come up"; tail -20 "$W/new2.log"; RC=1
-    else
-        NEW_FP=$("$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint) FROM t" 2>&1)
+    if "$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
         "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
-        if [ "$OLD_FP" = "$NEW_FP" ]; then log "[$name] PASS (converged after crash: $NEW_FP)"
-        else echo "[$name] FAIL: mismatch after crash-restart old='$OLD_FP' new='$NEW_FP'"; RC=1; fi
+        echo "[$name] FAIL: cluster served without a commit (quarantine bypassed)"; RC=1
+    elif ! grep -qiE "held in pg_upgrade quarantine|holding new cluster in quarantine" "$W/new2.log"; then
+        echo "[$name] FAIL: restart after crash did not re-hold in quarantine"; tail -20 "$W/new2.log"; RC=1
+    else
+        log "[$name] commit after crash-restart -- must converge and serve"
+        "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit >"$W/commit2.log" 2>&1 \
+            || { echo "[$name] FAIL commit after crash"; tail -20 "$W/commit2.log"; RC=1; }
+        "$BIN/pg_ctl" -D "$NEW" -l "$W/new3.log" -w -t 120 start >/dev/null 2>&1
+        if [ $? -ne 0 ]; then echo "[$name] FAIL: did not come up after commit"; tail -20 "$W/new3.log"; RC=1
+        else
+            NEW_FP=$("$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint) FROM t" 2>&1)
+            "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
+            if [ "$OLD_FP" = "$NEW_FP" ]; then log "[$name] PASS (converged after crash+commit: $NEW_FP)"
+            else echo "[$name] FAIL: mismatch after crash-restart old='$OLD_FP' new='$NEW_FP'"; RC=1; fi
+        fi
     fi
 fi
 

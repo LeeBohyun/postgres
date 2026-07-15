@@ -61,6 +61,9 @@ log "old cluster after: $OLD_FP2"
 log "control: same upgrade WITH COMPLETE must start and recover the data"
 rm -rf "$W/new2"
 cd "$W"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" -U postgres --initdb --wal-log-upgrade --copy >"$W/up2.log" 2>&1
+# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
+"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" --commit >"$W/commit2.log" 2>&1 \
+    || { echo "FAIL: control commit"; tail -20 "$W/commit2.log"; FAIL=1; }
 echo "unix_socket_directories='$W'">>$W/new2/postgresql.conf; echo "port=$P">>$W/new2/postgresql.conf
 if "$BIN/pg_ctl" -D "$W/new2" -l "$W/new2.log" -w start >/dev/null 2>&1; then
     CTRL_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(b)::bigint) FROM t")

@@ -46,6 +46,10 @@ cd "$W"
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" -U postgres --initdb --wal-log-upgrade --copy > "$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo "FAIL upgrade"; tail -15 "$W/up.log"; exit 1; }
 
+# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" --commit > "$W/commit.log" 2>&1 \
+    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
+
 cat >> "$N/postgresql.conf" <<CONF
 port=$P
 unix_socket_directories='$W'

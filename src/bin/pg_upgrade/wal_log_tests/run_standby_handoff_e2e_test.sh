@@ -89,6 +89,11 @@ cd "$W"
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -20 "$W/up.log"; exit 1; }
 mkdir -p "$W/upwal"; cp "$NEW/pg_wal"/[0-9A-F]* "$W/upwal/" 2>/dev/null || true
+# --wal-log-upgrade holds the primary's new cluster in quarantine; commit it so
+# it goes live.  (The upgrade WAL was already copied to $W/upwal above, before
+# the commit recycles it, so the standby re-provision below still has it.)
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit >"$W/commit.log" 2>&1 \
+    || { echo "FAIL new commit"; tail -20 "$W/commit.log"; exit 1; }
 cat >> "$NEW/postgresql.conf" <<CONF
 port=$PP
 unix_socket_directories='$W'
@@ -112,11 +117,17 @@ cat >> "$TGT/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
 CONF
-"$BIN/pg_ctl" -D "$TGT" -l "$W/tgt.log" -w -t 60 start >/dev/null 2>&1
-if [ $? -ne 0 ]; then echo "FAIL: re-provisioned standby did not start/replay"; tail -20 "$W/tgt.log"; FAIL=1; fi
-grep -q "arming recovery from end-of-upgrade checkpoint" "$W/tgt.log" \
+# The re-provisioned target is a fresh skeleton fed the delivered upgrade window;
+# --wal-log-upgrade replay holds it in quarantine.  Commit adopts it (this is the
+# standby-side commit).  No old cluster here, so only -D is given.  The CN-anchored
+# replay happens during commit, logged to the target's pg_upgrade_commit.log.
+"$BIN/pg_upgrade" -B "$BIN" -D "$TGT" --commit >"$W/tgt_commit.log" 2>&1 \
+  || { echo "FAIL: re-provisioned standby commit"; tail -20 "$W/tgt_commit.log"; FAIL=1; }
+grep -q "arming recovery from end-of-upgrade checkpoint" "$TGT/pg_upgrade_commit.log" 2>/dev/null \
   && log "  re-provisioned standby armed + replayed the upgrade from CN in-band" \
   || { echo "  FAIL: re-provisioned standby did not replay from CN"; FAIL=1; }
+"$BIN/pg_ctl" -D "$TGT" -l "$W/tgt.log" -w -t 60 start >/dev/null 2>&1
+if [ $? -ne 0 ]; then echo "FAIL: re-provisioned standby did not start after commit"; tail -20 "$W/tgt.log"; FAIL=1; fi
 
 log "5. verify the re-provisioned standby converged to the primary and is writable"
 STBY_FP=$("$BIN/psql" -h "$W" -p $SP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t) FROM t" 2>&1)

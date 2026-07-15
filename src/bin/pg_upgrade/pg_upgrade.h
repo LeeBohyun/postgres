@@ -249,6 +249,19 @@ typedef enum
 } transferMode;
 
 /*
+ * LEE: revertable-upgrade lifecycle subcommands.  When set (not _NONE),
+ * pg_upgrade does NOT run an upgrade; it acts on an existing cluster and exits.
+ */
+typedef enum
+{
+	REVERTABLE_OP_NONE = 0,		/* normal pg_upgrade run */
+	REVERTABLE_OP_STATUS,		/* report new_dir lifecycle state */
+	REVERTABLE_OP_COMMIT,		/* finalize a quarantined new_dir, stamp old */
+	REVERTABLE_OP_ROLLBACK,		/* discard a quarantined new_dir */
+	REVERTABLE_OP_DELETE_OLD,	/* delete a superseded old_dir */
+} RevertableOp;
+
+/*
  * Enumeration to denote pg_log modes
  */
 typedef enum
@@ -335,6 +348,8 @@ typedef struct
 	 * cluster purely from WAL (atomic, crash-safe, recoverable from an empty
 	 * data directory) */
 	bool		wal_log_upgrade;
+	/* LEE: revertable-upgrade lifecycle subcommand, if any (see enum below) */
+	RevertableOp revertable_op;
 } UserOpts;
 
 typedef struct
@@ -388,6 +403,12 @@ void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
 void		get_control_data(ClusterInfo *cluster);
 void		check_control_data(ControlData *oldctrl, ControlData *newctrl);
 void		disable_old_cluster(transferMode transfer_mode);
+
+
+/* revertable.c */
+
+void		perform_revertable_op(void);
+void		mark_new_cluster_quarantined(void);
 
 
 /* dump.c */

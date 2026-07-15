@@ -23,7 +23,7 @@
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	1902
+#define PG_CONTROL_VERSION	1903
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
@@ -293,6 +293,13 @@ typedef enum DBState
 	DB_IN_CRASH_RECOVERY,
 	DB_IN_ARCHIVE_RECOVERY,
 	DB_IN_PRODUCTION,
+	/*
+	 * A --wal-log-upgrade new cluster that has replayed its upgrade window to
+	 * XLOG_PG_UPGRADE_COMPLETE and is now HELD (reconstructed but not serving),
+	 * awaiting an explicit "pg_upgrade --commit" or "--rollback".  Appended last
+	 * to keep the on-disk values of the states above unchanged.
+	 */
+	DB_UPGRADE_QUARANTINED,
 } DBState;
 
 /*

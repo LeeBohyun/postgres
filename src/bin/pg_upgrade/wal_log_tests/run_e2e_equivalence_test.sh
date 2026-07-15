@@ -120,7 +120,14 @@ echo "  skeleton sysid=$SKEL_SYSID  burst sysid=$WAL_SYSID (DIFFERENT; adopted i
 rm -f "$T/pg_wal"/[0-9A-F]* 2>/dev/null
 cp "$L/new/pg_wal"/[0-9A-F]* "$T/pg_wal/" 2>/dev/null || true
 
-log "start target -> replay the upgrade purely from WAL"
+log "commit target -> replay the upgrade purely from WAL and adopt it"
+# --wal-log-upgrade holds the reconstructed target in quarantine; commit it so
+# it finalizes and can serve for the fingerprint comparison below.  The target
+# is a fresh skeleton with no old cluster, so no -d/old-dir stamping applies.
+"$BIN/pg_upgrade" -B "$BIN" -D "$T" --commit >"$W/target_commit.log" 2>&1 \
+  || { echo "TARGET COMMIT FAILED"; tail -20 "$W/target_commit.log"; exit 1; }
+
+log "start target -> serve the WAL-reconstructed cluster"
 TGT_FP=$(fingerprint "$T" 55542)
 log "target (replayed-from-WAL) fingerprint:"; echo "$TGT_FP"
 

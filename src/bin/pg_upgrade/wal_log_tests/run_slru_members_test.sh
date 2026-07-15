@@ -96,8 +96,16 @@ cat >> "$W/n/postgresql.conf" <<CONF
 unix_socket_directories='$W'
 port=$PP
 CONF
+# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/o" -D "$W/n" --commit > "$W/commit.log" 2>&1 \
+    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 "$BIN/pg_ctl" -D "$W/n" -l "$W/n.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/n.log"; FAIL=1; }
-grep -q "arming recovery from end-of-upgrade checkpoint" "$W/n.log" && log "  replayed from CN" || { echo "  FAIL: did not replay from CN"; FAIL=1; }
+# The CN-anchored replay happens during --commit (which finalizes the quarantined
+# cluster).  --commit starts the server with its own server log inside the data
+# dir (pg_upgrade_commit.log), where the "arming recovery" line is written -- not
+# the post-commit start log (that start is an ordinary startup of a now-live
+# cluster) nor pg_upgrade's own stdout.
+grep -q "arming recovery from end-of-upgrade checkpoint" "$W/n/pg_upgrade_commit.log" && log "  replayed from CN" || { echo "  FAIL: did not replay from CN"; FAIL=1; }
 NEW_MXID=$(Q "SELECT next_multixact_id FROM pg_control_checkpoint()")
 RELOCK=$(Q "WITH x AS (SELECT id FROM t FOR KEY SHARE LIMIT 100) SELECT count(*) FROM x")
 NEWSEGS=$(ls -1 "$W/n/pg_multixact/members" | grep -E '^[0-9A-F]+$' | sort | tr '\n' ' ')

@@ -66,6 +66,11 @@ parseCommandLine(int argc, char *argv[])
 		{"initdb", no_argument, NULL, 8},
 		/* LEE: capture the upgrade as WAL and reconstruct it on first startup */
 		{"wal-log-upgrade", no_argument, NULL, 9},
+		/* LEE: revertable-upgrade lifecycle subcommands (act on -D new / -d old) */
+		{"commit", no_argument, NULL, 10},
+		{"rollback", no_argument, NULL, 11},
+		{"delete-old", no_argument, NULL, 12},
+		{"status", no_argument, NULL, 13},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -246,6 +251,20 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.wal_log_upgrade = true;
 				break;
 
+			/* LEE: revertable-upgrade lifecycle subcommands */
+			case 10:
+				user_opts.revertable_op = REVERTABLE_OP_COMMIT;
+				break;
+			case 11:
+				user_opts.revertable_op = REVERTABLE_OP_ROLLBACK;
+				break;
+			case 12:
+				user_opts.revertable_op = REVERTABLE_OP_DELETE_OLD;
+				break;
+			case 13:
+				user_opts.revertable_op = REVERTABLE_OP_STATUS;
+				break;
+
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 						os_info.progname);
@@ -275,6 +294,26 @@ parseCommandLine(int argc, char *argv[])
 	}
 	else
 		setenv("PGOPTIONS", FIX_DEFAULT_READ_ONLY, 1);
+
+	/*
+	 * LEE: revertable-upgrade lifecycle subcommands act on a single existing
+	 * cluster and do not run an upgrade, so they need only their own directory
+	 * (-D for commit/rollback/status, -d for delete-old), not the full
+	 * old/new bindir+datadir set the normal flow requires.
+	 */
+	if (user_opts.revertable_op == REVERTABLE_OP_DELETE_OLD)
+	{
+		if (old_cluster.pgdata == NULL)
+			pg_fatal("--delete-old requires the old cluster data directory (-d/--old-datadir)");
+		return;
+	}
+	else if (user_opts.revertable_op != REVERTABLE_OP_NONE)
+	{
+		/* --commit / --rollback / --status: need -D (new); -d optional */
+		if (new_cluster.pgdata == NULL)
+			pg_fatal("this operation requires the new cluster data directory (-D/--new-datadir)");
+		return;
+	}
 
 	/* Get values from env if not already set */
 	check_required_directory(&old_cluster.bindir, "PGBINOLD", false,

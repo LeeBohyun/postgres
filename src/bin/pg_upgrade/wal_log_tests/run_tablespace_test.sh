@@ -68,6 +68,10 @@ log "pg_upgrade --wal-log-upgrade $MODE"
     -O "-c allow_in_place_tablespaces=on" >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -25 "$W/up.log"; exit 1; }
 
+# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$W/commit.log" 2>&1 \
+    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
+
 # BOTH tablespaces' data files must be WIPED off disk (like base/), so the match
 # below proves WAL replay, not leftover files.  In-place data lives under
 # $NEW/pg_tblspc/<oid>/PG_*/<dboid>/; external data lives under the external

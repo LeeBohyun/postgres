@@ -63,6 +63,10 @@ cd "$WORK"
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy > "$WORK/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -25 "$WORK/up.log"; exit 1; }
 
+# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$WORK/commit.log" 2>&1 \
+    || { echo FAIL commit; tail -20 "$WORK/commit.log"; exit 1; }
+
 MXOFF_BYTES=$(find "$NEW/pg_multixact/offsets" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
 MXMEM_BYTES=$(find "$NEW/pg_multixact/members" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
 log "after pg_upgrade: pg_multixact offsets=$MXOFF_BYTES members=$MXMEM_BYTES bytes on disk (should be 0 = skipped)"

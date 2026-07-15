@@ -112,6 +112,18 @@ main(int argc, char **argv)
 
 	parseCommandLine(argc, argv);
 
+	/*
+	 * LEE: revertable-upgrade lifecycle subcommands (--status / --commit /
+	 * --rollback / --delete-old) act on an existing cluster and exit; they do
+	 * not run an upgrade.  new_cluster.bindir is used to locate pg_ctl.
+	 */
+	if (user_opts.revertable_op != REVERTABLE_OP_NONE)
+	{
+		resolve_new_bindir(argv[0]);
+		perform_revertable_op();
+		return 0;
+	}
+
 
 	get_restricted_token();
 
@@ -458,6 +470,18 @@ main(int argc, char **argv)
 	 */
 	if (!user_opts.wal_log_upgrade)
 		issue_warnings_and_set_wal_level();
+
+	/*
+	 * LEE: revertable upgrade.  Record the honest lifecycle state on the new
+	 * cluster's control file: it is QUARANTINED (reconstructed-pending, held),
+	 * not the stale DB_IN_PRODUCTION that pg_upgrade's internal server work left
+	 * behind.  This makes "pg_upgrade --status/--commit/--rollback" read the
+	 * correct state on a freshly-upgraded, never-started cluster.  The actual
+	 * hold still happens on first startup (PerformWalUpgradeIfNeeded); this just
+	 * makes the persisted state truthful beforehand.
+	 */
+	if (user_opts.wal_log_upgrade)
+		mark_new_cluster_quarantined();
 
 	pg_log(PG_REPORT,
 		   "\n"

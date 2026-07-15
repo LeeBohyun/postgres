@@ -29,6 +29,11 @@ run_upgrade() { # $1=variant  $2=extraflag
   cp -a "$SEED" "$D/old_src" 2>/dev/null; mkdir -p "$D"; cp -a "$SEED" "$D/old"
   cd "$D"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$D/old" -D "$D/new" -U postgres --initdb $FLAG --copy >"$D/up.log" 2>&1 \
     || { echo "$V UPGRADE FAILED"; tail -8 "$D/up.log"; exit 1; }
+  # --wal-log-upgrade now holds the new cluster in quarantine; commit to adopt it.
+  case "$FLAG" in *wal-log-upgrade*)
+    "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$D/old" -D "$D/new" --commit >"$D/commit.log" 2>&1 \
+      || { echo "$V COMMIT FAILED"; tail -8 "$D/commit.log"; exit 1; } ;;
+  esac
   echo "unix_socket_directories='$W'">>$D/new/postgresql.conf; echo "port=$P">>$D/new/postgresql.conf; echo "autovacuum=off">>$D/new/postgresql.conf
   # start + clean stop so both go through an identical startup/shutdown cycle
   PGPORT=$P "$BIN/pg_ctl" -D "$D/new" -l "$D/new.log" -w start >/dev/null 2>&1 || { echo "$V START FAILED"; tail -20 "$D/new.log"; exit 1; }

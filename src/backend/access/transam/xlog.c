@@ -4685,6 +4685,42 @@ ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn,
 }
 
 /*
+ * LEE: Mark the control file as held in pg_upgrade quarantine.
+ *
+ * Called from the XLOG_PG_UPGRADE_COMPLETE redo handler when a sanctioned
+ * --wal-log-upgrade bootstrap has just replayed the whole window: instead of
+ * letting StartupXLOG() finalize (end-of-recovery record → DB_IN_PRODUCTION →
+ * serving), the handler sets this state and proc_exit(3)s, leaving new_dir
+ * reconstructed at COMPLETE but NOT serving.  A restart reads this state and
+ * re-enters the hold; an explicit "pg_upgrade --commit" is what finalizes.
+ * The control file is fsync'd so the held state survives a crash.
+ */
+void
+SetControlFileUpgradeQuarantined(void)
+{
+	Assert(ControlFile != NULL);
+
+	ControlFile->state = DB_UPGRADE_QUARANTINED;
+	ControlFile->time = (pg_time_t) time(NULL);
+	UpdateControlFile();
+}
+
+/*
+ * LEE: true if the control file is currently held in pg_upgrade quarantine.
+ *
+ * PerformWalUpgradeIfNeeded() uses this so that a RESTART of an already-held
+ * new cluster re-enters the hold instead of re-arming and re-replaying the
+ * window (the control-file checkpoint is still at CN, i.e. before COMPLETE, so
+ * the "already applied?" LSN test alone would wrongly re-trigger the upgrade).
+ */
+bool
+ControlFileInUpgradeQuarantine(void)
+{
+	Assert(ControlFile != NULL);
+	return ControlFile->state == DB_UPGRADE_QUARANTINED;
+}
+
+/*
  * LEE: the checkpoint LSN currently recorded in the control file (the position
  * recovery would start from).  Used by PerformWalUpgradeIfNeeded() to decide
  * whether a pg_upgrade window has ALREADY been applied: after first startup
@@ -5996,6 +6032,14 @@ StartupXLOG(void)
 					(errmsg("database system was interrupted; last known up at %s",
 							str_time(ControlFile->time,
 									 timebuf, sizeof(timebuf)))));
+			break;
+
+		case DB_UPGRADE_QUARANTINED:
+			ereport(LOG,
+					(errmsg("database system is held in pg_upgrade quarantine (last known up at %s)",
+							str_time(ControlFile->time,
+									 timebuf, sizeof(timebuf))),
+					 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
 			break;
 
 		default:
@@ -8252,7 +8296,14 @@ CreateRestartPoint(int flags)
 		if (flags & CHECKPOINT_IS_SHUTDOWN)
 		{
 			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-			ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
+			/*
+			 * LEE: don't clobber the revertable-upgrade quarantine state.  The
+			 * COMPLETE redo handler set DB_UPGRADE_QUARANTINED and proc_exit(3)'d;
+			 * the ensuing shutdown restartpoint must leave that state intact so
+			 * "pg_upgrade --commit/--rollback/--status" can read it durably.
+			 */
+			if (ControlFile->state != DB_UPGRADE_QUARANTINED)
+				ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
 			UpdateControlFile();
 			LWLockRelease(ControlFileLock);
 		}
@@ -8348,7 +8399,9 @@ CreateRestartPoint(int flags)
 				LocalMinRecoveryPoint = ControlFile->minRecoveryPoint;
 				LocalMinRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
 			}
-			if (flags & CHECKPOINT_IS_SHUTDOWN)
+			/* LEE: preserve the revertable-upgrade quarantine state (see above) */
+			if ((flags & CHECKPOINT_IS_SHUTDOWN) &&
+				ControlFile->state != DB_UPGRADE_QUARANTINED)
 				ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
 		}
 

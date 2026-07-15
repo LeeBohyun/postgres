@@ -98,6 +98,13 @@ echo "pg_xact bytes on disk after pg_upgrade (should be 0 = skipped): $XACT_BYTE
 [ "${XACT_BYTES:-0}" = "0" ] || { echo "FAIL: pg_xact not wiped ($XACT_BYTES bytes) — WAL-replay claim unproven"; exit 1; }
 
 # ------------------------------------------------------------------ new cluster
+# --wal-log-upgrade holds the new cluster in quarantine.  All the pre-start
+# assertions above (upgrade WAL present, disk wiped) inspect that held state.
+# Commit now to adopt it, which replays the window and brings it live.
+log "pg_upgrade --commit"
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$WORK/commit.log" 2>&1 \
+    || { echo "---- commit.log tail ----"; tail -20 "$WORK/commit.log"; exit 1; }
+
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
 

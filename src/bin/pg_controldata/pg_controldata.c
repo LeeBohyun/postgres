@@ -65,6 +65,8 @@ dbState(DBState state)
 			return _("in archive recovery");
 		case DB_IN_PRODUCTION:
 			return _("in production");
+		case DB_UPGRADE_QUARANTINED:
+			return _("in pg_upgrade quarantine");
 	}
 	return _("unrecognized status code");
 }

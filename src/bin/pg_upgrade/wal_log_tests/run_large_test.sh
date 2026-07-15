@@ -58,6 +58,9 @@ log "base/ data-file bytes on disk after pg_upgrade (should be 0 = wiped): $TOTA
 
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
+# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$WORK/commit.log" 2>&1 \
+    || { echo FAIL commit; tail -20 "$WORK/commit.log"; exit 1; }
 log "start new cluster (WAL replay)"
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1 || { echo FAIL start new; tail -40 "$WORK/new.log"; exit 1; }
 NEW_SUM=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*), sum(id)::bigint, sum(length(pad))::bigint FROM big")
