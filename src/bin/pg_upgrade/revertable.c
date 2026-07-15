@@ -244,6 +244,55 @@ do_delete_old(void)
 }
 
 /*
+ * --signal-standbys: connect to the LIVE old primary and emit the
+ * streaming-handoff trigger into its (old-format) WAL.  A physical standby
+ * streaming the old primary replays this record and shuts itself down cleanly,
+ * ready for the new-version binary swap.  Run this BEFORE stopping the old
+ * primary and running pg_upgrade.
+ *
+ * Unlike the other subcommands (which act on stopped clusters), this one
+ * requires the old primary to be RUNNING and reachable on its port.  The target
+ * major version passed to the trigger is this pg_upgrade binary's own major
+ * (i.e. the new version the standby will converge to).
+ */
+static void
+do_signal_standbys(void)
+{
+	PGconn	   *conn;
+	PGresult   *res;
+	char		query[128];
+
+	if (old_cluster.pgdata == NULL || old_cluster.pgdata[0] == '\0')
+		pg_fatal("--signal-standbys requires the old cluster data directory (-d)");
+
+	/*
+	 * The old primary is RUNNING here.  Flag a live check so get_sock_dir()
+	 * reads the actual socket directory (and port) from the server's
+	 * postmaster.pid, rather than defaulting to the current directory.
+	 */
+	user_opts.live_check = true;
+	get_sock_dir(&old_cluster);
+
+	prep_status("Signaling standbys via the old primary (port %d)",
+				old_cluster.port);
+
+	conn = connectToServer(&old_cluster, "template1");
+
+	snprintf(query, sizeof(query),
+			 "SELECT pg_write_pg_upgrade_handoff(%d)", PG_MAJORVERSION_NUM);
+	res = executeQueryOrDie(conn, "%s", query);
+	PQclear(res);
+	PQfinish(conn);
+	check_ok();
+
+	pg_log(PG_REPORT,
+		   "\nHandoff trigger emitted on the old primary.  Streaming standbys will\n"
+		   "replay it and shut down.  Now stop the old primary and run\n"
+		   "\"pg_upgrade --wal-log-upgrade ...\"; then re-provision each standby\n"
+		   "from the delivered upgrade window.");
+}
+
+/*
  * Generate the revertable-upgrade lifecycle scripts, in the same style as
  * create_script_for_old_cluster_deletion(): self-contained shell scripts with
  * all paths baked in, so the operator runs a path-free script rather than
@@ -331,6 +380,9 @@ perform_revertable_op(void)
 			break;
 		case REVERTABLE_OP_DELETE_OLD:
 			do_delete_old();
+			break;
+		case REVERTABLE_OP_SIGNAL_STANDBYS:
+			do_signal_standbys();
 			break;
 		case REVERTABLE_OP_NONE:
 			break;				/* not reached */
