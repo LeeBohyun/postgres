@@ -198,8 +198,9 @@ pause-and-resume. Until then the guard only *protects*; it does not *complete*.
 A standby that converges by *standalone crash recovery* of the upgrade WAL
 (deliver the segments, remove `standby.signal`, start) reaches the correct data
 but **forks the primary's WAL history** — so ordinary streaming cannot resume.
-Measured with `run_standby_replication_test.sh` + `pg_waldump` (both nodes on
-timeline 1, having replayed byte-identical upgrade WAL through COMPLETE):
+Measured historically with the (now-removed) basebackup-reuse standby tests +
+`pg_waldump` (both nodes on timeline 1, having replayed byte-identical upgrade
+WAL through COMPLETE):
 
 ```
 shared:   0/0A000028  CHECKPOINT_SHUTDOWN   (end-of-upgrade-replay checkpoint,
@@ -340,8 +341,9 @@ while the upgrade WAL is replaying. Two layers enforce this:
    from the upgraded primary is NOT yet closed — see the rejected approach
    below.**  Delivering the upgrade WAL to a standby with `recovery.signal`
    present (archive recovery) makes it apply the window in-band from CN and come
-   up consistent; verified by `run_standby_tli_test.sh` (which also confirms a
-   subsequent restart does not re-arm).  In that archive-recovery path the server
+   up consistent; this was verified historically by the (now-removed)
+   basebackup-reuse standby tests (which also confirmed a subsequent restart does
+   not re-arm).  In that archive-recovery path the server
    happens to take PostgreSQL's normal end-of-recovery timeline switch — which is
    fine for a standalone converge, but is exactly what does NOT coordinate with
    the primary for streaming (below).

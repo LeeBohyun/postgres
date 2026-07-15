@@ -43,34 +43,7 @@ code change warranted:
   applies the window under an active hot standby.  Nothing to fix here; keep this
   note so the concern is not re-opened without a concrete reachable path.
 
-## 2. Hand over the system identifier WITHOUT the pg_resetwal --system-identifier flag
-
-We still carry ONE added pg_resetwal flag: --system-identifier, used in the
-"Resetting WAL archives" step so the new cluster's pg_control AND its fresh WAL
-segment header (xlp_sysid) both get the OLD cluster's sysid -- required so a
-re-provisioned standby accepts the delivered burst.  It needs a WAL-rewriting
-reset because the sysid lives in two places (pg_control.system_identifier and
-every WAL page's xlp_sysid).  We prefer to avoid flags (cf. how --upgrade-recovery
-was dropped by deriving CN in-process).  Investigate a flag-free handover:
-  - Derive/stamp the sysid IN-PROCESS at the new cluster's first startup, the
-    same way PerformWalUpgradeIfNeeded() already derives CN and arms pg_control
-    -- i.e. read the old sysid from the delivered artifact (or a value embedded
-    in the START/HANDOFF record) and write it into pg_control there, rather than
-    via an offline pg_resetwal flag.  The WAL pages the burst wrote already carry
-    whatever sysid the emitting server had, so check whether stamping pg_control
-    alone (matching the burst's xlp_sysid) is sufficient, or whether the burst
-    itself should simply be emitted under the correct sysid from the start.
-  - Alternative: have the skeleton provisioning stamp the sysid when it builds
-    the fresh new-version datadir (it already runs initdb + places the WAL), so
-    no pg_upgrade-side flag is needed at all.
-  - Goal: remove --system-identifier from pg_resetwal (mirroring the --control-only
-    revert and the --upgrade-recovery removal) so --wal-log-upgrade adds NO new
-    pg_resetwal flags.
-  - Verify the chosen approach against run_standby_xversion_test.sh /
-    run_e2e_equivalence_test.sh (sysid must match the primary; standby accepts
-    the WAL).
-
-## 3. From REPLICA_UPGRADE_DESIGN.md (already tracked there)
+## 2. From REPLICA_UPGRADE_DESIGN.md (already tracked there)
 
 - Q6: remove/gate `revert_wal_logged_disk_writes` (a test-only device) before
   the final patch, once the equivalence tests no longer depend on the
@@ -81,7 +54,7 @@ was dropped by deriving CN in-process).  Investigate a flag-free handover:
 - Q2: orphaned old-cluster relfiles on the standby (unreferenced garbage) --
   confirm benign / clean up.
 
-## 4. All-version upgrade permutation test
+## 3. All-version upgrade permutation test
 
 Add a test matrix that exercises --wal-log-upgrade across EVERY supported
 old->new major-version pair, not just the single 18->20 pair currently proven by

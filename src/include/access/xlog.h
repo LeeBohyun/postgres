@@ -282,7 +282,8 @@ extern XLogRecPtr XLogWriteUpgradeSlruData(uint8 slru_type);
 /* LEE: arm pg_control at CN for in-process --wal-log-upgrade recovery */
 struct CheckPoint;
 extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
-											  XLogRecPtr cn_lsn);
+											  XLogRecPtr cn_lsn,
+											  uint64 wal_sysid);
 /* LEE: control-file checkpoint LSN, for the "upgrade already applied?" test */
 extern XLogRecPtr GetControlFileCheckPointLSN(void);
 /* LEE: batched relation-file images live in access/pgupgrade_wal.h */

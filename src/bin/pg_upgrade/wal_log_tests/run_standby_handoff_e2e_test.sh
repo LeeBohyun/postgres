@@ -104,8 +104,8 @@ log "4. (B) RE-PROVISION the halted standby: fresh skeleton + delivered window, 
 rm -f "$TGT"/base/*/[0-9]* 2>/dev/null
 rm -f "$TGT"/global/[0-9]* "$TGT"/global/pg_filenode.map 2>/dev/null
 rm -f "$TGT"/pg_xact/* "$TGT"/pg_multixact/offsets/* "$TGT"/pg_multixact/members/* 2>/dev/null
-WAL_SYSID=$("$BIN/pg_controldata" -D "$NEW" | grep -i "system identifier" | grep -oE "[0-9]+")
-"$BIN/pg_resetwal" -f --system-identifier="$WAL_SYSID" "$TGT" >/dev/null 2>&1
+# Do NOT stamp the skeleton's sysid: first startup adopts the delivered burst's
+# sysid in-process (no pg_resetwal --system-identifier needed).
 rm -f "$TGT/pg_wal"/[0-9A-F]*
 cp "$W/upwal"/[0-9A-F]* "$TGT/pg_wal/" 2>/dev/null || true
 cat >> "$TGT/postgresql.conf" <<CONF

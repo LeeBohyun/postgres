@@ -79,22 +79,26 @@ log "upgraded primary ($NEWVER) data: $NEW_FP  new catalog version: $NEW_CATVER"
 log "3. build a fresh NEW-version SKELETON as the standby target, deliver upgrade WAL, replay from CN"
 # A cross-version standby CANNOT reuse its old v18 data dir: the new binary's
 # PG_VERSION and pg_control version gates reject it BEFORE replay.  So the target
-# is a fresh new-version initdb skeleton (like a re-provisioned standby), stamped
-# with the OLD cluster's sysid, fed only the upgrade WAL.  This is the same model
-# as run_e2e_equivalence_test.sh.  (The old standby basebackup is what a real
-# standby streamed up to the boundary; here we just need its sysid, which equals
-# the old cluster's.)
+# is a fresh new-version initdb skeleton (like a re-provisioned standby), fed only
+# the upgrade WAL.  This is the same model as run_e2e_equivalence_test.sh.
+#
+# NOTE: we deliberately do NOT stamp the skeleton's system identifier.  The
+# skeleton keeps its OWN fresh initdb sysid (which differs from the burst's), and
+# first startup adopts the burst's sysid in-process (PerformWalUpgradeIfNeeded ->
+# ArmControlFileForUpgradeRecovery reads xlp_sysid from the delivered WAL).  This
+# is what proves the pg_resetwal --system-identifier flag is no longer needed:
+# if in-process adoption were broken, replay would FATAL with "WAL file is from
+# different database system".
 TGT=$W/target
 "$NEWBIN/initdb" -D "$TGT" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb-target; exit 1; }
+SKEL_SYSID=$("$NEWBIN/pg_controldata" -D "$TGT" | grep -i "system identifier" | grep -oE "[0-9]+")
+BURST_SYSID=$("$NEWBIN/pg_controldata" -D "$NEW" | grep -i "system identifier" | grep -oE "[0-9]+")
+log "  skeleton sysid=$SKEL_SYSID  burst sysid=$BURST_SYSID (intentionally DIFFERENT; adoption happens in-process)"
 # wipe the skeleton's data so nothing masks a missing WAL image (keep runtime dirs)
 rm -f "$TGT"/base/*/[0-9]* 2>/dev/null
 rm -f "$TGT"/global/[0-9]* "$TGT"/global/pg_filenode.map 2>/dev/null
 rm -f "$TGT"/pg_xact/* "$TGT"/pg_multixact/offsets/* "$TGT"/pg_multixact/members/* 2>/dev/null
-rm -f "$TGT"/pg_wal/[0-9A-F]* 2>/dev/null
-# stamp the old cluster's sysid (new WAL is stamped with it), then deliver the WAL
-WAL_SYSID=$("$NEWBIN/pg_controldata" -D "$NEW" | grep -i "system identifier" | grep -oE "[0-9]+")
-"$NEWBIN/pg_resetwal" -f --system-identifier="$WAL_SYSID" "$TGT" >/dev/null 2>&1
-rm -f "$TGT/pg_wal"/[0-9A-F]*
+rm -f "$TGT/pg_wal"/[0-9A-F]* 2>/dev/null
 cp "$W/upwal"/[0-9A-F]* "$TGT/pg_wal/" 2>/dev/null || true
 cat >> "$TGT/postgresql.conf" <<CONF
 port=$SP

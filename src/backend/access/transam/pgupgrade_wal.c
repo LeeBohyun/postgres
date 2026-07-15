@@ -175,7 +175,8 @@ UpgradeWalPageRead(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 static bool
 upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 						 bool *found_complete, CheckPoint *cn,
-						 XLogRecPtr *cn_lsn, XLogRecPtr *complete_lsn)
+						 XLogRecPtr *cn_lsn, XLogRecPtr *complete_lsn,
+						 uint64 *wal_sysid)
 {
 	DIR		   *dir;
 	struct dirent *de;
@@ -183,6 +184,7 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 	XLogSegNo	lowseg = 0;
 	XLogSegNo	highseg = 0;
 	bool		any = false;
+	char		lowseg_path[MAXPGPATH] = {0};
 	UpgradeWalReadPrivate priv;
 	XLogReaderState *reader;
 	XLogRecPtr	startptr;
@@ -194,6 +196,7 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 	*found_complete = false;
 	*cn_lsn = InvalidXLogRecPtr;
 	*complete_lsn = InvalidXLogRecPtr;
+	*wal_sysid = 0;
 	MemSet(cn, 0, sizeof(CheckPoint));
 	MemSet(&last_ckpt, 0, sizeof(CheckPoint));
 
@@ -235,7 +238,10 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 		if (ftli != 1)
 			continue;
 		if (!any || segno < lowseg)
+		{
 			lowseg = segno;
+			snprintf(lowseg_path, sizeof(lowseg_path), "%s/%s", waldir, de->d_name);
+		}
 		if (!any || segno > highseg)
 			highseg = segno;
 		any = true;
@@ -244,6 +250,31 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 
 	if (!any || segsize == 0)
 		return false;
+
+	/*
+	 * LEE: capture the system identifier the upgrade WAL was emitted under, by
+	 * reading xlp_sysid from the long page header at the start of the lowest
+	 * segment.  Recovery validates every WAL page's xlp_sysid against
+	 * pg_control->system_identifier, so the arming step (ArmControlFileForUpgrade
+	 * Recovery) stamps pg_control with THIS value.  That lets a fresh skeleton
+	 * replay the delivered burst without any offline sysid stamping -- the sysid
+	 * is adopted in-process from the WAL, exactly as CN is.  (We do NOT force the
+	 * old cluster's sysid; the burst carries whatever the new cluster had, and
+	 * consistency between pg_control and the WAL is all recovery requires.)
+	 */
+	{
+		int			fd = OpenTransientFile(lowseg_path, O_RDONLY | PG_BINARY);
+		XLogLongPageHeaderData longhdr;
+
+		if (fd >= 0)
+		{
+			if (pg_pread(fd, &longhdr, sizeof(longhdr), 0) == sizeof(longhdr) &&
+				longhdr.std.xlp_magic == XLOG_PAGE_MAGIC &&
+				(longhdr.std.xlp_info & XLP_LONG_HEADER))
+				*wal_sysid = longhdr.xlp_sysid;
+			CloseTransientFile(fd);
+		}
+	}
 
 	priv.tli = 1;
 	strlcpy(priv.dir, waldir, sizeof(priv.dir));
@@ -340,6 +371,7 @@ PerformWalUpgradeIfNeeded(void)
 	CheckPoint	cn;
 	XLogRecPtr	cn_lsn = InvalidXLogRecPtr;
 	XLogRecPtr	complete_lsn = InvalidXLogRecPtr;
+	uint64		wal_sysid = 0;
 
 	/* Skip during pg_upgrade internal server starts (-b binary upgrade mode) */
 	if (IsBinaryUpgrade)
@@ -377,7 +409,7 @@ PerformWalUpgradeIfNeeded(void)
 	 * atomicity guarantee sound.
 	 */
 	if (!upgrade_wal_scan_markers(wal_dir, &found_start, &found_complete,
-								  &cn, &cn_lsn, &complete_lsn))
+								  &cn, &cn_lsn, &complete_lsn, &wal_sysid))
 		return false;			/* no readable upgrade WAL — normal startup */
 
 	if (!found_start)
@@ -418,12 +450,15 @@ PerformWalUpgradeIfNeeded(void)
 
 	/*
 	 * Arm the control file in-process: point recovery at CN with state =
-	 * DB_IN_PRODUCTION and wal_level = replica.  StartupXLOG() (called right
-	 * after us) reads ControlFile->checkPointCopy, so this takes effect for this
-	 * recovery cycle.  This replaces the old offline pg_resetwal
-	 * --upgrade-recovery step.
+	 * DB_IN_PRODUCTION and wal_level = replica, and adopt the upgrade WAL's
+	 * system identifier so recovery's per-page xlp_sysid check passes.
+	 * StartupXLOG() (called right after us) reads ControlFile->checkPointCopy, so
+	 * this takes effect for this recovery cycle.  This replaces the old offline
+	 * pg_resetwal --upgrade-recovery step, and adopting wal_sysid here replaces
+	 * the offline pg_resetwal --system-identifier stamping (the skeleton no longer
+	 * needs its sysid set to match the delivered burst -- it is done in-process).
 	 */
-	ArmControlFileForUpgradeRecovery(&cn, cn_lsn);
+	ArmControlFileForUpgradeRecovery(&cn, cn_lsn, wal_sysid);
 
 	/*
 	 * Arm the sanctioned bootstrap: the pg_upgrade redo handlers may now apply

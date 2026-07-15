@@ -1263,38 +1263,25 @@ copy_xact_xlog_xid(void)
 	 * Now reset the WAL archives in the new cluster.  This positions the new
 	 * cluster's WAL at the old cluster's next segment.
 	 *
-	 * LEE: for --wal-log-upgrade this is also where the OLD cluster's system
-	 * identifier is stamped.  It is the RIGHT place because this call rewrites
-	 * the WAL (WriteEmptyXLOG), so pg_control AND the fresh WAL segment header
-	 * both get the old sysid -- consistent.  The burst that follows writes all
-	 * upgrade WAL under the old sysid, so a physical standby re-provisioned from
-	 * the delivered upgrade window accepts it.  (The upgrade is delivered
-	 * out-of-band and replayed from the end-of-upgrade checkpoint (CN); it is not
-	 * followed by live streaming across the major-version WAL-page-format
-	 * boundary, so WAL contiguity with the old cluster is not required.)
+	 * LEE: for --wal-log-upgrade this call also (re)assigns the new cluster's
+	 * system identifier.  We do NOT force it to the old cluster's value: this
+	 * reset rewrites the control file AND the fresh WAL segment header from the
+	 * same ControlFile.system_identifier, so pg_control and the WAL that the
+	 * burst is then emitted into stay CONSISTENT with each other -- which is all
+	 * that replay requires (recovery validates the WAL's xlp_sysid against
+	 * pg_control; it does not care what the numeric value is).  A standby is
+	 * re-provisioned from a fresh skeleton stamped with THIS sysid (read from the
+	 * delivered burst), not by reusing its old data dir, so it need not match the
+	 * pre-upgrade cluster's identifier.  This is the same "new cluster gets a new
+	 * sysid" behavior as stock pg_upgrade, and it lets us drop the pg_resetwal
+	 * --system-identifier flag entirely.
 	 */
 	prep_status("Resetting WAL archives");
-	if (user_opts.wal_log_upgrade)
-	{
-		/*
-		 * Read the OLD cluster's sysid now: copy_xact_xlog_xid() runs before
-		 * disable_old_cluster(), so the old pg_control still exists and is
-		 * readable here (in --link/--swap mode it is renamed only later).
-		 */
-		uint64		old_sysid = get_control_system_identifier(&old_cluster);
-
-		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-		/* use timeline 1 to match controldata and no WAL history file */
-				  "\"%s/pg_resetwal\" -l 00000001%s --system-identifier=" UINT64_FORMAT " \"%s\"",
-				  new_cluster.bindir,
-				  old_cluster.controldata.nextxlogfile + 8,
-				  old_sysid, new_cluster.pgdata);
-	}
-	else
-		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/pg_resetwal\" -l 00000001%s \"%s\"", new_cluster.bindir,
-				  old_cluster.controldata.nextxlogfile + 8,
-				  new_cluster.pgdata);
+	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+	/* use timeline 1 to match controldata and no WAL history file */
+			  "\"%s/pg_resetwal\" -l 00000001%s \"%s\"", new_cluster.bindir,
+			  old_cluster.controldata.nextxlogfile + 8,
+			  new_cluster.pgdata);
 	check_ok();
 }
 

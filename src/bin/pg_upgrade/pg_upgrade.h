@@ -386,7 +386,6 @@ void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
 /* controldata.c */
 
 void		get_control_data(ClusterInfo *cluster);
-uint64		get_control_system_identifier(ClusterInfo *cluster);
 void		check_control_data(ControlData *oldctrl, ControlData *newctrl);
 void		disable_old_cluster(transferMode transfer_mode);
 

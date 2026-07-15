@@ -101,9 +101,6 @@ static bool char_signedness_val;
 static TimeLineID minXlogTli = 0;
 static XLogSegNo minXlogSegNo = 0;
 static int	WalSegSz;
-/* LEE: --system-identifier: overwrite pg_control's sysid (preserve old cluster's) */
-static bool set_system_identifier = false;
-static uint64 new_system_identifier = 0;
 
 static void CheckDataVersion(void);
 static bool read_controlfile(void);
@@ -138,8 +135,6 @@ main(int argc, char *argv[])
 		{"next-transaction-id", required_argument, NULL, 'x'},
 		{"wal-segsize", required_argument, NULL, 1},
 		{"char-signedness", required_argument, NULL, 2},
-		/* LEE: preserve the old cluster's system identifier for --wal-log-upgrade */
-		{"system-identifier", required_argument, NULL, 3},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -357,22 +352,6 @@ main(int argc, char *argv[])
 					break;
 				}
 
-				/* LEE: --system-identifier=N (preserve old cluster's sysid) */
-				case 3:
-					{
-						char	   *endp;
-
-						errno = 0;
-						new_system_identifier = strtou64(optarg, &endp, 10);
-						if (errno != 0 || *endp != '\0' || new_system_identifier == 0)
-						{
-							pg_log_error("invalid system identifier \"%s\"", optarg);
-							exit(1);
-						}
-						set_system_identifier = true;
-					}
-					break;
-
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -505,17 +484,6 @@ main(int argc, char *argv[])
 
 	if (next_oid_given)
 		ControlFile.checkPointCopy.nextOid = next_oid_val;
-
-	/*
-	 * LEE: --system-identifier overwrites the system identifier.  This falls
-	 * through to the normal WAL reset below, so pg_control AND the freshly
-	 * written WAL segment both carry the new identifier (they stay consistent).
-	 * pg_upgrade --wal-log-upgrade uses this to give the new cluster the OLD
-	 * cluster's identifier, so a physical standby of the old cluster accepts
-	 * the upgrade WAL (replay validates xlp_sysid against pg_control).
-	 */
-	if (set_system_identifier)
-		ControlFile.system_identifier = new_system_identifier;
 
 	if (mxids_given)
 	{
@@ -1254,11 +1222,6 @@ usage(void)
 	printf(_("  -f, --force            force update to be done even after unclean shutdown or\n"
 			 "                         if pg_control values had to be guessed\n"));
 	printf(_("  -n, --dry-run          no update, just show what would be done\n"));
-	/* LEE: --system-identifier usage line */
-	printf(_("      --system-identifier=N\n"
-			 "                         set pg_control system identifier to N (used by\n"
-			 "                         pg_upgrade --wal-log-upgrade to preserve the old\n"
-			 "                         cluster's identifier); do not touch WAL files\n"));
 	printf(_("  -V, --version          output version information, then exit\n"));
 	printf(_("  -?, --help             show this help, then exit\n"));
 

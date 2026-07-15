@@ -4656,7 +4656,8 @@ UpdateControlFile(void)
  * The control file is fsync'd (do_sync=true) so the armed anchor is durable.
  */
 void
-ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn)
+ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn,
+								 uint64 wal_sysid)
 {
 	Assert(ControlFile != NULL);
 
@@ -4668,6 +4669,17 @@ ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn)
 	ControlFile->minRecoveryPointTLI = 0;
 	/* keep wal_level=replica so crash/archive recovery can apply the records */
 	ControlFile->wal_level = WAL_LEVEL_REPLICA;
+
+	/*
+	 * LEE: adopt the system identifier the upgrade WAL was emitted under, so
+	 * recovery's per-page xlp_sysid validation accepts the delivered burst.  A
+	 * fresh skeleton (or the upgraded cluster's own datadir) may have a different
+	 * sysid; matching pg_control to the WAL here is what lets the burst be
+	 * replayed without any offline pg_resetwal --system-identifier stamping.
+	 * wal_sysid==0 means the scan could not read it; leave pg_control untouched.
+	 */
+	if (wal_sysid != 0)
+		ControlFile->system_identifier = wal_sysid;
 
 	UpdateControlFile();
 }
