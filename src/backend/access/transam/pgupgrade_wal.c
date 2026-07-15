@@ -367,20 +367,39 @@ static bool in_upgrade_bootstrap = false;
  * LEE: revertable upgrade commit request sentinel.
  *
  * "pg_upgrade --commit" drops this file in the new cluster's data directory,
- * then starts the server.  Its presence tells PerformWalUpgradeIfNeeded() to
- * FINALIZE a quarantined cluster (re-replay CN..COMPLETE and go live) instead
- * of re-entering the hold.  The COMPLETE redo handler checks it too: with the
- * sentinel present, it does NOT quarantine — it lets recovery finalize.  The
- * file is removed once finalization begins so a later crash re-holds cleanly.
+ * then starts the server.  Its presence tells StartupXLOG() to FINALIZE a held
+ * cluster (release the quarantine and go live) rather than re-entering the
+ * hold.  It is consumed once finalization begins so a later crash re-holds.
  */
 #define UPGRADE_COMMIT_SENTINEL	"pg_upgrade_commit.signal"
 
-static bool
-upgrade_commit_requested(void)
+bool
+UpgradeCommitRequested(void)
 {
 	struct stat st;
 
 	return stat(UPGRADE_COMMIT_SENTINEL, &st) == 0;
+}
+
+void
+ConsumeUpgradeCommitRequest(void)
+{
+	if (unlink(UPGRADE_COMMIT_SENTINEL) != 0 && errno != ENOENT)
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not remove pg_upgrade commit sentinel \"%s\": %m",
+						UPGRADE_COMMIT_SENTINEL)));
+}
+
+/*
+ * LEE: true once PerformWalUpgradeIfNeeded() has armed the sanctioned upgrade
+ * replay for this startup.  StartupXLOG() consults it at end-of-recovery to
+ * decide whether to hold the reconstructed cluster in quarantine.
+ */
+bool
+IsUpgradeBootstrap(void)
+{
+	return in_upgrade_bootstrap;
 }
 
 bool
@@ -397,6 +416,35 @@ PerformWalUpgradeIfNeeded(void)
 	/* Skip during pg_upgrade internal server starts (-b binary upgrade mode) */
 	if (IsBinaryUpgrade)
 		return false;
+
+	/*
+	 * Held in pg_upgrade quarantine?  Decide this from the durable pg_control
+	 * STATE, BEFORE scanning pg_wal/ -- because the first hold already wrote an
+	 * end-of-recovery checkpoint that RECYCLED the upgrade WAL window, so the
+	 * scan would no longer find START/COMPLETE and would wrongly let the cluster
+	 * serve.  The reconstructed data is durable on disk and the control
+	 * checkpoint is past COMPLETE, so:
+	 *
+	 *   - commit requested ("pg_upgrade --commit"): release the quarantine,
+	 *     consume the sentinel, return false -> ordinary startup finalizes from
+	 *     the durable checkpoint and goes live.  No re-replay.
+	 *   - otherwise: refuse to serve (re-hold).  The operator must "--commit"
+	 *     to adopt or "--rollback" to discard.
+	 */
+	if (ControlFileInUpgradeQuarantine())
+	{
+		if (!UpgradeCommitRequested())
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("new cluster is held in pg_upgrade quarantine"),
+					 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
+
+		ereport(LOG,
+				(errmsg("pg_upgrade --commit: releasing quarantine and finalizing")));
+		ConsumeUpgradeCommitRequest();
+		ReleaseControlFileUpgradeQuarantine();
+		return false;			/* ordinary startup finalizes; no re-replay */
+	}
 
 	snprintf(wal_dir, sizeof(wal_dir), XLOGDIR);
 
@@ -440,38 +488,6 @@ PerformWalUpgradeIfNeeded(void)
 		ereport(FATAL,
 				(errmsg("pg_upgrade failed mid-upgrade: new cluster is unusable"),
 				 errhint("Re-run pg_upgrade from the old cluster to start fresh.")));
-
-	/*
-	 * Already held in quarantine?  A prior startup replayed the window to
-	 * COMPLETE and entered DB_UPGRADE_QUARANTINED (the revertable hold), then
-	 * this cluster was restarted.  Its control-file checkpoint is still at CN
-	 * (before COMPLETE), so the LSN test below would wrongly re-arm and
-	 * re-replay the window.  Two sub-cases:
-	 *
-	 *   - commit requested ("pg_upgrade --commit" dropped the sentinel): remove
-	 *     the sentinel and fall through to re-arm + replay.  This time the
-	 *     COMPLETE handler sees the commit request and lets recovery FINALIZE
-	 *     (end-of-recovery record, go live) instead of re-holding.
-	 *   - otherwise: refuse to serve.  The operator must run "pg_upgrade
-	 *     --commit" to finalize or "--rollback" to discard.
-	 */
-	if (ControlFileInUpgradeQuarantine())
-	{
-		if (!upgrade_commit_requested())
-			ereport(FATAL,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("new cluster is held in pg_upgrade quarantine"),
-					 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
-
-		/*
-		 * Commit: fall through to re-arm at CN and replay.  We must NOT remove
-		 * the sentinel here -- the COMPLETE redo handler checks it to decide to
-		 * finalize instead of re-holding, and removes it once finalization
-		 * begins.
-		 */
-		ereport(LOG,
-				(errmsg("pg_upgrade --commit: finalizing quarantined cluster")));
-	}
 
 	/*
 	 * Already applied?  Ask the control file, not the WAL: if its current
@@ -613,55 +629,19 @@ pg_upgrade_redo(XLogReaderState *record)
 	{
 		/*
 		 * LEE: the upgrade window is now closed and the cluster is fully
-		 * upgraded.  Clear the guard so hot standby may activate normally
-		 * (CheckRecoveryConsistency will pick it up on the next call).
+		 * reconstructed on disk.  Clear the guard so hot standby may activate
+		 * normally (CheckRecoveryConsistency will pick it up on the next call).
+		 *
+		 * The revertable-upgrade quarantine hold does NOT happen here.  We let
+		 * the redo loop finish and StartupXLOG() write its normal end-of-recovery
+		 * checkpoint (flushing the reconstructed data durably and advancing the
+		 * control checkpoint past COMPLETE).  Only AFTER that -- at the
+		 * end-of-recovery seam in StartupXLOG(), guarded by IsUpgradeBootstrap()
+		 * -- do we set DB_UPGRADE_QUARANTINED and hold, so a later "pg_upgrade
+		 * --commit" is just a lightweight switch to live (no window re-replay)
+		 * and "--rollback" simply discards the reconstructed new cluster.
 		 */
 		pgUpgradeReplayInProgress = false;
-
-		/*
-		 * LEE: revertable upgrade quarantine hold.  When this COMPLETE is
-		 * reached under the sanctioned bootstrap (the first startup that
-		 * PerformWalUpgradeIfNeeded() armed for this new cluster), do NOT let
-		 * StartupXLOG() finalize and bring the cluster live.  The whole upgrade
-		 * has now been reconstructed on disk; hold it, dark, so the operator can
-		 * verify and then explicitly "pg_upgrade --commit" (adopt) or
-		 * "--rollback" (discard).  We mark pg_control DB_UPGRADE_QUARANTINED and
-		 * proc_exit(3) -- the same "shut down the postmaster" exit code that
-		 * recovery_target_action=shutdown uses -- BEFORE the end-of-recovery
-		 * record is written or a timeline is forked (xlog.c), so new_dir is
-		 * frozen exactly at COMPLETE and remains trivially discardable.
-		 *
-		 * A restart re-reads DB_UPGRADE_QUARANTINED and re-holds (the guard in
-		 * PerformWalUpgradeIfNeeded()), so this is idempotent.
-		 *
-		 * Only under in_upgrade_bootstrap: a standby or ordinary stream that
-		 * reaches COMPLETE without the sanctioned bootstrap must not be affected
-		 * (those paths are handled by the START-side guard above).
-		 */
-		if (in_upgrade_bootstrap)
-		{
-			if (!upgrade_commit_requested())
-			{
-				ereport(LOG,
-						(errmsg("pg_upgrade reached end-of-upgrade (COMPLETE); holding new cluster in quarantine"),
-						 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
-				SetControlFileUpgradeQuarantined();
-				proc_exit(3);
-			}
-
-			/*
-			 * Commit requested: consume the sentinel now (so a crash before
-			 * finalize re-holds cleanly) and let StartupXLOG() finalize normally
-			 * -- write the end-of-recovery record and bring the cluster live.
-			 */
-			if (unlink(UPGRADE_COMMIT_SENTINEL) != 0)
-				ereport(WARNING,
-						(errcode_for_file_access(),
-						 errmsg("could not remove pg_upgrade commit sentinel \"%s\": %m",
-								UPGRADE_COMMIT_SENTINEL)));
-			ereport(LOG,
-					(errmsg("pg_upgrade --commit: end-of-upgrade reached; finalizing cluster")));
-		}
 	}
 	else if (info == XLOG_PG_UPGRADE_HANDOFF)
 	{

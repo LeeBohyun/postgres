@@ -100,9 +100,10 @@ CONF
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/o" -D "$W/n" --commit > "$W/commit.log" 2>&1 \
     || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 "$BIN/pg_ctl" -D "$W/n" -l "$W/n.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/n.log"; FAIL=1; }
-# The CN-anchored replay happens during --commit (which finalizes the quarantined
-# cluster).  --commit starts the server with its own server log inside the data
-# dir (pg_upgrade_commit.log), where the "arming recovery" line is written -- not
+# We commit directly from the pending cluster (no prior hold-start), so --commit's
+# own start is the one that reconstructs from CN and, seeing the commit sentinel,
+# goes live.  It writes its server log inside the data dir (pg_upgrade_commit.log),
+# where the "arming recovery" line appears -- not
 # the post-commit start log (that start is an ordinary startup of a now-live
 # cluster) nor pg_upgrade's own stdout.
 grep -q "arming recovery from end-of-upgrade checkpoint" "$W/n/pg_upgrade_commit.log" && log "  replayed from CN" || { echo "  FAIL: did not replay from CN"; FAIL=1; }

@@ -63,27 +63,31 @@ OLD_T1=$("$BIN/pg_ctl" -D "$OLD" -l "$WORK/o.log" -w start >/dev/null 2>&1; \
          "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1)
 run_upgrade "$OLD" "$NEW" || { tail -30 "$WORK/upgrade.log"; fail "upgrade exited nonzero"; }
 
-# Right after upgrade (before any start), the recorded state must be truthful:
-# QUARANTINED, not the stale DB_IN_PRODUCTION pg_upgrade's internal server left.
-STATE=$(db_state "$NEW")
-log "new cluster state after upgrade: '$STATE'"
-echo "$STATE" | grep -qi "quarantine" || fail "new cluster is not quarantined (got '$STATE')"
-
-# It must NOT serve while held: a direct start replays to COMPLETE and holds
-# (the postmaster shuts down at the recovery target), so pg_ctl reports a start
-# failure and no connection is possible.  That is the CORRECT behavior here.
+# In the new model the upgrade leaves the window PENDING in pg_wal/ (not yet
+# reconstructed).  The FIRST start reconstructs the cluster, writes its
+# end-of-recovery checkpoint, then HOLDS in quarantine (not serving).
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new_hold.log" -w start >/dev/null 2>&1
+# It must NOT serve while held: no connection should be possible.
 if "$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
     "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
-    fail "quarantined cluster accepted a connection (should be held/dark)"
+    fail "held cluster accepted a connection (should be held/dark)"
 fi
-grep -qi "held in pg_upgrade quarantine" "$WORK/new_hold.log" \
+grep -qi "holding in quarantine" "$WORK/new_hold.log" \
     || fail "expected quarantine-hold message in startup log"
+STATE=$(db_state "$NEW")
+log "new cluster state after first start: '$STATE'"
+echo "$STATE" | grep -qi "quarantine" || fail "new cluster is not quarantined (got '$STATE')"
+# A restart must re-hold (stay quarantined), not serve or re-replay.
+"$BIN/pg_ctl" -D "$NEW" -l "$WORK/new_rehold.log" -w start >/dev/null 2>&1
+if "$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
+    "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
+    fail "held cluster served on restart (should re-hold)"
+fi
 echo "$(db_state "$NEW")" | grep -qi "quarantine" \
-    || fail "state not quarantined after a hold-start (got '$(db_state "$NEW")')"
-log "PASS: held cluster refused to serve and stayed quarantined"
+    || fail "state not quarantined after restart (got '$(db_state "$NEW")')"
+log "PASS: first start reconstructed + held; restart re-held (never served)"
 
 # =========================================================== Scenario 2: ROLLBACK
 log "Scenario 2: rollback discards new, old still serves"
@@ -97,10 +101,12 @@ AFTER_T1=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*),sum(hashtext
 log "PASS: rollback restored the old cluster intact"
 
 # =========================================================== Scenario 3: COMMIT
-log "Scenario 3: upgrade again, then commit"
+log "Scenario 3: upgrade again, then commit (directly from a pending cluster)"
 NEW=$WORK/new3
 run_upgrade "$OLD" "$NEW" || { tail -30 "$WORK/upgrade.log"; fail "second upgrade exited nonzero"; }
-echo "$(db_state "$NEW")" | grep -qi "quarantine" || fail "second upgrade not quarantined"
+# New model: the window is pending until first start.  We commit directly here
+# (without a prior hold-start), exercising commit-from-pending: commit's start
+# reconstructs the cluster and, seeing the commit sentinel, goes straight live.
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
 

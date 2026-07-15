@@ -35,32 +35,6 @@
 #define UPGRADE_COMMIT_SENTINEL "pg_upgrade_commit.signal"
 
 /*
- * Stamp the new cluster's control file as DB_UPGRADE_QUARANTINED.
- *
- * Called at the end of a --wal-log-upgrade run.  pg_upgrade's internal server
- * work leaves the control state at DB_IN_PRODUCTION, which is untruthful: the
- * on-disk data files have been reverted and the cluster cannot serve until its
- * WAL window is replayed.  Recording the quarantine state here makes the state
- * honest BEFORE any startup, so "pg_upgrade --status/--commit/--rollback" read
- * the correct state on a freshly-upgraded, never-started cluster.
- */
-void
-mark_new_cluster_quarantined(void)
-{
-	ControlFileData *cf;
-	bool		crc_ok;
-
-	cf = get_controlfile(new_cluster.pgdata, &crc_ok);
-	if (cf == NULL || !crc_ok)
-		pg_fatal("could not read control file in \"%s\" to mark quarantine",
-				 new_cluster.pgdata);
-
-	cf->state = DB_UPGRADE_QUARANTINED;
-	update_controlfile(new_cluster.pgdata, cf, true);
-	pg_free(cf);
-}
-
-/*
  * Read the DB state recorded in a cluster's control file.  Fatals if the
  * control file cannot be read or its CRC is bad -- we must not act on a
  * cluster we cannot reliably identify.
@@ -152,7 +126,6 @@ do_status(void)
 static void
 do_commit(void)
 {
-	DBState		state = read_db_state(new_cluster.pgdata);
 	char		sentinel[MAXPGPATH];
 	char		logfile[MAXPGPATH];
 	char		old_ctl[MAXPGPATH],
@@ -160,19 +133,17 @@ do_commit(void)
 	FILE	   *fp;
 
 	/*
-	 * Refuse only if the cluster is already live/committed.  We accept both a
-	 * pre-stamped DB_UPGRADE_QUARANTINED cluster (the normal primary case) and
-	 * a cluster that merely has a pending upgrade window in pg_wal but was never
-	 * stamped -- e.g. a fresh skeleton fed the WAL (the standby/replay case).
-	 * In the latter the state is whatever initdb left (DB_SHUTDOWNED); the
-	 * commit sentinel makes first startup finalize the window either way, and if
-	 * there is no window the backend refuses to start with its own clear error.
+	 * Commit works whether the new cluster is still pending (reconstructed on
+	 * its first start, standby/replay case) or already reconstructed and held
+	 * (DB_UPGRADE_QUARANTINED, the normal primary case).  In both cases we drop
+	 * the commit sentinel and start: the end-of-recovery seam sees the sentinel
+	 * and goes live instead of holding, and a held cluster's startup releases the
+	 * quarantine and finalizes from its durable checkpoint (no window re-replay).
+	 * We do not gate on the pre-start control state, which right after
+	 * pg_upgrade is a stale DB_IN_PRODUCTION left by its internal server work.
 	 */
-	if (state == DB_IN_PRODUCTION)
-		pg_fatal("new cluster \"%s\" is already live (nothing to commit)",
-				 new_cluster.pgdata);
 
-	/* Drop the commit sentinel so first startup finalizes instead of re-holding. */
+	/* Drop the commit sentinel so first startup finalizes instead of holding. */
 	snprintf(sentinel, sizeof(sentinel), "%s/%s", new_cluster.pgdata,
 			 UPGRADE_COMMIT_SENTINEL);
 	fp = fopen(sentinel, "w");

@@ -408,7 +408,6 @@ void		disable_old_cluster(transferMode transfer_mode);
 /* revertable.c */
 
 void		perform_revertable_op(void);
-void		mark_new_cluster_quarantined(void);
 
 
 /* dump.c */

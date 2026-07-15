@@ -4687,13 +4687,14 @@ ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn,
 /*
  * LEE: Mark the control file as held in pg_upgrade quarantine.
  *
- * Called from the XLOG_PG_UPGRADE_COMPLETE redo handler when a sanctioned
- * --wal-log-upgrade bootstrap has just replayed the whole window: instead of
- * letting StartupXLOG() finalize (end-of-recovery record → DB_IN_PRODUCTION →
- * serving), the handler sets this state and proc_exit(3)s, leaving new_dir
- * reconstructed at COMPLETE but NOT serving.  A restart reads this state and
- * re-enters the hold; an explicit "pg_upgrade --commit" is what finalizes.
- * The control file is fsync'd so the held state survives a crash.
+ * Called from StartupXLOG() at the end-of-recovery seam when a sanctioned
+ * --wal-log-upgrade bootstrap has replayed the whole window AND its normal
+ * end-of-recovery checkpoint has been written (so the reconstructed data is
+ * durable and the control checkpoint is past COMPLETE).  Instead of going live
+ * (DB_IN_PRODUCTION), we record this state and exit, leaving new_dir fully
+ * reconstructed but NOT serving.  A restart reads this state and re-holds; an
+ * explicit "pg_upgrade --commit" releases it to a lightweight go-live (no
+ * window re-replay).  The control file is fsync'd so the state survives a crash.
  */
 void
 SetControlFileUpgradeQuarantined(void)
@@ -4706,12 +4707,30 @@ SetControlFileUpgradeQuarantined(void)
 }
 
 /*
+ * LEE: Release the pg_upgrade quarantine hold (called by "pg_upgrade --commit"
+ * path in PerformWalUpgradeIfNeeded()).  The reconstructed cluster's checkpoint
+ * is already past COMPLETE, so moving the state to DB_SHUTDOWNED lets ordinary
+ * startup finalize and go live from that durable checkpoint -- no re-replay.
+ */
+void
+ReleaseControlFileUpgradeQuarantine(void)
+{
+	Assert(ControlFile != NULL);
+
+	if (ControlFile->state == DB_UPGRADE_QUARANTINED)
+	{
+		ControlFile->state = DB_SHUTDOWNED;
+		ControlFile->time = (pg_time_t) time(NULL);
+		UpdateControlFile();
+	}
+}
+
+/*
  * LEE: true if the control file is currently held in pg_upgrade quarantine.
  *
- * PerformWalUpgradeIfNeeded() uses this so that a RESTART of an already-held
- * new cluster re-enters the hold instead of re-arming and re-replaying the
- * window (the control-file checkpoint is still at CN, i.e. before COMPLETE, so
- * the "already applied?" LSN test alone would wrongly re-trigger the upgrade).
+ * PerformWalUpgradeIfNeeded() uses this to decide, from the durable pg_control
+ * STATE (not a checkpoint LSN), that a restart of a held new cluster must
+ * re-hold rather than serve.
  */
 bool
 ControlFileInUpgradeQuarantine(void)
@@ -6670,6 +6689,33 @@ StartupXLOG(void)
 	 */
 	if (performedWalRecovery)
 		promoted = PerformRecoveryXLogAction();
+
+	/*
+	 * LEE: revertable --wal-log-upgrade quarantine hold.
+	 *
+	 * If this startup replayed a sanctioned upgrade window (IsUpgradeBootstrap)
+	 * and no "pg_upgrade --commit" has been requested, HOLD here instead of
+	 * going live.  We arrive at this point only AFTER PerformRecoveryXLogAction()
+	 * has written the end-of-recovery checkpoint, so the reconstructed cluster is
+	 * durable on disk and its control checkpoint is past COMPLETE.  Record
+	 * DB_UPGRADE_QUARANTINED and exit cleanly: new_dir is fully built but not
+	 * serving, and the old cluster is untouched.  "pg_upgrade --commit" later
+	 * releases the hold (a lightweight go-live from the durable checkpoint, no
+	 * re-replay); "pg_upgrade --rollback" discards new_dir.
+	 */
+	if (IsUpgradeBootstrap() && !UpgradeCommitRequested())
+	{
+		ereport(LOG,
+				(errmsg("pg_upgrade: new cluster reconstructed; holding in quarantine (not serving)"),
+				 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
+		SetControlFileUpgradeQuarantined();
+		/*
+		 * Exit with the special code the postmaster reads as "shut down the
+		 * whole server" (same as recovery_target_action=shutdown's proc_exit(3)).
+		 * proc_exit(0) would let the postmaster proceed to accept connections.
+		 */
+		proc_exit(3);
+	}
 
 	/*
 	 * If any of the critical GUCs have changed, log them before we allow

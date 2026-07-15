@@ -472,16 +472,12 @@ main(int argc, char **argv)
 		issue_warnings_and_set_wal_level();
 
 	/*
-	 * LEE: revertable upgrade.  Record the honest lifecycle state on the new
-	 * cluster's control file: it is QUARANTINED (reconstructed-pending, held),
-	 * not the stale DB_IN_PRODUCTION that pg_upgrade's internal server work left
-	 * behind.  This makes "pg_upgrade --status/--commit/--rollback" read the
-	 * correct state on a freshly-upgraded, never-started cluster.  The actual
-	 * hold still happens on first startup (PerformWalUpgradeIfNeeded); this just
-	 * makes the persisted state truthful beforehand.
+	 * LEE: revertable upgrade.  We do NOT pre-stamp the new cluster here: the
+	 * upgrade window is left pending in pg_wal/, and the cluster is reconstructed
+	 * and then HELD (DB_UPGRADE_QUARANTINED) on its first startup, at the
+	 * end-of-recovery seam in StartupXLOG().  "pg_upgrade --commit" then releases
+	 * the hold to a lightweight go-live; "pg_upgrade --rollback" discards it.
 	 */
-	if (user_opts.wal_log_upgrade)
-		mark_new_cluster_quarantined();
 
 	pg_log(PG_REPORT,
 		   "\n"

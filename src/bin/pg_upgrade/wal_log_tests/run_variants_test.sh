@@ -117,7 +117,7 @@ SQL
     if "$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
         "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
         echo "[$name] FAIL: cluster served without a commit (quarantine bypassed)"; RC=1
-    elif ! grep -qiE "held in pg_upgrade quarantine|holding new cluster in quarantine" "$W/new2.log"; then
+    elif ! grep -qiE "holding in quarantine|held in pg_upgrade quarantine" "$W/new2.log"; then
         echo "[$name] FAIL: restart after crash did not re-hold in quarantine"; tail -20 "$W/new2.log"; RC=1
     else
         log "[$name] commit after crash-restart -- must converge and serve"
