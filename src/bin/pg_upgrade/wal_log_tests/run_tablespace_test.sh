@@ -68,10 +68,6 @@ log "pg_upgrade --wal-log-upgrade $MODE"
     -O "-c allow_in_place_tablespaces=on" >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -25 "$W/up.log"; exit 1; }
 
-# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$W/commit.log" 2>&1 \
-    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
-
 # BOTH tablespaces' data files must be WIPED off disk (like base/), so the match
 # below proves WAL replay, not leftover files.  In-place data lives under
 # $NEW/pg_tblspc/<oid>/PG_*/<dboid>/; external data lives under the external
@@ -80,6 +76,12 @@ tsbytes() { find "$1" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9
 IP_BYTES=$(tsbytes "$NEW/pg_tblspc")
 log "tablespace data on disk after pg_upgrade (should be 0=wiped): $IP_BYTES"
 [ "${IP_BYTES:-0}" = "0" ]  || { echo "FAIL: tablespace data not wiped ($IP_BYTES) -- replay unproven"; exit 1; }
+
+# --wal-log-upgrade holds the new cluster in quarantine.  Commit AFTER the
+# wiped-on-disk assertion above (commit replays the window and reconstructs the
+# tablespace relfiles, so checking the wipe post-commit would wrongly see data).
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$W/commit.log" 2>&1 \
+    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 
 echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
 log "start new cluster (WAL replay) and verify tablespace table"

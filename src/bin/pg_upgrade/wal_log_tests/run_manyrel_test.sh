@@ -101,13 +101,16 @@ log "pg_upgrade --wal-log-upgrade --initdb --copy -j 4"
 cd "$W"
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy -j 4 >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -30 "$W/up.log"; exit 1; }
-# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$W/commit.log" 2>&1 \
-    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 
 TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
 log "base/ data-file bytes on disk after pg_upgrade (should be 0 = wiped): $TOTAL_BASE"
 [ "${TOTAL_BASE:-0}" = "0" ] || { echo "FAIL: data not wiped ($TOTAL_BASE) -- replay unproven"; exit 1; }
+
+# --wal-log-upgrade holds the new cluster in quarantine.  Commit AFTER the
+# disk-wiped assertion above (commit replays the window and reconstructs the
+# data files on disk, so checking the wipe post-commit would wrongly see data).
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$W/commit.log" 2>&1 \
+    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 
 cat >> "$NEW/postgresql.conf" <<CONF
 unix_socket_directories='$W'
