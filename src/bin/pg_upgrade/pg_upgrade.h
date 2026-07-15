@@ -408,6 +408,7 @@ void		disable_old_cluster(transferMode transfer_mode);
 /* revertable.c */
 
 void		perform_revertable_op(void);
+void		create_revertable_scripts(void);
 
 
 /* dump.c */

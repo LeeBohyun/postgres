@@ -50,6 +50,12 @@ run_upgrade() {
     local OLD=$1 NEW=$2
     ( cd "$WORK" && "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" \
         -U postgres --initdb --wal-log-upgrade --copy > "$WORK/upgrade.log" 2>&1 )
+    local rc=$?
+    # The run must emit the lifecycle scripts (paths baked in), like
+    # delete_old_cluster.sh, so the operator need not re-type -b/-B/-d/-D.
+    [ $rc -eq 0 ] && { [ -x "$WORK/pg_upgrade_commit.sh" ] || { echo "FAIL: pg_upgrade_commit.sh not generated"; return 1; }
+                       [ -x "$WORK/pg_upgrade_rollback.sh" ] || { echo "FAIL: pg_upgrade_rollback.sh not generated"; return 1; }; }
+    return $rc
 }
 
 rm -rf "$WORK"; mkdir -p "$WORK"

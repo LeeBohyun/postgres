@@ -244,6 +244,74 @@ do_delete_old(void)
 }
 
 /*
+ * Generate the revertable-upgrade lifecycle scripts, in the same style as
+ * create_script_for_old_cluster_deletion(): self-contained shell scripts with
+ * all paths baked in, so the operator runs a path-free script rather than
+ * re-typing -b/-B/-d/-D.  Written at the end of a --wal-log-upgrade run.
+ *
+ *   pg_upgrade_commit.sh   -> pg_upgrade --commit   (adopt new, stamp old)
+ *   pg_upgrade_rollback.sh -> pg_upgrade --rollback (discard new, keep old)
+ *
+ * (delete_old_cluster.sh is still produced by the stock deletion-script path.)
+ */
+void
+create_revertable_scripts(void)
+{
+	char	   *commit_file;
+	char	   *rollback_file;
+	FILE	   *script;
+	const char *newbin = new_cluster.bindir;
+
+	commit_file = psprintf("%spg_upgrade_commit.%s", SCRIPT_PREFIX, SCRIPT_EXT);
+	rollback_file = psprintf("%spg_upgrade_rollback.%s", SCRIPT_PREFIX, SCRIPT_EXT);
+
+	/* --- commit script --- */
+	prep_status("Writing revertable-upgrade scripts");
+	if ((script = fopen_priv(commit_file, "w")) == NULL)
+		pg_fatal("could not open file \"%s\": %m", commit_file);
+#ifndef WIN32
+	fprintf(script, "#!/bin/sh\n\n");
+#endif
+	fprintf(script,
+			"# Adopt the upgraded cluster: bring it live and mark the old\n"
+			"# cluster superseded.  The old cluster is retained; remove it\n"
+			"# afterwards with delete_old_cluster.%s once you are confident.\n\n",
+			SCRIPT_EXT);
+	fprintf(script, "%c%s%cpg_upgrade%c --commit -b %c%s%c -B %c%s%c -d %c%s%c -D %c%s%c\n",
+			PATH_QUOTE, newbin, PATH_SEPARATOR, PATH_QUOTE,
+			PATH_QUOTE, old_cluster.bindir, PATH_QUOTE,
+			PATH_QUOTE, newbin, PATH_QUOTE,
+			PATH_QUOTE, old_cluster.pgdata, PATH_QUOTE,
+			PATH_QUOTE, new_cluster.pgdata, PATH_QUOTE);
+	fclose(script);
+
+	/* --- rollback script --- */
+	if ((script = fopen_priv(rollback_file, "w")) == NULL)
+		pg_fatal("could not open file \"%s\": %m", rollback_file);
+#ifndef WIN32
+	fprintf(script, "#!/bin/sh\n\n");
+#endif
+	fprintf(script,
+			"# Discard the upgraded cluster.  The old cluster was never\n"
+			"# touched; start it again with its original (old) binaries.\n\n");
+	fprintf(script, "%c%s%cpg_upgrade%c --rollback -D %c%s%c\n",
+			PATH_QUOTE, newbin, PATH_SEPARATOR, PATH_QUOTE,
+			PATH_QUOTE, new_cluster.pgdata, PATH_QUOTE);
+	fclose(script);
+
+#ifndef WIN32
+	if (chmod(commit_file, S_IRWXU) != 0)
+		pg_fatal("could not add execute permission to file \"%s\": %m", commit_file);
+	if (chmod(rollback_file, S_IRWXU) != 0)
+		pg_fatal("could not add execute permission to file \"%s\": %m", rollback_file);
+#endif
+
+	pg_free(commit_file);
+	pg_free(rollback_file);
+	check_ok();
+}
+
+/*
  * Dispatch a revertable-upgrade lifecycle subcommand and exit.  Called from
  * main() before the normal upgrade flow when user_opts.revertable_op is set.
  */

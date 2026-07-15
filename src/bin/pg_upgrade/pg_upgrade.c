@@ -475,9 +475,13 @@ main(int argc, char **argv)
 	 * LEE: revertable upgrade.  We do NOT pre-stamp the new cluster here: the
 	 * upgrade window is left pending in pg_wal/, and the cluster is reconstructed
 	 * and then HELD (DB_UPGRADE_QUARANTINED) on its first startup, at the
-	 * end-of-recovery seam in StartupXLOG().  "pg_upgrade --commit" then releases
-	 * the hold to a lightweight go-live; "pg_upgrade --rollback" discards it.
+	 * end-of-recovery seam in StartupXLOG().  We emit self-contained
+	 * pg_upgrade_commit.sh / pg_upgrade_rollback.sh (paths baked in, same style
+	 * as delete_old_cluster.sh) so the operator adopts or discards the upgrade
+	 * without re-typing -b/-B/-d/-D.
 	 */
+	if (user_opts.wal_log_upgrade)
+		create_revertable_scripts();
 
 	pg_log(PG_REPORT,
 		   "\n"
