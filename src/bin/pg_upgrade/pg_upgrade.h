@@ -259,9 +259,10 @@ typedef enum
 	REVERTABLE_OP_COMMIT,		/* finalize a quarantined new_dir, stamp old */
 	REVERTABLE_OP_ROLLBACK,		/* discard a quarantined new_dir */
 	REVERTABLE_OP_DELETE_OLD,	/* delete a superseded old_dir */
-	REVERTABLE_OP_SIGNAL_STANDBYS,	/* emit the handoff trigger on the LIVE old
-									 * primary so streaming standbys stand down
-									 * before the upgrade */
+	REVERTABLE_OP_EMIT_HANDOFF,	/* emit the handoff trigger into the LIVE old
+								 * primary's WAL; it propagates to streaming
+								 * standbys (via safekeepers in Neon) which then
+								 * stand down before the upgrade */
 } RevertableOp;
 
 /*

@@ -71,7 +71,7 @@ parseCommandLine(int argc, char *argv[])
 		{"rollback", no_argument, NULL, 11},
 		{"delete-old", no_argument, NULL, 12},
 		{"status", no_argument, NULL, 13},
-		{"signal-standbys", no_argument, NULL, 14},
+		{"emit-handoff", no_argument, NULL, 14},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -266,7 +266,7 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.revertable_op = REVERTABLE_OP_STATUS;
 				break;
 			case 14:
-				user_opts.revertable_op = REVERTABLE_OP_SIGNAL_STANDBYS;
+				user_opts.revertable_op = REVERTABLE_OP_EMIT_HANDOFF;
 				break;
 
 			default:
@@ -311,16 +311,15 @@ parseCommandLine(int argc, char *argv[])
 			pg_fatal("--delete-old requires the old cluster data directory (-d/--old-datadir)");
 		return;
 	}
-	else if (user_opts.revertable_op == REVERTABLE_OP_SIGNAL_STANDBYS)
+	else if (user_opts.revertable_op == REVERTABLE_OP_EMIT_HANDOFF)
 	{
 		/*
-		 * --signal-standbys connects to the LIVE old primary and emits the
-		 * handoff trigger.  It needs the old data dir (to locate the running
-		 * cluster's socket) and the old port; unlike other ops the old cluster
-		 * is RUNNING here.
+		 * --emit-handoff connects to the LIVE old primary and writes the handoff
+		 * trigger into its WAL.  It needs the old data dir (to locate the running
+		 * cluster's socket); unlike other ops the old cluster is RUNNING here.
 		 */
 		if (old_cluster.pgdata == NULL)
-			pg_fatal("--signal-standbys requires the old cluster data directory (-d/--old-datadir)");
+			pg_fatal("--emit-handoff requires the old cluster data directory (-d/--old-datadir)");
 		return;
 	}
 	else if (user_opts.revertable_op != REVERTABLE_OP_NONE)

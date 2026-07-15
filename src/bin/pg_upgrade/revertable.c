@@ -244,26 +244,28 @@ do_delete_old(void)
 }
 
 /*
- * --signal-standbys: connect to the LIVE old primary and emit the
- * streaming-handoff trigger into its (old-format) WAL.  A physical standby
- * streaming the old primary replays this record and shuts itself down cleanly,
- * ready for the new-version binary swap.  Run this BEFORE stopping the old
+ * --emit-handoff: connect to the LIVE old primary and write the
+ * streaming-handoff trigger into its (old-format) WAL.  This does NOT push to
+ * each standby directly -- it emits a WAL record, which propagates to streaming
+ * standbys through the normal WAL path (in Neon, primary -> safekeepers ->
+ * standby).  On replaying it, a standby shuts down cleanly, ready for the
+ * new-version binary swap / re-provision.  Run this BEFORE stopping the old
  * primary and running pg_upgrade.
  *
  * Unlike the other subcommands (which act on stopped clusters), this one
- * requires the old primary to be RUNNING and reachable on its port.  The target
- * major version passed to the trigger is this pg_upgrade binary's own major
- * (i.e. the new version the standby will converge to).
+ * requires the old primary to be RUNNING.  The target major version passed to
+ * the trigger is this pg_upgrade binary's own major (the new version the
+ * standby will converge to).
  */
 static void
-do_signal_standbys(void)
+do_emit_handoff(void)
 {
 	PGconn	   *conn;
 	PGresult   *res;
 	char		query[128];
 
 	if (old_cluster.pgdata == NULL || old_cluster.pgdata[0] == '\0')
-		pg_fatal("--signal-standbys requires the old cluster data directory (-d)");
+		pg_fatal("--emit-handoff requires the old cluster data directory (-d)");
 
 	/*
 	 * The old primary is RUNNING here.  Flag a live check so get_sock_dir()
@@ -273,7 +275,7 @@ do_signal_standbys(void)
 	user_opts.live_check = true;
 	get_sock_dir(&old_cluster);
 
-	prep_status("Signaling standbys via the old primary (port %d)",
+	prep_status("Emitting handoff trigger on the old primary (port %d)",
 				old_cluster.port);
 
 	conn = connectToServer(&old_cluster, "template1");
@@ -286,8 +288,9 @@ do_signal_standbys(void)
 	check_ok();
 
 	pg_log(PG_REPORT,
-		   "\nHandoff trigger emitted on the old primary.  Streaming standbys will\n"
-		   "replay it and shut down.  Now stop the old primary and run\n"
+		   "\nHandoff trigger written to the old primary's WAL.  It propagates to\n"
+		   "streaming standbys (via the safekeepers in Neon), which replay it and\n"
+		   "shut down.  Now stop the old primary and run\n"
 		   "\"pg_upgrade --wal-log-upgrade ...\"; then re-provision each standby\n"
 		   "from the delivered upgrade window.");
 }
@@ -381,8 +384,8 @@ perform_revertable_op(void)
 		case REVERTABLE_OP_DELETE_OLD:
 			do_delete_old();
 			break;
-		case REVERTABLE_OP_SIGNAL_STANDBYS:
-			do_signal_standbys();
+		case REVERTABLE_OP_EMIT_HANDOFF:
+			do_emit_handoff();
 			break;
 		case REVERTABLE_OP_NONE:
 			break;				/* not reached */
