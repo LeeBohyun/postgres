@@ -6693,15 +6693,24 @@ StartupXLOG(void)
 	/*
 	 * LEE: revertable --wal-log-upgrade quarantine hold.
 	 *
-	 * If this startup replayed a sanctioned upgrade window (IsUpgradeBootstrap)
-	 * and no "pg_upgrade --commit" has been requested, HOLD here instead of
-	 * going live.  We arrive at this point only AFTER PerformRecoveryXLogAction()
-	 * has written the end-of-recovery checkpoint, so the reconstructed cluster is
-	 * durable on disk and its control checkpoint is past COMPLETE.  Record
-	 * DB_UPGRADE_QUARANTINED and exit cleanly: new_dir is fully built but not
-	 * serving, and the old cluster is untouched.  "pg_upgrade --commit" later
-	 * releases the hold (a lightweight go-live from the durable checkpoint, no
-	 * re-replay); "pg_upgrade --rollback" discards new_dir.
+	 * WHY THIS LIVES IN CORE StartupXLOG():  the hold must happen at exactly one
+	 * point -- AFTER PerformRecoveryXLogAction() has written the end-of-recovery
+	 * checkpoint (so the reconstructed cluster is durable on disk and the control
+	 * checkpoint is past COMPLETE), but BEFORE the state flips to
+	 * DB_IN_PRODUCTION / SharedRecoveryState = DONE and backends are let in
+	 * (below).  There is no hook or extension point in that window; a --wal-log-
+	 * upgrade new cluster would otherwise silently go live the instant recovery
+	 * finishes, which is the exact behavior this feature exists to prevent.  The
+	 * guard is a single cheap branch (two process-local reads) and is inert for
+	 * every non-upgrade startup: IsUpgradeBootstrap() is only true when
+	 * PerformWalUpgradeIfNeeded() armed a sanctioned window for THIS startup, so
+	 * ordinary crash/archive/standby recovery never enters it.
+	 *
+	 * When held: record DB_UPGRADE_QUARANTINED and exit cleanly -- new_dir is
+	 * fully built but not serving, and the old cluster is untouched.  A restart
+	 * re-holds (PerformWalUpgradeIfNeeded sees the quarantine state).  "pg_upgrade
+	 * --commit" later releases the hold (a lightweight go-live from the durable
+	 * checkpoint, no window re-replay); "pg_upgrade --rollback" discards new_dir.
 	 */
 	if (IsUpgradeBootstrap() && !UpgradeCommitRequested())
 	{

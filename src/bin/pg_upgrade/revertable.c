@@ -57,7 +57,23 @@ read_db_state(const char *datadir)
 	return state;
 }
 
-/* Run "pg_ctl <verb>" against a data directory; return true on success. */
+/*
+ * Run "pg_ctl <verb>" against a data directory; return true on success.
+ *
+ * Uses the NEW cluster's binaries (new_cluster.bindir): the lifecycle
+ * subcommands only ever start/stop the NEW cluster (reconstructed at the new
+ * major version), never the old one -- the old cluster is only ever renamed
+ * (superseded stamp) or rm -rf'd, never started by us.  If a future op ever
+ * needs to run pg_ctl against the old cluster it must pass the old bindir
+ * explicitly rather than reuse this helper.
+ *
+ * We shell out via system() rather than reuse pg_upgrade's exec_prog() /
+ * start_postmaster() on purpose: those carry upgrade-run-specific setup (output
+ * dirs, IsBinaryUpgrade options, PGOPTIONS, atexit stop hooks) that does not
+ * apply to a standalone lifecycle subcommand acting on an already-built cluster.
+ * datadir/logfile come from -D/-d and an internal path, and are double-quoted;
+ * pg_ctl's own -w handles wait semantics.
+ */
 static bool
 run_pg_ctl(const char *verb, const char *datadir, const char *logfile)
 {
