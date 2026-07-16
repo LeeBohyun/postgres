@@ -80,10 +80,12 @@ log "tablespace data on disk after pg_upgrade (should be 0=wiped): $IP_BYTES"
 # --wal-log-upgrade holds the new cluster in quarantine.  Commit AFTER the
 # wiped-on-disk assertion above (commit replays the window and reconstructs the
 # tablespace relfiles, so checking the wipe post-commit would wrongly see data).
+echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
+# Hold-start: first start applies the WAL window, reconstructs, and holds
+# in quarantine (pg_ctl returns non-zero by design as it exits at the hold).
+"$BIN/pg_ctl" -D "$NEW" -l "$W/hold.log" -w start >/dev/null 2>&1 || true
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$W/commit.log" 2>&1 \
     || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
-
-echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
 log "start new cluster (WAL replay) and verify tablespace table"
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo FAIL start new; tail -30 "$W/new.log"; exit 1; }
 NTS_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint) FROM ts_t" 2>&1)

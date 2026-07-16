@@ -55,12 +55,13 @@ SQL
     local TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
     [ "${TOTAL_BASE:-0}" = "0" ] || { echo "[$name] FAIL: base/ not wiped ($TOTAL_BASE)"; return 1; }
 
-    # --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it
-    # (after the disk-wiped assertion above, before starting it below).
+    # --wal-log-upgrade holds the new cluster in quarantine (after the disk-wiped
+    # assertion above).  Hold-start it (applies the window, reconstructs, holds;
+    # pg_ctl exits non-zero by design), then commit, then start for real.
+    echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$port">>$NEW/postgresql.conf
+    "$BIN/pg_ctl" -D "$NEW" -l "$W/hold.log" -w start >/dev/null 2>&1 || true
     "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit >"$W/commit.log" 2>&1 \
         || { echo "[$name] FAIL commit"; tail -20 "$W/commit.log"; return 1; }
-
-    echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$port">>$NEW/postgresql.conf
     "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "[$name] FAIL start new"; tail -20 "$W/new.log"; return 1; }
     local NEW_FP=$("$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint), (SELECT count(*) FROM toast_t) FROM t")
     "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1

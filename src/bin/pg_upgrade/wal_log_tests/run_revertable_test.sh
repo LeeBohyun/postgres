@@ -107,14 +107,15 @@ AFTER_T1=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*),sum(hashtext
 log "PASS: rollback restored the old cluster intact"
 
 # =========================================================== Scenario 3: COMMIT
-log "Scenario 3: upgrade again, then commit (directly from a pending cluster)"
+log "Scenario 3: upgrade again, hold-start, then commit"
 NEW=$WORK/new3
 run_upgrade "$OLD" "$NEW" || { tail -30 "$WORK/upgrade.log"; fail "second upgrade exited nonzero"; }
-# New model: the window is pending until first start.  We commit directly here
-# (without a prior hold-start), exercising commit-from-pending: commit's start
-# reconstructs the cluster and, seeing the commit sentinel, goes straight live.
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
+# You cannot commit a not-yet-applied cluster: commit requires the held
+# (quarantine) state, reached by a first start that reconstructs and holds.
+"$BIN/pg_ctl" -D "$NEW" -l "$WORK/new3_hold.log" -w start >/dev/null 2>&1 || true
+echo "$(db_state "$NEW")" | grep -qi "quarantine" || fail "hold-start did not quarantine (got '$(db_state "$NEW")')"
 
 # --delete-old BEFORE commit must be refused (old not yet superseded)
 if "$BIN/pg_upgrade" -d "$OLD" --delete-old > "$WORK/del_early.log" 2>&1; then

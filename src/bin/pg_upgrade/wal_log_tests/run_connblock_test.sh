@@ -46,17 +46,18 @@ cd "$W"
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" -U postgres --initdb --wal-log-upgrade --copy > "$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo "FAIL upgrade"; tail -15 "$W/up.log"; exit 1; }
 
-# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" --commit > "$W/commit.log" 2>&1 \
-    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
-
 cat >> "$N/postgresql.conf" <<CONF
 port=$P
 unix_socket_directories='$W'
 hot_standby=on
 CONF
 
-log "hammer connections while the new cluster starts + replays the upgrade"
+# The upgrade replay happens on the HOLD-START (first start): it reconstructs the
+# cluster and holds in quarantine (dark), so no connection may observe a
+# half-upgraded cluster during it.  Hammer connections THROUGH that hold-start --
+# every probe must either be cleanly rejected (recovering / not accepting) or,
+# once held, refused; never a partial count.  pg_ctl exits non-zero at the hold.
+log "hammer connections while the new cluster replays the upgrade (hold-start)"
 PROBE="$W/probe.out"; : > "$PROBE"
 (
   for i in $(seq 1 400); do
@@ -65,11 +66,16 @@ PROBE="$W/probe.out"; : > "$PROBE"
   done
 ) > "$PROBE" 2>&1 &
 PROBEPID=$!
+"$BIN/pg_ctl" -D "$N" -l "$W/n.log" -w start >/dev/null 2>&1 || true
+wait $PROBEPID 2>/dev/null
+
+# Now adopt the held cluster and bring it live for the final consistency check.
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" --commit > "$W/commit.log" 2>&1 \
+    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 "$BIN/pg_ctl" -D "$N" -l "$W/n.log" -w start >/dev/null 2>&1
 STARTRC=$?
-wait $PROBEPID 2>/dev/null
 "$BIN/pg_ctl" -D "$N" -w stop >/dev/null 2>&1
-[ $STARTRC -eq 0 ] || { echo "FAIL: new cluster did not start"; tail -15 "$W/n.log"; exit 1; }
+[ $STARTRC -eq 0 ] || { echo "FAIL: new cluster did not start after commit"; tail -15 "$W/n.log"; exit 1; }
 
 log "analyze probe results"
 # Every outcome is one of:

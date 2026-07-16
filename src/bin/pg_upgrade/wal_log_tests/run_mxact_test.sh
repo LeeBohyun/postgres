@@ -74,10 +74,13 @@ log "after pg_upgrade: pg_multixact offsets=$MXOFF_BYTES members=$MXMEM_BYTES by
 # --wal-log-upgrade holds the new cluster in quarantine.  Commit AFTER the
 # skipped-on-disk assertion above (commit replays the window and reconstructs
 # the SLRU segments, so checking post-commit would wrongly see data).
+echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"; echo "port=$PORT" >> "$NEW/postgresql.conf"
+    # Hold-start: first start applies the WAL window, reconstructs, and holds
+    # in quarantine (pg_ctl returns non-zero by design as it exits at the hold).
+    "$BIN/pg_ctl" -D "$NEW" -l "$WORK/hold.log" -w start >/dev/null 2>&1 || true
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$WORK/commit.log" 2>&1 \
     || { echo FAIL commit; tail -20 "$WORK/commit.log"; exit 1; }
 
-echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"; echo "port=$PORT" >> "$NEW/postgresql.conf"
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1 || { echo FAIL start; tail -30 "$WORK/new.log"; exit 1; }
 NEW_SUM=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint) FROM m")
 NEW_NEXT=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT next_multixact_id FROM pg_control_checkpoint()")

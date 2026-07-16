@@ -133,17 +133,21 @@ do_commit(void)
 	FILE	   *fp;
 
 	/*
-	 * Commit works whether the new cluster is still pending (reconstructed on
-	 * its first start, standby/replay case) or already reconstructed and held
-	 * (DB_UPGRADE_QUARANTINED, the normal primary case).  In both cases we drop
-	 * the commit sentinel and start: the end-of-recovery seam sees the sentinel
-	 * and goes live instead of holding, and a held cluster's startup releases the
-	 * quarantine and finalizes from its durable checkpoint (no window re-replay).
-	 * We do not gate on the pre-start control state, which right after
-	 * pg_upgrade is a stale DB_IN_PRODUCTION left by its internal server work.
+	 * Gate: you cannot commit a cluster whose upgrade has not been applied yet.
+	 * Committing means finalizing an already-reconstructed cluster, so the new
+	 * cluster must be HELD in quarantine -- i.e. it was started once, replayed
+	 * its upgrade window to COMPLETE, and is holding (DB_UPGRADE_QUARANTINED).
+	 * This is also the gate that confines --commit to real --wal-log-upgrade
+	 * clusters: no ordinary cluster is ever in this state, so --commit refuses a
+	 * random -D.  (A never-started cluster is still pending -- start it first.)
 	 */
+	if (read_db_state(new_cluster.pgdata) != DB_UPGRADE_QUARANTINED)
+		pg_fatal("new cluster \"%s\" is not held in pg_upgrade quarantine\n"
+				 "Start it once so it reconstructs and holds, then commit; "
+				 "or this is not a --wal-log-upgrade cluster.",
+				 new_cluster.pgdata);
 
-	/* Drop the commit sentinel so first startup finalizes instead of holding. */
+	/* Drop the commit sentinel so startup finalizes instead of re-holding. */
 	snprintf(sentinel, sizeof(sentinel), "%s/%s", new_cluster.pgdata,
 			 UPGRADE_COMMIT_SENTINEL);
 	fp = fopen(sentinel, "w");
