@@ -244,7 +244,7 @@ do_delete_old(void)
 }
 
 /*
- * --emit-handoff: connect to the LIVE old primary and write the
+ * --signal-handoff: connect to the LIVE old primary and write the
  * streaming-handoff trigger into its (old-format) WAL.  This does NOT push to
  * each standby directly -- it emits a WAL record, which propagates to streaming
  * standbys through the normal WAL path (in Neon, primary -> safekeepers ->
@@ -258,14 +258,14 @@ do_delete_old(void)
  * standby will converge to).
  */
 static void
-do_emit_handoff(void)
+do_signal_handoff(void)
 {
 	PGconn	   *conn;
 	PGresult   *res;
 	char		query[128];
 
 	if (old_cluster.pgdata == NULL || old_cluster.pgdata[0] == '\0')
-		pg_fatal("--emit-handoff requires the old cluster data directory (-d)");
+		pg_fatal("--signal-handoff requires the old cluster data directory (-d)");
 
 	/*
 	 * The old primary is RUNNING here.  Flag a live check so get_sock_dir()
@@ -275,7 +275,7 @@ do_emit_handoff(void)
 	user_opts.live_check = true;
 	get_sock_dir(&old_cluster);
 
-	prep_status("Emitting handoff trigger on the old primary (port %d)",
+	prep_status("Signaling handoff on the old primary (port %d)",
 				old_cluster.port);
 
 	conn = connectToServer(&old_cluster, "template1");
@@ -384,8 +384,8 @@ perform_revertable_op(void)
 		case REVERTABLE_OP_DELETE_OLD:
 			do_delete_old();
 			break;
-		case REVERTABLE_OP_EMIT_HANDOFF:
-			do_emit_handoff();
+		case REVERTABLE_OP_SIGNAL_HANDOFF:
+			do_signal_handoff();
 			break;
 		case REVERTABLE_OP_NONE:
 			break;				/* not reached */
