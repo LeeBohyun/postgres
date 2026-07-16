@@ -340,6 +340,71 @@ Everything under "reuse": recovery targets, `RecoveryPauseState`,
 `restore_command`/`RestoreArchivedFile`, timeline history follow, the existing
 COMPLETE commit token, and `--copy`'s old_dir isolation.
 
+### H. Streaming the window into the skeleton (spike-validated, 2026-07-16)
+
+The older sections assume the window is **file-delivered** (archive / restore_command).
+A spike on Arca (fresh v20 skeleton streaming from an upgraded v18->20 primary)
+established that **streaming the window into a fresh skeleton is viable** — the
+PG_VERSION gate does NOT apply to a fresh vN+1 skeleton (it starts, "entering
+standby mode", "ready to accept read-only connections"). So "no cp, stream it"
+is achievable, subject to the pieces below.
+
+WHAT THE SPIKE RULED OUT vs. IN:
+- OUT (my test error, not a design blocker): the spike hit a walreceiver
+  "system identifier differs" FATAL — but only because it started the skeleton
+  in plain standby.signal streaming WITHOUT arming the upgrade bootstrap first.
+  **No sysid seeding is needed.** The sysid rides IN the WAL (`xlp_sysid`); the
+  bootstrap already adopts it in-process (`ArmControlFileForUpgradeRecovery`:
+  `ControlFile->system_identifier = wal_sysid`, proven by
+  run_standby_xversion_test with intentionally-different sysids). The real
+  requirement is that arming (which adopts the sysid + anchors CN) must run in
+  the streaming path too, before/around the walreceiver handshake — not an
+  out-of-band sysid stamp.
+- IN (genuine, spike-confirmed): the upgraded primary had ALREADY RECYCLED the
+  window ("window markers in primary pg_wal: 0") because its end-of-recovery
+  checkpoint reclaimed those segments. **The primary must RETAIN the window** for
+  a standby to stream it — via a replication slot / wal_keep_size, and/or
+  archive.  This is C2 made concrete: without retention there is nothing to
+  stream.
+
+TIMELINE COORDINATION (useful — checked against code):
+The window is currently emitted on TLI 1 (`pgupgrade_wal.c:280` `priv.tli = 1`).
+Walreceiver already supports FOLLOWING a timeline switch while streaming
+(`WalRcvFetchTimeLineHistoryFiles`, `startpointTLI`; standby reads the `.history`
+file — `xlogrecovery.c:4317`).  So emitting the window as a **new timeline forked
+at CN** (write a `.history`) lets a streaming standby cross TLI 1 -> TLI 2 at the
+fork point and pull the window, exactly as standbys already cross timelines
+during failover/promotion.  This is the "manage the timeline like Neon branching"
+idea, and it is the natural C2 solution for the streaming path: the branch point
+IS the CN anchor.  (For the file-delivered path, TLI 1 is fine.)
+
+ATOMICITY WITHOUT A PRE-SCAN (decided 2026-07-16):
+The file path proves atomicity by pre-scanning pg_wal for COMPLETE and refusing
+to start if absent.  **Streaming cannot pre-check COMPLETE** — the window arrives
+incrementally.  So the model inverts, and this is WHY the feature is revertable:
+- DETECT an upgrade by the FIRST record being XLOG_PG_UPGRADE_START (not by
+  finding COMPLETE up front).  Drop the `!found_complete -> FATAL` pre-scan.
+- ARM on START, then HOLD in quarantine — the cluster NEVER auto-goes-live.
+- A `--status` / commit-gate check verifies COMPLETE was ACTUALLY REPLAYED before
+  allowing commit.  An incomplete stream (primary died mid-window) simply never
+  reaches COMPLETE -> stays quarantined -> rollback discards it.  No half-upgraded
+  cluster ever serves.  Rollback-ability REPLACES the pre-scan as the atomicity
+  guarantee.
+- NOTE (code impact): today's "already applied?" restart check keys off
+  `GetControlFileCheckPointLSN() >= complete_lsn`.  With COMPLETE no longer
+  required up-front, that test must be re-based on a COMPLETE-independent signal
+  (e.g. pg_control state past the window / not-quarantined), or `complete_lsn`
+  being Invalid (0) would make the check always true and wrongly skip arming.
+
+NEW CODE for the streaming standby path (beyond the file path):
+1. Arming must run in the streaming path (adopt sysid + anchor CN before the
+   walreceiver applies the window); rework the START-guard so a bootstrap-armed
+   streaming standby APPLIES the window instead of FATAL-halting.
+2. Window retention on the primary (slot / wal_keep_size / archive) + optional
+   emit-on-new-timeline-forked-at-CN so the walreceiver can follow to it.
+3. Gate rework: arm-on-START, drop the COMPLETE pre-scan, add the
+   COMPLETE-replayed status/commit check (shared with the file path).
+
 ### G. No stale-new_dir problem (Q-R3 retired)
 
 The old cluster is shut down for the whole upgrade (C5), so new_dir never goes
