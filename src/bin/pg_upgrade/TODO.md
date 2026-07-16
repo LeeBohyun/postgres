@@ -3,17 +3,24 @@
 Working and tested today (see wal_log_tests/): primary upgrade via WAL replay;
 standby upgrade by REPLAYING a delivered upgrade WAL (in-band CN derivation,
 converges to the primary, writable); cross-version standby upgrade (18->20) via
-the skeleton model; tablespaces (in-place + capture/wipe); empty-catalog
+the skeleton model; ALL-version matrix 14/15/16/17/18 -> 20 (primary
+self-upgrade); tablespaces (in-place + capture/wipe); empty-catalog
 reconstruction; crash-mid-upgrade atomicity; all 5 transfer modes; 10GB +
-concurrent-client stress; multixact members long-name SLRU segments.
+concurrent-client stress; multixact members long-name SLRU segments; the
+revertable lifecycle (quarantine hold, commit-is-finalize, rollback, delete-old,
+signal-handoff) plus its adversarial edges (run_revertable_extreme_test.sh).
 
-## 1. Remaining wiring for the handoff trigger
+## 1. Handoff trigger wiring — RESOLVED
 
 The XLOG_PG_UPGRADE_HANDOFF record + the standby self-shutdown are implemented
-and tested.  Still to wire for a complete operator flow:
-- Decide WHO calls pg_write_pg_upgrade_handoff() on the live old primary before
-  shutdown: pg_upgrade core vs. an HA/orchestration layer.  (Lean: HA layer --
-  pg_upgrade never connects to the old primary as a standby-visible writer.)
+and tested.  RESOLVED: `pg_upgrade --signal-handoff -d <old> -U <user>` connects
+to the LIVE old primary and calls pg_write_pg_upgrade_handoff(); the trigger
+then propagates to standbys through the normal WAL path (in Neon: primary ->
+safekeepers -> standby -- verified against the hadron compute config, replicas
+stream from the safekeepers, so no per-standby push is needed).  This can be run
+by an operator or an HA/orchestration layer.  pg_upgrade still never acts as a
+standby-visible writer during the upgrade itself; --signal-handoff is a distinct
+pre-upgrade action against the running primary.
 
 CONNECTION BLOCKING -- investigated 2026-07-14, found NO reachable exposure, no
 code change warranted:
@@ -54,23 +61,20 @@ code change warranted:
 - Q2: orphaned old-cluster relfiles on the standby (unreferenced garbage) --
   confirm benign / clean up.
 
-## 3. All-version upgrade permutation test
+## 3. All-version upgrade permutation test — DONE
 
-Add a test matrix that exercises --wal-log-upgrade across EVERY supported
-old->new major-version pair, not just the single 18->20 pair currently proven by
-run_standby_xversion_test.sh.
+run_allversion_matrix_test.sh upgrades EVERY available old major to the current
+NEW (20devel) via --wal-log-upgrade and asserts, per pair: catalog version jumps
+old->new, the new cluster holds then commits, data matches, appdb data survives,
+and the result is writable.  Driven from OLDBIN_DIRS (defaults to the Arca
+hadron/pg_install/vNN layout); unavailable pairs are SKIPPED and logged, and the
+test FAILS if no cross-version pair was available (no silent all-skip pass).
 
-- For each supported OLD major (e.g. the last N majors pg_upgrade accepts as a
-  source) upgrading to the current NEW major, run: primary self-upgrade via WAL
-  replay (run_upgrade_test-style) AND the cross-version standby re-provision
-  (run_standby_xversion_test-style), asserting catalog version changes old->new,
-  data matches, and the result is writable.
-- Drive it from a list of OLDBIN dirs (one per major) + the single NEWBIN; skip
-  pairs whose OLDBIN is unavailable on the box, and LOG which pairs were skipped
-  (no silent coverage gaps).
-- Include the handoff trigger where the OLD binary supports it (forward-looking),
-  and note where it cannot be exercised (stock old majors that do not emit
-  XLOG_PG_UPGRADE_HANDOFF).
-- Goal: catch version-specific regressions (catalog layout, SLRU format, control
-  version gates) that a single pair cannot surface -- e.g. the members long-name
-  SLRU truncation bug fixed this session would have been caught here.
+Proven on Arca (ran=5 passed=5): 14.23, 15.18, 16.14, 17.10, 18.4 -> 20devel,
+each with a real catalog-version jump (e.g. 202107181 -> 202607022).
+
+Still primary self-upgrade only.  Possible follow-ups (not blocking):
+- extend each matrix pair to ALSO do the cross-version standby re-provision
+  (run_standby_xversion_test-style), not just the primary self-upgrade;
+- exercise the handoff trigger where the OLD binary emits
+  XLOG_PG_UPGRADE_HANDOFF (stock old majors do not, so note where skipped).
