@@ -38,6 +38,7 @@
 #include "catalog/pg_tablespace_d.h"
 #include "common/file_perm.h"	/* pg_dir_create_mode */
 #include "common/relpath.h"		/* RelFileLocator, ForkNumber */
+#include "fmgr.h"				/* pg_upgrade_window_anchor SQL function */
 #include "miscadmin.h"
 #include "storage/bufmgr.h"		/* buffer-manager RELFILE_DATA redo */
 #include "storage/smgr.h"		/* smgr create for empty relfiles */
@@ -46,6 +47,7 @@
 #include "storage/copydir.h"	/* copydir() for WAL segment migration */
 #include "storage/ipc.h"		/* proc_exit() for the quarantine hold */
 #include "storage/lwlock.h"
+#include "utils/builtins.h"		/* cstring_to_text, psprintf */
 #include "utils/elog.h"
 
 /* -------------------------------------------------------------------------
@@ -354,6 +356,54 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 }
 
 /*
+ * LEE: pg_upgrade_window_anchor() -> text
+ *
+ * Run ON THE LIVE (committed) PRIMARY that retains the upgrade window (pinned by
+ * the UPGRADE_WINDOW_SLOT replication slot).  Scans the primary's own pg_wal for
+ * the CN checkpoint that precedes XLOG_PG_UPGRADE_START and returns the anchor a
+ * streaming standby needs to stamp into its control file BEFORE it connects:
+ *
+ *     "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>"   (cn_lsn and redo_lsn, each an
+ *                                              %X/%08X pair, slash-joined)
+ *
+ * The standby also learns the primary's sysid + TLI from IDENTIFY_SYSTEM (a
+ * standard replication command), so those are not returned here.  Recovery on the
+ * standby re-reads the full CN CheckPoint record from the streamed WAL, so only
+ * the LSNs are needed to point recovery at CN.  Returns NULL if no window is
+ * present (not an upgrade primary, or the window was already released).
+ */
+Datum		pg_upgrade_window_anchor(PG_FUNCTION_ARGS);
+
+PG_FUNCTION_INFO_V1(pg_upgrade_window_anchor);
+
+Datum
+pg_upgrade_window_anchor(PG_FUNCTION_ARGS)
+{
+	char		wal_dir[MAXPGPATH];
+	bool		found_start = false;
+	bool		found_complete = false;
+	CheckPoint	cn;
+	XLogRecPtr	cn_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	complete_lsn = InvalidXLogRecPtr;
+	uint64		wal_sysid = 0;
+	char	   *result;
+
+	snprintf(wal_dir, sizeof(wal_dir), XLOGDIR);
+
+	if (!upgrade_wal_scan_markers(wal_dir, &found_start, &found_complete,
+								  &cn, &cn_lsn, &complete_lsn, &wal_sysid) ||
+		!found_start ||
+		XLogRecPtrIsInvalid(cn_lsn))
+		PG_RETURN_NULL();		/* no retained upgrade window here */
+
+	result = psprintf("%X/%08X/%X/%08X",
+					  LSN_FORMAT_ARGS(cn_lsn),
+					  LSN_FORMAT_ARGS(cn.redo));
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+/*
  * LEE: true once PerformWalUpgradeIfNeeded() has armed the sanctioned upgrade
  * bootstrap (pg_wal_upgrade/ present with a COMPLETE marker) for this startup.
  * The pg_upgrade redo handlers consult it to distinguish the bootstrap replay
@@ -372,6 +422,50 @@ static bool in_upgrade_bootstrap = false;
  * hold.  It is consumed once finalization begins so a later crash re-holds.
  */
 #define UPGRADE_COMMIT_SENTINEL	"pg_upgrade_commit.signal"
+
+/*
+ * LEE: durable "the upgrade window fully replayed to COMPLETE" marker.
+ *
+ * The end-of-recovery quarantine hold (StartupXLOG) fires for ANY armed upgrade
+ * bootstrap -- including a crash-truncated window that stopped before COMPLETE.
+ * So DB_UPGRADE_QUARANTINED alone cannot tell a fully-upgraded held cluster from
+ * a partial one: both hold in quarantine.  This marker is the ground truth.  It
+ * is written+fsync'd by the XLOG_PG_UPGRADE_COMPLETE redo handler (below) the
+ * instant redo actually reaches COMPLETE, so its presence proves the window
+ * replayed in full.  "pg_upgrade --commit" refuses to finalize a held cluster
+ * that lacks it (a partial cluster can only be --rollback'd), and --status
+ * reports it.  Written with a relative path: redo runs with cwd == DataDir.
+ */
+#define UPGRADE_COMPLETE_MARKER	"pg_upgrade_complete.done"
+
+/*
+ * LEE: streaming-standby anchor file, written by "pg_upgrade --prepare-standby".
+ *
+ * A fresh PG20 skeleton cannot scan a local pg_wal window (the window streams in
+ * from the live primary), and its walreceiver would reject the primary on a sysid
+ * mismatch before any WAL flows.  The prepare step contacts the live primary,
+ * learns the window's anchor + identity, and drops this file so first startup can
+ * arm the control file (sysid + CN + TLI) BEFORE the walreceiver connects.  Four
+ * whitespace-separated fields on one line:
+ *
+ *     <sysid> <cn_lsn> <cn_redo> <tli>
+ *
+ * sysid: decimal uint64 (primary's system identifier, from IDENTIFY_SYSTEM).
+ * cn_lsn/cn_redo: %X/%08X LSNs (from pg_upgrade_window_anchor() on the primary).
+ * tli: decimal (primary's timeline, from IDENTIFY_SYSTEM; =1 for pg_upgrade).
+ * Consumed (removed) once arming succeeds so a later restart re-reads pg_control.
+ */
+#define UPGRADE_STREAM_ANCHOR	"pg_upgrade_stream.anchor"
+
+/*
+ * LEE: durable "this node's old cluster is authorized for deletion" marker,
+ * written+fsync'd by the XLOG_PG_UPGRADE_DELETE_AUTHORIZE redo handler when a NEW
+ * streaming standby replays the set-wide delete signal from the primary.  A local
+ * "pg_upgrade --delete-old" on the standby treats this marker as authorization to
+ * remove the (superseded) old cluster, so the operator need not hand-run
+ * delete-old fleet-wide.  Written under DataDir (redo cwd == DataDir).
+ */
+#define UPGRADE_DELETE_AUTHORIZED_MARKER	"pg_upgrade_delete_authorized"
 
 bool
 UpgradeCommitRequested(void)
@@ -400,6 +494,98 @@ bool
 IsUpgradeBootstrap(void)
 {
 	return in_upgrade_bootstrap;
+}
+
+/*
+ * LEE: streaming-standby arming.  If UPGRADE_STREAM_ANCHOR is present, this is a
+ * fresh skeleton that will STREAM the upgrade window from the live primary.  Read
+ * the anchor, stamp the control file (sysid + CN + TLI) via
+ * ArmControlFileForUpgradeRecovery so the walreceiver's sysid check passes and
+ * recovery starts at CN, and return true.  The full CN CheckPoint record is
+ * re-read from the streamed WAL by StartupXLOG (only the LSNs are needed here to
+ * point recovery at CN and its redo), so the CheckPoint we build carries just the
+ * fields recovery reads before the record arrives: redo, ThisTimeLineID.
+ *
+ * Returns false if no anchor file exists (the ordinary local-window path runs
+ * instead).  On a malformed anchor we FATAL: the operator explicitly asked for a
+ * streaming standby, so silently falling back would be wrong.
+ */
+static bool
+ArmFromStreamingAnchorIfPresent(void)
+{
+	int			fd;
+	char		buf[256];
+	int			n;
+	uint64		sysid = 0;
+	uint32		cn_hi = 0,
+				cn_lo = 0,
+				redo_hi = 0,
+				redo_lo = 0,
+				tli = 0;
+	XLogRecPtr	cn_lsn;
+	CheckPoint	cn;
+
+	fd = OpenTransientFile(UPGRADE_STREAM_ANCHOR, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+	{
+		if (errno == ENOENT)
+			return false;		/* not a streaming standby; ordinary path */
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not open pg_upgrade streaming anchor \"%s\": %m",
+						UPGRADE_STREAM_ANCHOR)));
+	}
+
+	n = read(fd, buf, sizeof(buf) - 1);
+	CloseTransientFile(fd);
+	if (n <= 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not read pg_upgrade streaming anchor \"%s\": %m",
+						UPGRADE_STREAM_ANCHOR)));
+	buf[n] = '\0';
+
+	/* <sysid> <cn_hi>/<cn_lo> <redo_hi>/<redo_lo> <tli> */
+	if (sscanf(buf, UINT64_FORMAT " %X/%X %X/%X %u",
+			   &sysid, &cn_hi, &cn_lo, &redo_hi, &redo_lo, &tli) != 6 ||
+		sysid == 0 || tli == 0)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("malformed pg_upgrade streaming anchor \"%s\": \"%s\"",
+						UPGRADE_STREAM_ANCHOR, buf)));
+
+	cn_lsn = ((uint64) cn_hi << 32) | cn_lo;
+
+	MemSet(&cn, 0, sizeof(cn));
+	cn.redo = ((uint64) redo_hi << 32) | redo_lo;
+	cn.ThisTimeLineID = tli;
+	cn.PrevTimeLineID = tli;
+
+	ereport(LOG,
+			(errmsg("pg_upgrade: arming streaming standby from anchor "
+					"(sysid " UINT64_FORMAT ", CN %X/%08X, redo %X/%08X, TLI %u)",
+					sysid, LSN_FORMAT_ARGS(cn_lsn),
+					LSN_FORMAT_ARGS(cn.redo), tli)));
+
+	/*
+	 * Stamp sysid + CN + TLI so the walreceiver accepts the primary, in STREAMING
+	 * mode: the window is not on local disk, so recovery must enter standby mode
+	 * and stream CN + the window from the primary.
+	 */
+	ArmControlFileForUpgradeRecovery(&cn, cn_lsn, sysid, true);
+
+	/*
+	 * Consume the anchor so a later restart re-reads pg_control (by then the
+	 * control file is armed / the cluster is quarantined, and the ordinary paths
+	 * take over).  Best-effort: a stale anchor would just re-arm identically.
+	 */
+	if (unlink(UPGRADE_STREAM_ANCHOR) != 0 && errno != ENOENT)
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not remove pg_upgrade streaming anchor \"%s\": %m",
+						UPGRADE_STREAM_ANCHOR)));
+
+	return true;
 }
 
 bool
@@ -446,6 +632,21 @@ PerformWalUpgradeIfNeeded(void)
 		return false;			/* ordinary startup finalizes; no re-replay */
 	}
 
+	/*
+	 * STREAMING STANDBY PATH.  If the standby-prepare step dropped a streaming
+	 * anchor file, this is a fresh skeleton that will STREAM the upgrade window
+	 * from the live primary (not replay a local pg_wal window).  Arm from the
+	 * anchor -- stamp the control file with the primary's sysid + CN + TLI so the
+	 * walreceiver's sysid check passes and recovery starts at CN -- then let
+	 * StartupXLOG() enter standby mode and stream the window forward.  The window
+	 * is NOT on local disk yet, so we must NOT fall through to the pg_wal scan.
+	 */
+	if (ArmFromStreamingAnchorIfPresent())
+	{
+		in_upgrade_bootstrap = true;
+		return true;
+	}
+
 	snprintf(wal_dir, sizeof(wal_dir), XLOGDIR);
 
 	/*
@@ -463,8 +664,14 @@ PerformWalUpgradeIfNeeded(void)
 	 *                       finalized by a prior startup; its end-of-recovery
 	 *                       checkpoint sits past COMPLETE (on this or a later
 	 *                       timeline).
-	 *   START, no COMPLETE -> crash mid-upgrade; refuse to start (old cluster
-	 *                       is intact — re-run pg_upgrade).
+	 *   START, no COMPLETE -> crash mid-upgrade.  Replay the partial window
+	 *                       anyway and HOLD it in quarantine at end-of-recovery
+	 *                       (it never serves and never leaves the COMPLETE
+	 *                       marker, so --commit refuses it).  The partial new_dir
+	 *                       is a dead end: it does NOT resume or repair in place.
+	 *                       Recovery is --rollback (discard new_dir) then re-run
+	 *                       pg_upgrade -- which is safe because the OLD cluster
+	 *                       was never written during the upgrade and is intact.
 	 *   no START         -> not an upgrade; normal startup.
 	 *
 	 * Deriving CN here (rather than requiring a prior "pg_resetwal
@@ -481,26 +688,45 @@ PerformWalUpgradeIfNeeded(void)
 								  &cn, &cn_lsn, &complete_lsn, &wal_sysid))
 		return false;			/* no readable upgrade WAL — normal startup */
 
+	/*
+	 * found_complete / complete_lsn are populated by the scan but intentionally
+	 * NOT consulted here (see the atomicity note below): detection is by START,
+	 * completeness is enforced later by the quarantine + commit path.  Reference
+	 * them so the compiler does not flag them unused on this path.
+	 */
+	(void) found_complete;
+	(void) complete_lsn;
+
 	if (!found_start)
 		return false;			/* not an upgrade */
 
-	if (!found_complete)
-		ereport(FATAL,
-				(errmsg("pg_upgrade failed mid-upgrade: new cluster is unusable"),
-				 errhint("Re-run pg_upgrade from the old cluster to start fresh.")));
+	/*
+	 * An upgrade is detected by the START marker alone -- we do NOT require
+	 * COMPLETE to be present up front.  COMPLETE is intentionally not
+	 * pre-checked: when the window is delivered by STREAMING (into a standby
+	 * skeleton) it arrives incrementally and COMPLETE has not necessarily
+	 * streamed in yet at this point.  Atomicity is instead provided by the
+	 * quarantine + commit/rollback model: we arm and replay whatever is present,
+	 * NEVER auto-go-live (the end-of-recovery hold in StartupXLOG), and only a
+	 * "pg_upgrade --commit" -- which verifies COMPLETE actually replayed --
+	 * finalizes.  A window that never reaches COMPLETE (e.g. the primary died
+	 * mid-stream) simply stays quarantined and is discarded by "--rollback".
+	 * This is exactly why the feature is revertable: rollback-ability replaces
+	 * the old "refuse to start without COMPLETE" pre-scan.
+	 */
 
 	/*
-	 * Already applied?  Ask the control file, not the WAL: if its current
-	 * checkpoint already sits at or past COMPLETE's LSN, a prior startup
-	 * replayed the window and finalized (writing an end-of-recovery checkpoint
-	 * past COMPLETE, possibly on a later timeline after a standby's timeline
-	 * switch).  Re-arming at CN would re-replay the upgrade over live
-	 * post-upgrade data, so treat it as an ordinary startup.  This is
-	 * authoritative and timeline-independent -- unlike scanning for a
-	 * post-COMPLETE checkpoint, which cannot see a checkpoint on a timeline the
-	 * TLI-1 scan does not follow.
+	 * Already applied?  Decide from the control-file checkpoint vs CN, NOT vs
+	 * COMPLETE (complete_lsn may be Invalid when the window is still streaming
+	 * in).  A pending/held cluster's control checkpoint sits AT or before CN (it
+	 * was armed at CN, or never armed); a finalized/committed cluster wrote its
+	 * end-of-recovery checkpoint PAST CN.  So "checkpoint strictly past CN" means
+	 * the upgrade already finalized -- re-arming at CN would re-replay over live
+	 * data, so treat it as an ordinary startup.  (The DB_UPGRADE_QUARANTINED
+	 * re-hold case is handled earlier, before the scan.)  This is
+	 * COMPLETE-independent and timeline-independent.
 	 */
-	if (GetControlFileCheckPointLSN() >= complete_lsn)
+	if (!XLogRecPtrIsInvalid(cn_lsn) && GetControlFileCheckPointLSN() > cn_lsn)
 		return false;
 
 	/*
@@ -527,7 +753,7 @@ PerformWalUpgradeIfNeeded(void)
 	 * the offline pg_resetwal --system-identifier stamping (the skeleton no longer
 	 * needs its sysid set to match the delivered burst -- it is done in-process).
 	 */
-	ArmControlFileForUpgradeRecovery(&cn, cn_lsn, wal_sysid);
+	ArmControlFileForUpgradeRecovery(&cn, cn_lsn, wal_sysid, false);
 
 	/*
 	 * Arm the sanctioned bootstrap: the pg_upgrade redo handlers may now apply
@@ -640,8 +866,39 @@ pg_upgrade_redo(XLogReaderState *record)
 		 * -- do we set DB_UPGRADE_QUARANTINED and hold, so a later "pg_upgrade
 		 * --commit" is just a lightweight switch to live (no window re-replay)
 		 * and "--rollback" simply discards the reconstructed new cluster.
+		 *
+		 * A STREAMING standby (fresh skeleton streaming the window from the
+		 * already-committed primary) does NOT hold or quarantine: once the window
+		 * is replayed it simply continues as an ordinary hot standby following the
+		 * primary.  So there is nothing special to do here beyond clearing the
+		 * guard -- the local-window path still holds at StartupXLOG's seam.
 		 */
 		pgUpgradeReplayInProgress = false;
+
+		/*
+		 * Drop the durable COMPLETE marker.  Because the quarantine hold fires
+		 * for a partial (crash-truncated) window too, this file -- written only
+		 * when redo actually reaches COMPLETE -- is what lets "--commit" tell a
+		 * fully-upgraded held cluster from a partial one.  fsync it: a --commit
+		 * may run right after this without a clean shutdown in between.
+		 */
+		{
+			int			mfd;
+
+			mfd = OpenTransientFile(UPGRADE_COMPLETE_MARKER,
+									O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+			if (mfd < 0)
+				ereport(PANIC,
+						(errcode_for_file_access(),
+						 errmsg("pg_upgrade_redo: could not create \"%s\": %m",
+								UPGRADE_COMPLETE_MARKER)));
+			if (pg_fsync(mfd) != 0)
+				ereport(PANIC,
+						(errcode_for_file_access(),
+						 errmsg("pg_upgrade_redo: could not fsync \"%s\": %m",
+								UPGRADE_COMPLETE_MARKER)));
+			CloseTransientFile(mfd);
+		}
 	}
 	else if (info == XLOG_PG_UPGRADE_HANDOFF)
 	{
@@ -686,6 +943,41 @@ pg_upgrade_redo(XLogReaderState *record)
 							 "from the delivered upgrade WAL; it will replay the upgrade from "
 							 "the end-of-upgrade checkpoint.")));
 		}
+	}
+	else if (info == XLOG_PG_UPGRADE_DELETE_AUTHORIZE)
+	{
+		/*
+		 * LEE: set-wide "the old cluster may now be deleted" signal, emitted by
+		 * "pg_upgrade --delete-old" on the live NEW primary and replayed here by a
+		 * NEW streaming standby.  We do NOT rm anything from redo (an irreversible
+		 * rm in WAL replay would re-run on crash recovery, and we do not know this
+		 * standby's old-dir path).  Instead drop a durable marker file; a local
+		 * "pg_upgrade --delete-old" on this standby checks for it and is thereby
+		 * authorized to remove the (already superseded) old cluster.  fsync so the
+		 * authorization survives a crash.
+		 *
+		 * On the primary itself the record is a harmless no-op on replay: the
+		 * primary already deleted its old dir before emitting this.
+		 */
+		int			afd;
+
+		afd = OpenTransientFile(UPGRADE_DELETE_AUTHORIZED_MARKER,
+								O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+		if (afd < 0)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("pg_upgrade_redo: could not create \"%s\": %m",
+							UPGRADE_DELETE_AUTHORIZED_MARKER)));
+		if (pg_fsync(afd) != 0)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("pg_upgrade_redo: could not fsync \"%s\": %m",
+							UPGRADE_DELETE_AUTHORIZED_MARKER)));
+		CloseTransientFile(afd);
+
+		ereport(LOG,
+				(errmsg("pg_upgrade: delete-authorize signal replayed; old cluster "
+						"may now be removed with \"pg_upgrade --delete-old\" on this node")));
 	}
 	else if (info == XLOG_UPGRADE_DIRSKEL)
 	{

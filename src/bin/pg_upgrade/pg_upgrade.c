@@ -113,9 +113,10 @@ main(int argc, char **argv)
 	parseCommandLine(argc, argv);
 
 	/*
-	 * LEE: revertable-upgrade lifecycle subcommands (--status / --commit /
-	 * --rollback / --delete-old) act on an existing cluster and exit; they do
-	 * not run an upgrade.  new_cluster.bindir is used to locate pg_ctl.
+	 * LEE: revertable-upgrade lifecycle subcommands (--commit / --rollback /
+	 * --delete-old / --signal-handoff / --prepare-standby) act on an existing
+	 * cluster and exit; they do not run an upgrade.  new_cluster.bindir locates
+	 * pg_ctl.
 	 */
 	if (user_opts.revertable_op != REVERTABLE_OP_NONE)
 	{
@@ -253,9 +254,22 @@ main(int argc, char **argv)
 	 * which for --link will make it unsafe to start the old cluster once the
 	 * new cluster is started, and for --swap will make it unsafe to start the
 	 * old cluster at all.
+	 *
+	 * LEE: but NOT for --wal-log-upgrade.  Revertability requires the old cluster
+	 * to stay intact and startable until "pg_upgrade --commit" (which stamps it
+	 * superseded then).  Disabling it here would make --link non-revertable even
+	 * though --link's transfer only READS the old files -- and the reason upstream
+	 * disables it (the new cluster sharing inodes with the old via --link) does
+	 * not apply here: revert_wal_logged_disk_writes() unlinks the transferred
+	 * new_dir files and first startup reconstructs them as FRESH inodes from WAL,
+	 * so the reconstructed new cluster shares nothing with the old.  We therefore
+	 * DEFER the disable to --commit.  (--swap is a separate matter: it moves the
+	 * old data out, so it is rejected for --wal-log-upgrade in check_new_cluster's
+	 * option validation; it never reaches here.)
 	 */
-	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
-		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
+	if (!user_opts.wal_log_upgrade &&
+		(user_opts.transfer_mode == TRANSFER_MODE_LINK ||
+		 user_opts.transfer_mode == TRANSFER_MODE_SWAP))
 		disable_old_cluster(user_opts.transfer_mode);
 
 	transfer_all_new_tablespaces(&old_cluster.dbarr, &new_cluster.dbarr,
@@ -301,6 +315,28 @@ main(int argc, char **argv)
 		 * runs a forced checkpoint and fsyncs the SLRU segment files so the
 		 * committed transaction statuses are durable before we read them.
 		 */
+		/*
+		 * LEE: retention slot.  Create a physical replication slot reserving WAL
+		 * NOW, BEFORE the CN checkpoint below, with immediately_reserve = true so
+		 * its restart_lsn sits AT or BEFORE CN.  That is essential: a streaming
+		 * standby anchors recovery at CN (the checkpoint preceding START), so CN
+		 * and the whole window must be pinned; a restart_lsn past CN could let CN
+		 * itself be recycled.  The slot pins the window in pg_wal/ so it is NOT
+		 * recycled -- neither by the end-of-recovery checkpoint the first
+		 * hold-start writes (measured: the window is otherwise reclaimed the
+		 * instant the cluster holds in quarantine), nor by the go-live checkpoint
+		 * at --commit.  A streaming standby later connects with primary_slot_name =
+		 * this slot and pulls the window from the LIVE (committed) primary.
+		 * --commit keeps the slot; --rollback and the eventual "standby caught up"
+		 * step drop it.  The slot's on-disk state lives in pg_replslot/, which the
+		 * revert step preserves (it wipes only base/ and global/, keeping
+		 * pg_control), so it survives the wipe-and-reconstruct cycle into the
+		 * persisted new cluster.
+		 */
+		PQclear(executeQueryOrDie(conn,
+								 "SELECT pg_create_physical_replication_slot('%s', true, false)",
+								 UPGRADE_WINDOW_SLOT));
+
 		PQclear(executeQueryOrDie(conn, "CHECKPOINT"));
 		PQclear(executeQueryOrDie(conn, "SELECT pg_flush_upgrade_slru()"));
 

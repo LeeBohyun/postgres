@@ -4657,18 +4657,45 @@ UpdateControlFile(void)
  */
 void
 ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn,
-								 uint64 wal_sysid)
+								 uint64 wal_sysid, bool for_streaming)
 {
 	Assert(ControlFile != NULL);
 
 	ControlFile->checkPoint = cn_lsn;
 	ControlFile->checkPointCopy = *cn;
-	ControlFile->state = DB_IN_PRODUCTION;
-	/* minRecoveryPoint=0 lets recovery stop at the end of available WAL */
-	ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
-	ControlFile->minRecoveryPointTLI = 0;
-	/* keep wal_level=replica so crash/archive recovery can apply the records */
 	ControlFile->wal_level = WAL_LEVEL_REPLICA;
+	ControlFile->minRecoveryPointTLI = cn->ThisTimeLineID;
+
+	if (for_streaming)
+	{
+		/*
+		 * LEE: STREAMING standby arm.  The CN checkpoint record is NOT on local
+		 * disk -- it must stream in from the primary.  InitWalRecovery() decides
+		 * whether to enter standby mode (and thus start the walreceiver) BEFORE it
+		 * reads the checkpoint record: it does so only if minRecoveryPoint is
+		 * valid, or backupEndPoint/backupEndRequired is set, or state ==
+		 * DB_SHUTDOWNED (xlogrecovery.c "enter archive recovery directly" branch).
+		 * With state = DB_IN_PRODUCTION and minRecoveryPoint = 0 (the local-window
+		 * arm below), it would instead try to crash-recover and FATAL with "could
+		 * not locate a valid checkpoint record" because CN is not local yet.  So
+		 * for streaming we set state = DB_SHUTDOWNED and minRecoveryPoint = CN:
+		 * recovery enters standby mode, starts streaming from CN, and pulls the
+		 * window over the wire.
+		 */
+		ControlFile->state = DB_SHUTDOWNED;
+		ControlFile->minRecoveryPoint = cn_lsn;
+	}
+	else
+	{
+		/*
+		 * LOCAL-window arm: the whole window is already in pg_wal/, so recover it
+		 * as ordinary (crash) recovery.  minRecoveryPoint = 0 lets recovery stop
+		 * at the end of available WAL.
+		 */
+		ControlFile->state = DB_IN_PRODUCTION;
+		ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
+		ControlFile->minRecoveryPointTLI = 0;
+	}
 
 	/*
 	 * LEE: adopt the system identifier the upgrade WAL was emitted under, so
@@ -8920,6 +8947,39 @@ XLogWritePgUpgradeHandoff(uint32 old_major_version, uint32 target_major_version)
 }
 
 /*
+ * LEE: XLogWritePgUpgradeDeleteAuthorize — emit the set-wide "old cluster may now
+ * be deleted" signal.
+ *
+ * Called on the LIVE, committed NEW primary (via pg_write_pg_upgrade_delete_
+ * authorize()) from "pg_upgrade --delete-old".  It streams to NEW-version standbys
+ * like any other NEW-format record; on replay each standby marks its own
+ * superseded old cluster delete-authorized (see the redo handler).  Flushed so it
+ * reaches the standbys promptly.
+ */
+XLogRecPtr
+XLogWritePgUpgradeDeleteAuthorize(uint32 new_major_version)
+{
+	xl_pg_upgrade_delete_authorize xlrec;
+	XLogRecPtr	RecPtr;
+
+	xlrec.new_major_version = new_major_version;
+	xlrec.authorize_time = (pg_time_t) time(NULL);
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfXLPgUpgradeDeleteAuthorize);
+	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_PG_UPGRADE_DELETE_AUTHORIZE);
+
+	XLogFlush(RecPtr);
+
+	ereport(LOG,
+			(errmsg("pg_upgrade delete-authorize signal recorded at %X/%X "
+					"(new major version %u)",
+					LSN_FORMAT_ARGS(RecPtr), new_major_version)));
+
+	return RecPtr;
+}
+
+/*
  * LEE: recursively collect PGDATA-relative subdirectory paths under "abspath"
  * (whose PGDATA-relative prefix is "relpath"), appending each as a
  * NUL-terminated string to "buf" and counting them in *ndirs.  Parent
@@ -8952,6 +9012,19 @@ collect_upgrade_dirs(const char *abspath, const char *relpath,
 
 		/* top-level pg_wal is not part of the after-image (see comment) */
 		if (relpath[0] == '\0' && strcmp(de->d_name, "pg_wal") == 0)
+			continue;
+
+		/*
+		 * LEE: top-level pg_replslot is NOT part of the after-image either.  It
+		 * holds the upgrade-window retention slot (UPGRADE_WINDOW_SLOT), whose
+		 * per-slot "state" file is NOT WAL-logged.  Capturing the slot's directory
+		 * without its state file would leave a WAL-reconstructed cluster (a
+		 * streaming standby especially) with an empty pg_replslot/<slot>/ that
+		 * PANICs at startup ("could not open pg_replslot/.../state").  The slot is
+		 * a PRIMARY-only artifact; a reconstructed cluster must start with an empty
+		 * pg_replslot/ (as fresh initdb leaves it), so skip the whole subtree.
+		 */
+		if (relpath[0] == '\0' && strcmp(de->d_name, "pg_replslot") == 0)
 			continue;
 
 		snprintf(childabs, sizeof(childabs), "%s/%s", abspath, de->d_name);

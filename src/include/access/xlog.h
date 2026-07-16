@@ -283,7 +283,8 @@ extern XLogRecPtr XLogWriteUpgradeSlruData(uint8 slru_type);
 struct CheckPoint;
 extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
 											  XLogRecPtr cn_lsn,
-											  uint64 wal_sysid);
+											  uint64 wal_sysid,
+											  bool for_streaming);
 /* LEE: control-file checkpoint LSN, for the "upgrade already applied?" test */
 extern XLogRecPtr GetControlFileCheckPointLSN(void);
 /* LEE: mark pg_control DB_UPGRADE_QUARANTINED (revertable upgrade hold) */

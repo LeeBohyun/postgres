@@ -70,8 +70,11 @@ parseCommandLine(int argc, char *argv[])
 		{"commit", no_argument, NULL, 10},
 		{"rollback", no_argument, NULL, 11},
 		{"delete-old", no_argument, NULL, 12},
-		{"status", no_argument, NULL, 13},
 		{"signal-handoff", no_argument, NULL, 14},
+		/* LEE: prepare a fresh skeleton to STREAM the upgrade window from the live
+		 * primary (stamps its control file; no cp).  Needs -D; reads the standard
+		 * primary_conninfo GUC from the skeleton's config (no dedicated flag). */
+		{"prepare-standby", no_argument, NULL, 15},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -262,11 +265,11 @@ parseCommandLine(int argc, char *argv[])
 			case 12:
 				user_opts.revertable_op = REVERTABLE_OP_DELETE_OLD;
 				break;
-			case 13:
-				user_opts.revertable_op = REVERTABLE_OP_STATUS;
-				break;
 			case 14:
 				user_opts.revertable_op = REVERTABLE_OP_SIGNAL_HANDOFF;
+				break;
+			case 15:
+				user_opts.revertable_op = REVERTABLE_OP_PREPARE_STANDBY;
 				break;
 
 			default:
@@ -278,6 +281,22 @@ parseCommandLine(int argc, char *argv[])
 
 	if (optind < argc)
 		pg_fatal("too many command-line arguments (first is \"%s\")", argv[optind]);
+
+	/*
+	 * LEE: --swap is incompatible with --wal-log-upgrade.  Revertability requires
+	 * the old cluster to stay intact until --commit, but --swap MOVES the old
+	 * cluster's data directories into the new cluster (prepare_for_swap), and the
+	 * subsequent revert-wipe then deletes them from the new cluster -- so there is
+	 * nothing to roll back to.  Unlike --link (which only reads the old files and
+	 * is revertable once its old-cluster disable is deferred to --commit), --swap
+	 * is destructive by construction.  Refuse it up front rather than silently
+	 * producing a non-revertable upgrade.
+	 */
+	if (user_opts.wal_log_upgrade &&
+		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
+		pg_fatal("--swap cannot be used with --wal-log-upgrade\n"
+				 "--swap moves the old cluster's data into the new cluster, which "
+				 "makes the upgrade non-revertable; use --copy, --clone, or --link.");
 
 	if (!user_opts.sync_method)
 		user_opts.sync_method = pg_strdup("fsync");
@@ -302,8 +321,8 @@ parseCommandLine(int argc, char *argv[])
 	/*
 	 * LEE: revertable-upgrade lifecycle subcommands act on a single existing
 	 * cluster and do not run an upgrade, so they need only their own directory
-	 * (-D for commit/rollback/status, -d for delete-old), not the full
-	 * old/new bindir+datadir set the normal flow requires.
+	 * (-D for commit/rollback, -d for delete-old), not the full old/new
+	 * bindir+datadir set the normal flow requires.
 	 */
 	if (user_opts.revertable_op == REVERTABLE_OP_DELETE_OLD)
 	{
@@ -322,9 +341,21 @@ parseCommandLine(int argc, char *argv[])
 			pg_fatal("--signal-handoff requires the old cluster data directory (-d/--old-datadir)");
 		return;
 	}
+	else if (user_opts.revertable_op == REVERTABLE_OP_PREPARE_STANDBY)
+	{
+		/*
+		 * --prepare-standby stamps a fresh skeleton (-D) so it can STREAM the
+		 * upgrade window from the live primary.  The primary is named by the
+		 * standard primary_conninfo GUC in the skeleton's config (as for any
+		 * standby) -- no dedicated flag.  It needs only -D; no old cluster/bindir.
+		 */
+		if (new_cluster.pgdata == NULL)
+			pg_fatal("--prepare-standby requires the new (skeleton) data directory (-D/--new-datadir)");
+		return;
+	}
 	else if (user_opts.revertable_op != REVERTABLE_OP_NONE)
 	{
-		/* --commit / --rollback / --status: need -D (new); -d optional */
+		/* --commit / --rollback: need -D (new); -d optional */
 		if (new_cluster.pgdata == NULL)
 			pg_fatal("this operation requires the new cluster data directory (-D/--new-datadir)");
 		return;

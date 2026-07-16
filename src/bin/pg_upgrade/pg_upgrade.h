@@ -255,7 +255,6 @@ typedef enum
 typedef enum
 {
 	REVERTABLE_OP_NONE = 0,		/* normal pg_upgrade run */
-	REVERTABLE_OP_STATUS,		/* report new_dir lifecycle state */
 	REVERTABLE_OP_COMMIT,		/* finalize a quarantined new_dir, stamp old */
 	REVERTABLE_OP_ROLLBACK,		/* discard a quarantined new_dir */
 	REVERTABLE_OP_DELETE_OLD,	/* delete a superseded old_dir */
@@ -263,7 +262,19 @@ typedef enum
 								 * primary's WAL; it propagates to streaming
 								 * standbys (via safekeepers in Neon) which then
 								 * stand down before the upgrade */
+	REVERTABLE_OP_PREPARE_STANDBY,	/* stamp a fresh skeleton (-D) from the LIVE
+								 * primary (--primary-conninfo) so it can STREAM the
+								 * upgrade window (no cp): writes the streaming
+								 * anchor + standby.signal + primary_conninfo/slot */
 } RevertableOp;
+
+/*
+ * LEE: name of the internal physical replication slot pg_upgrade creates during
+ * --wal-log-upgrade capture to RETAIN the upgrade window in pg_wal/ (pinned at
+ * CN) so a streaming standby can pull it from the committed/live primary.  Kept
+ * across --commit; dropped on --rollback and once the standby has caught up.
+ */
+#define UPGRADE_WINDOW_SLOT		"pg_upgrade_window"
 
 /*
  * Enumeration to denote pg_log modes

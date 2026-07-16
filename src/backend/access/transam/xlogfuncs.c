@@ -398,6 +398,35 @@ pg_write_pg_upgrade_handoff(PG_FUNCTION_ARGS)
 }
 
 /*
+ * LEE: pg_write_pg_upgrade_delete_authorize() → pg_lsn
+ *
+ * Emit the set-wide "old cluster may now be deleted" signal into THIS (new,
+ * committed) cluster's WAL.  Called by "pg_upgrade --delete-old" on the LIVE NEW
+ * PRIMARY; it streams to NEW standbys, which on replay mark their own superseded
+ * old cluster delete-authorized.  Superuser-only; invalid during recovery (it is
+ * emitted by the live primary).
+ */
+Datum
+pg_write_pg_upgrade_delete_authorize(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	lsn;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to write pg_upgrade WAL markers")));
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("WAL control functions cannot be executed during recovery.")));
+
+	lsn = XLogWritePgUpgradeDeleteAuthorize(PG_VERSION_NUM / 10000);
+	PG_RETURN_LSN(lsn);
+}
+
+/*
  * LEE: pg_write_upgrade_slru_data(slru_type integer) → pg_lsn
  *
  * Emit XLOG_UPGRADE_SLRU_DATA records for all segment files in the given SLRU
