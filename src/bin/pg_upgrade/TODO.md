@@ -52,9 +52,13 @@ code change warranted:
 
 ## 2. From REPLICA_UPGRADE_DESIGN.md (already tracked there)
 
-- Q6: remove/gate `revert_wal_logged_disk_writes` (a test-only device) before
-  the final patch, once the equivalence tests no longer depend on the
-  wiped-then-replayed cluster.
+- Q6: KEEP `revert_wal_logged_disk_writes` (decided) -- do NOT remove it.  It is
+  the device that PROVES reconstruction is truly WAL-only (wipe the on-disk data,
+  then require replay to rebuild it): the disk-wiped assertions in
+  run_upgrade/large/stress/mxact/tablespace/manyrel/datashape all depend on it,
+  and it is the honest guarantee behind the whole feature.  Production keeps the
+  reconstructed files (Phase-0 wipe-policy decision); the wipe stays as the
+  test-only path.  Leave it in.
 - Q7(b): external-location tablespace symlink REPLAY branch is coded but not
   exercised end to end on a same-build test (pg_upgrade refuses same-catalog +
   tablespaces); needs a real cross-version run.
