@@ -328,6 +328,17 @@ typedef enum DBState
 	 * to keep the on-disk values of the states above unchanged.
 	 */
 	DB_UPGRADE_QUARANTINED,
+
+	/*
+	 * INFORMATIONAL: a --wal-log-upgrade cluster that is CURRENTLY replaying its
+	 * upgrade window (between XLOG_PG_UPGRADE_START and _COMPLETE).  The arm still
+	 * uses DB_IN_PRODUCTION to trigger crash recovery; the redo path flips to this
+	 * state while the window is being applied and back to DB_IN_PRODUCTION when it
+	 * finishes, purely so pg_controldata / diagnostics show "in pg_upgrade" rather
+	 * than the misleading "in production" for a half-reconstructed cluster.  It is
+	 * NOT a recovery-mode trigger.  Appended last to keep on-disk values stable.
+	 */
+	DB_IN_UPGRADE,
 } DBState;
 
 /*

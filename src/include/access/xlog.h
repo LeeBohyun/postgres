@@ -289,6 +289,10 @@ extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
 extern XLogRecPtr GetControlFileCheckPointLSN(void);
 /* LEE: mark pg_control DB_UPGRADE_QUARANTINED (revertable upgrade hold) */
 extern void SetControlFileUpgradeQuarantined(void);
+/* LEE: informational DB_IN_UPGRADE flips during window replay (set at START,
+ * cleared back to DB_IN_PRODUCTION at COMPLETE) -- diagnostics only */
+extern void SetControlFileInUpgrade(void);
+extern void ClearControlFileInUpgrade(void);
 /* LEE: release the quarantine hold (commit path) */
 extern void ReleaseControlFileUpgradeQuarantine(void);
 /* LEE: true if pg_control state is DB_UPGRADE_QUARANTINED (re-hold test) */

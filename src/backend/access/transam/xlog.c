@@ -4734,6 +4734,39 @@ SetControlFileUpgradeQuarantined(void)
 }
 
 /*
+ * LEE: INFORMATIONAL state flips for the "currently replaying the upgrade window"
+ * period.  The arm sets DB_IN_PRODUCTION (a crash-recovery trigger); the redo
+ * path calls SetControlFileInUpgrade() at XLOG_PG_UPGRADE_START and
+ * ClearControlFileInUpgrade() at XLOG_PG_UPGRADE_COMPLETE, purely so a crash
+ * mid-window or pg_controldata shows "in pg_upgrade" instead of "in production".
+ * These do NOT affect the recovery-mode decision (that already happened from the
+ * armed DB_IN_PRODUCTION); Clear restores DB_IN_PRODUCTION so the end-of-recovery
+ * seam behaves exactly as before (quarantine hold or go-live).
+ */
+void
+SetControlFileInUpgrade(void)
+{
+	Assert(ControlFile != NULL);
+
+	ControlFile->state = DB_IN_UPGRADE;
+	ControlFile->time = (pg_time_t) time(NULL);
+	UpdateControlFile();
+}
+
+void
+ClearControlFileInUpgrade(void)
+{
+	Assert(ControlFile != NULL);
+
+	if (ControlFile->state == DB_IN_UPGRADE)
+	{
+		ControlFile->state = DB_IN_PRODUCTION;
+		ControlFile->time = (pg_time_t) time(NULL);
+		UpdateControlFile();
+	}
+}
+
+/*
  * LEE: Release the pg_upgrade quarantine hold (called by "pg_upgrade --commit"
  * path in PerformWalUpgradeIfNeeded()).  The reconstructed cluster's checkpoint
  * is already past COMPLETE, so moving the state to DB_SHUTDOWNED lets ordinary
@@ -6086,6 +6119,20 @@ StartupXLOG(void)
 							str_time(ControlFile->time,
 									 timebuf, sizeof(timebuf))),
 					 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
+			break;
+
+		case DB_IN_UPGRADE:
+			/*
+			 * LEE: crashed while replaying the upgrade window (informational
+			 * state).  PerformWalUpgradeIfNeeded() already re-armed at CN before we
+			 * got here (resetting the state to DB_IN_PRODUCTION), so this case is
+			 * reached only if that arming was skipped; report it honestly and let
+			 * recovery proceed rather than FATAL as an "invalid" state.
+			 */
+			ereport(LOG,
+					(errmsg("database system was interrupted while replaying a pg_upgrade window (last known up at %s)",
+							str_time(ControlFile->time,
+									 timebuf, sizeof(timebuf)))));
 			break;
 
 		default:

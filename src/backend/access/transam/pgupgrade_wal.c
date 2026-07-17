@@ -829,6 +829,18 @@ pg_upgrade_redo(XLogReaderState *record)
 		pgUpgradeReplayInProgress = true;
 
 		/*
+		 * INFORMATIONAL only: record DB_IN_UPGRADE in the control file so a crash
+		 * mid-window (or an operator peeking with pg_controldata) shows "in
+		 * pg_upgrade" instead of the misleading "in production" that the arm set as
+		 * its crash-recovery trigger.  This does NOT drive recovery -- COMPLETE
+		 * restores DB_IN_PRODUCTION, and the end-of-recovery seam then decides
+		 * quarantine vs. go-live as before.  Guarded by in_upgrade_bootstrap so it
+		 * only marks a sanctioned reconstruction, never an ordinary replay.
+		 */
+		if (in_upgrade_bootstrap)
+			SetControlFileInUpgrade();
+
+		/*
 		 * Write $PGDATA/PG_VERSION from the embedded string.  The top-level
 		 * PG_VERSION is created by initdb outside the server and is not
 		 * otherwise WAL-logged.  Per-database PG_VERSION files are covered by
@@ -874,6 +886,16 @@ pg_upgrade_redo(XLogReaderState *record)
 		 * guard -- the local-window path still holds at StartupXLOG's seam.
 		 */
 		pgUpgradeReplayInProgress = false;
+
+		/*
+		 * Restore the DB_IN_PRODUCTION crash-recovery trigger we borrowed at START
+		 * (informational DB_IN_UPGRADE).  The window is fully applied; the
+		 * end-of-recovery seam will set the terminal state (DB_UPGRADE_QUARANTINED
+		 * for a held local primary, or DB_IN_PRODUCTION on go-live).  Only meaningful
+		 * for the sanctioned bootstrap that set it.
+		 */
+		if (in_upgrade_bootstrap)
+			ClearControlFileInUpgrade();
 
 		/*
 		 * Drop the durable COMPLETE marker.  Because the quarantine hold fires
