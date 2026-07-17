@@ -13,6 +13,18 @@
 #   * the data matches after the WAL-replay reconstruction, and
 #   * the committed cluster is writable.
 #
+# Why every pair targets 20devel (not e.g. 16->18): this feature is developed for
+# upstream, i.e. against master (currently 20devel), and that is where it will
+# ship.  --wal-log-upgrade therefore lives ONLY in the patched NEW (master)
+# binary.  In real use an operator upgrades from a supported old release
+# (14..18) straight to the new major -- pg_upgrade skips intermediate majors, so
+# 14->20 is a single jump (proven below), never 14->15->...  The feature is only
+# ever present in the version you upgrade TO, so "{every supported old major} ->
+# master" IS the real supported matrix.  A pair like 16->18 would need stock v18
+# to carry the patch (it does not) or a backport to REL_18 built as NEWBIN --
+# neither applies to an upstream-master feature, so it is intentionally out of
+# scope, not a coverage gap.
+#
 # Drive it from a set of OLDBIN dirs (one per major) + the single NEWBIN.  Pairs
 # whose OLDBIN is unavailable are SKIPPED and logged -- never silently dropped.
 #
