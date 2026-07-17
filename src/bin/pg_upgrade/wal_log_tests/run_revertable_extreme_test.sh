@@ -57,17 +57,20 @@ grep -qi "not held in pg_upgrade quarantine\|not a --wal-log-upgrade" "$W/e1.log
 [ -f "$W/rand/global/pg_control" ] || fail "E1: commit disturbed the random cluster"
 log "PASS E1"
 
-# =========================================================== E2: commit pending
-log "E2: commit refuses a pending (not-yet-applied) cluster"
+# =========================================================== E2: upgrade -> held
+log "E2: upgrade leaves the new cluster HELD immediately (no hold-start needed)"
 make_old "$W/old2" 3000
 OLD2_FP=$(fp "$W/old2")
 do_upgrade "$W/old2" "$W/new2"
-# NO hold-start yet -> still pending; commit must refuse.
-if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old2" -D "$W/new2" --wal-log-commit >"$W/e2.log" 2>&1; then
-    fail "commit succeeded on a pending cluster (must hold-start first)"
+# Primary model: pg_upgrade stamps DB_UPGRADE_QUARANTINED at the shutdown
+# checkpoint, so the new cluster is held the instant the upgrade finishes -- no
+# separate reconstruct/hold-start.  Starting it must REFUSE, not serve.
+echo "$(db_state "$W/new2")" | grep -qi quarantine || fail "E2: new2 not quarantined right after upgrade (got '$(db_state "$W/new2")')"
+hold_start "$W/new2"
+if "$BIN/psql" -h "$W" -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
+    "$BIN/pg_ctl" -D "$W/new2" -w stop >/dev/null 2>&1; fail "E2: held cluster served (must refuse)"
 fi
-grep -qi "not held in pg_upgrade quarantine" "$W/e2.log" || { cat "$W/e2.log"; fail "E2 wrong error"; }
-[ -f "$W/old2/global/pg_control" ] || fail "E2: pending-commit stamped old cluster (must not)"
+[ -f "$W/old2/global/pg_control" ] || fail "E2: upgrade stamped/disabled the old cluster (must not until commit)"
 log "PASS E2"
 
 # =========================================================== E4: idempotent hold

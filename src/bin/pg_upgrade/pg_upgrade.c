@@ -75,7 +75,6 @@ static void resolve_new_bindir(const char *argv0);
 static void create_new_cluster_via_initdb(const char *argv0);
 static void create_logical_replication_slots(void);
 static void create_conflict_detection_slot(void);
-static void revert_wal_logged_disk_writes(void);
 
 ClusterInfo old_cluster,
 			new_cluster;
@@ -255,17 +254,15 @@ main(int argc, char **argv)
 	 * new cluster is started, and for --swap will make it unsafe to start the
 	 * old cluster at all.
 	 *
-	 * LEE: but NOT for --wal-log-upgrade.  Revertability requires the old cluster
-	 * to stay intact and startable until "pg_upgrade --commit" (which stamps it
-	 * superseded then).  Disabling it here would make --link non-revertable even
-	 * though --link's transfer only READS the old files -- and the reason upstream
-	 * disables it (the new cluster sharing inodes with the old via --link) does
-	 * not apply here: revert_wal_logged_disk_writes() unlinks the transferred
-	 * new_dir files and first startup reconstructs them as FRESH inodes from WAL,
-	 * so the reconstructed new cluster shares nothing with the old.  We therefore
-	 * DEFER the disable to --commit.  (--swap is a separate matter: it moves the
-	 * old data out, so it is rejected for --wal-log-upgrade in check_new_cluster's
-	 * option validation; it never reaches here.)
+	 * LEE: but NOT for --wal-log-upgrade.  Revertability here means "the old
+	 * cluster stays intact and startable until the operator commits"; disabling it
+	 * during the upgrade would defeat that.  We DEFER the disable to the switch
+	 * (--wal-log-commit stamps old_dir superseded once the operator adopts new_dir).
+	 * (--swap is rejected for --wal-log-upgrade in option validation; it never
+	 * reaches here.  --link: note that new_dir hard-links old_dir's files, so the
+	 * usual upstream caveat -- do not run BOTH clusters -- still applies; commit
+	 * disables old_dir before new_dir is meant to be used, and rollback discards
+	 * new_dir without ever having started it.)
 	 */
 	if (!user_opts.wal_log_upgrade &&
 		(user_opts.transfer_mode == TRANSFER_MODE_LINK ||
@@ -402,31 +399,60 @@ main(int argc, char **argv)
 									 old_cluster.major_version,
 									 new_cluster.major_version));
 		PQclear(executeQueryOrDie(conn, "SELECT pg_switch_wal()"));
+
+		/*
+		 * LEE: arm the quarantine hold.  This sets a flag so the CLEAN shutdown
+		 * below records DB_UPGRADE_QUARANTINED on its shutdown checkpoint (atomic
+		 * with the checkpoint, which is past COMPLETE).  Must be done on the still-
+		 * running server, immediately before the shutdown, so it is the last
+		 * durable control-file write.  new_dir then refuses to serve on start until
+		 * "pg_upgrade --wal-log-commit" releases the hold.
+		 */
+		PQclear(executeQueryOrDie(conn, "SELECT pg_arm_upgrade_quarantine()"));
 		PQfinish(conn);
 
 		/*
-		 * LEE: immediate stop — no checkpoint, no WAL recycling.  All upgrade
-		 * WAL stays intact in pg_wal/.  The rename to pg_wal_upgrade/ and the
-		 * --upgrade-recovery pg_control rewrite happen at the very end, after
-		 * all other pg_resetwal calls (which require pg_wal/ to exist).
+		 * LEE: CLEAN shutdown (-m smart) so the shutdown checkpoint lands PAST
+		 * XLOG_PG_UPGRADE_COMPLETE.  The primary is now a NORMAL, fully-upgraded
+		 * cluster whose files are on disk -- we do NOT wipe them and we do NOT
+		 * reconstruct from WAL.  Because the control-file checkpoint ends up past
+		 * COMPLETE, first startup's PerformWalUpgradeIfNeeded() "already applied"
+		 * guard (checkpoint > CN) is true, so the primary SKIPS the window replay
+		 * and simply comes up as the upgraded cluster.
+		 *
+		 * The upgrade WAL window (CN..COMPLETE) still stays intact in pg_wal/ --
+		 * pinned by the UPGRADE_WINDOW_SLOT retention slot -- so a fresh standby
+		 * skeleton can STREAM and replay it (the standby, not the primary, is what
+		 * reconstructs from the window).  The revert-and-replay path is thus a
+		 * STANDBY-only mechanism now; the primary keeps its transferred files.
 		 */
-		stop_postmaster_immediate();
+		stop_postmaster(false);
 
 		/*
-		 * LEE: skip the disk writes.  Every byte pg_upgrade transferred into
-		 * the new cluster (user relation files and the copied SLRU segments) is
-		 * now captured as full-page images in pg_wal/.  Revert those on-disk
-		 * files to an empty baseline so the persisted new cluster contains NONE
-		 * of the upgrade data on disk — only in WAL.  First startup must then
-		 * reconstruct the entire cluster purely from WAL replay, which is what
-		 * proves the upgrade is fully WAL-recoverable.
+		 * LEE: drop the durable "window reached COMPLETE" marker that
+		 * --wal-log-commit's completeness gate requires.  On a STANDBY this marker
+		 * is written by the COMPLETE redo handler during window replay; the PRIMARY
+		 * does not replay, so we write it here -- the window definitionally reached
+		 * COMPLETE (we emitted pg_write_pg_upgrade_complete() above, unless the
+		 * test-only PG_UPGRADE_TEST_SKIP_COMPLETE suppressed it, in which case we
+		 * intentionally do NOT write it so a "crash mid-window" primary is refused
+		 * by --wal-log-commit exactly like a partial standby).
 		 */
-		revert_wal_logged_disk_writes();
+		if (getenv("PG_UPGRADE_TEST_SKIP_COMPLETE") == NULL)
+		{
+			char		marker_path[MAXPGPATH];
+			FILE	   *mf;
+
+			snprintf(marker_path, sizeof(marker_path),
+					 "%s/pg_upgrade_complete.done", new_cluster.pgdata);
+			if ((mf = fopen(marker_path, "w")) == NULL)
+				pg_fatal("could not create \"%s\": %m", marker_path);
+			fclose(mf);
+		}
 
 		/*
 		 * LEE: the transferred-files manifest has served its purpose (the emit
-		 * and revert phases read it).  Remove it so it does not linger in the
-		 * live cluster.
+		 * phase read it).  Remove it so it does not linger in the live cluster.
 		 */
 		{
 			char		manifest_path[MAXPGPATH];
@@ -1447,193 +1473,6 @@ set_frozenxids(void)
 	PQclear(dbres);
 
 	PQfinish(conn_template1);
-
-	check_ok();
-}
-
-/*
- * unlink every regular file in one directory (optionally keeping one name).
- * Directories are left in place.  Returns the number of files removed.
- */
-static int
-wipe_dir_files(const char *dirpath, const char *keep)
-{
-	DIR		   *dir;
-	struct dirent *de;
-	int			n = 0;
-
-	dir = opendir(dirpath);
-	if (dir == NULL)
-		return 0;
-	while ((de = readdir(dir)) != NULL)
-	{
-		char		path[MAXPGPATH];
-		struct stat st;
-
-		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-			continue;
-		if (keep != NULL && strcmp(de->d_name, keep) == 0)
-			continue;
-
-		snprintf(path, sizeof(path), "%s/%s", dirpath, de->d_name);
-		if (lstat(path, &st) != 0)
-			continue;
-		if (!S_ISREG(st.st_mode))
-			continue;			/* leave subdirectories/symlinks alone */
-
-		if (unlink(path) == 0)
-			n++;
-		else if (errno != ENOENT)
-			pg_fatal("could not unlink \"%s\": %m", path);
-	}
-	closedir(dir);
-	return n;
-}
-
-/*
- * revert_wal_logged_disk_writes()
- *
- * LEE: for --wal-log-upgrade, "skip the disk writes".  By the time this runs
- * (server stopped via immediate stop, WAL sealed in pg_wal/) the ENTIRE
- * physical image of the new cluster has been captured as full-page / raw-file
- * images in the upgrade WAL:
- *
- *   - all relation files (user + system catalogs + global) -> RELFILE_DATA
- *   - pg_filenode.map, PG_VERSION                           -> RAWFILE
- *   - pg_xact / pg_multixact segments                       -> SLRU_DATA
- *   - XID/OID/multixact counters                            -> the CN checkpoint
- *
- * We now wipe those files from disk, leaving only the directory skeleton, the
- * top-level PG_VERSION, and global/pg_control (the entry point recovery needs
- * before it can read any WAL).  The persisted new cluster therefore looks like
- * a fresh, pre-initdb directory tree with empty folders; first startup rebuilds
- * everything purely by replaying the upgrade WAL.  This is what makes the
- * recovery verifiable end to end: if any image were missing, the data would
- * come back wrong or the cluster would fail to start.
- *
- * Files are unlinked (not truncated) so --link mode does not destroy the old
- * cluster's data via shared inodes; replay recreates each file from scratch.
- *
- * NOTE: removing the DIRECTORIES (base/<dboid>, the SLRU dirs) in addition to
- * their files is NOT required for correctness -- replay would happily reuse
- * directories left on disk.  We do it purely for TESTING: wiping the directory
- * tree forces the XLOG_UPGRADE_DIRSKEL redo path to actually recreate every
- * directory, proving it can rebuild the skeleton from WAL alone (the property a
- * standby depends on).  If those rmdir()s were dropped, the upgrade would still
- * be correct; the DIRSKEL replay would just become a no-op instead of being
- * exercised.
- */
-static void
-revert_wal_logged_disk_writes(void)
-{
-	char		path[MAXPGPATH];
-	DIR		   *basedir;
-	struct dirent *de;
-
-	prep_status("Skipping disk writes (wiping data files; only WAL remains)");
-
-	/* Shared catalogs + relmap in global/, but KEEP pg_control. */
-	snprintf(path, sizeof(path), "%s/global", new_cluster.pgdata);
-	wipe_dir_files(path, "pg_control");
-
-	/*
-	 * Every database directory under base/.  We remove the directory itself
-	 * too, not just its files -- but only to exercise the DIRSKEL redo path
-	 * (see the function header note); it is not needed for correctness, since
-	 * XLOG_UPGRADE_DIRSKEL redo recreates base/<dboid> on replay anyway.
-	 */
-	snprintf(path, sizeof(path), "%s/base", new_cluster.pgdata);
-	basedir = opendir(path);
-	if (basedir != NULL)
-	{
-		while ((de = readdir(basedir)) != NULL)
-		{
-			if (de->d_name[0] < '1' || de->d_name[0] > '9')
-				continue;
-			snprintf(path, sizeof(path), "%s/base/%s",
-					 new_cluster.pgdata, de->d_name);
-			wipe_dir_files(path, NULL);
-			if (rmdir(path) != 0 && errno != ENOENT)
-				pg_fatal("could not remove directory \"%s\": %m", path);
-		}
-		closedir(basedir);
-	}
-
-	/*
-	 * LEE: relation files in USER-DEFINED tablespaces, under
-	 * pg_tblspc/<spcoid>/<TABLESPACE_VERSION_DIRECTORY>/<dboid>/.  These are
-	 * captured as RELFILE_DATA (see pg_write_upgrade_relfile_data), so wipe them
-	 * too -- otherwise a same-node upgrade would silently read them off disk
-	 * instead of reconstructing from WAL, and the WAL-recoverability guarantee
-	 * would be unproven (and false on a fresh target/standby).  We wipe the
-	 * relfiles but LEAVE the pg_tblspc/<spcoid> symlink and version directory in
-	 * place (recreating those from scratch needs the external location, which is
-	 * the tablespace-symlink bootstrap tracked in REPLICA_UPGRADE_DESIGN.md).
-	 */
-	snprintf(path, sizeof(path), "%s/%s", new_cluster.pgdata, "pg_tblspc");
-	{
-		DIR		   *tsdir = opendir(path);
-
-		if (tsdir != NULL)
-		{
-			struct dirent *tde;
-
-			while ((tde = readdir(tsdir)) != NULL)
-			{
-				char		verpath[MAXPGPATH];
-				DIR		   *verdir;
-				struct dirent *vde;
-
-				if (tde->d_name[0] < '1' || tde->d_name[0] > '9')
-					continue;
-
-				snprintf(verpath, sizeof(verpath), "%s/pg_tblspc/%s/%s",
-						 new_cluster.pgdata, tde->d_name,
-						 TABLESPACE_VERSION_DIRECTORY);
-				verdir = opendir(verpath);
-				if (verdir == NULL)
-					continue;
-
-				while ((vde = readdir(verdir)) != NULL)
-				{
-					char		dbpath[MAXPGPATH];
-
-					if (vde->d_name[0] < '1' || vde->d_name[0] > '9')
-						continue;
-					snprintf(dbpath, sizeof(dbpath), "%s/%s",
-							 verpath, vde->d_name);
-					wipe_dir_files(dbpath, NULL);
-					if (rmdir(dbpath) != 0 && errno != ENOENT)
-						pg_fatal("could not remove directory \"%s\": %m", dbpath);
-				}
-				closedir(verdir);
-			}
-			closedir(tsdir);
-		}
-	}
-
-	/*
-	 * SLRU segments (pg_xact, pg_multixact) — captured as SLRU_DATA.  As with
-	 * base/ above, removing the directories (not just their files) is a
-	 * testing measure only (see the function header note): DIRSKEL redo
-	 * recreates them before the SLRU images replay.  Order matters: leaf dirs
-	 * before the pg_multixact parent.
-	 */
-	{
-		static const char *const slru_dirs[] = {
-			"pg_xact", "pg_multixact/offsets", "pg_multixact/members",
-			"pg_multixact"
-		};
-
-		for (int d = 0; d < (int) lengthof(slru_dirs); d++)
-		{
-			snprintf(path, sizeof(path), "%s/%s",
-					 new_cluster.pgdata, slru_dirs[d]);
-			wipe_dir_files(path, NULL);
-			if (rmdir(path) != 0 && errno != ENOENT)
-				pg_fatal("could not remove directory \"%s\": %m", path);
-		}
-	}
 
 	check_ok();
 }

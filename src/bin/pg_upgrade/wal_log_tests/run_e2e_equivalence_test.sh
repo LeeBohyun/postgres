@@ -77,14 +77,16 @@ VAN_FP=$(fingerprint "$V/new" 55541)
 log "vanilla fingerprint:"; echo "$VAN_FP"
 
 # ---------------------------------------------------------------- wal-log
-log "WAL pg_upgrade --initdb --wal-log-upgrade (leaves empty skeleton + WAL)"
+log "WAL pg_upgrade --initdb --wal-log-upgrade (primary keeps its files + emits the window)"
 L=$W/wal; mkdir -p "$L"; cp -a "$SEED" "$L/old"
 cd "$L"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$L/old" -D "$L/new" -U postgres --initdb --wal-log-upgrade --copy >"$L/up.log" 2>&1 \
   || { echo "WAL UPGRADE FAILED"; tail -15 "$L/up.log"; exit 1; }
-# confirm it really is data-empty on disk
+# In the primary model the primary is a NORMAL upgraded cluster: its files stay on
+# disk (no wipe) and it does NOT reconstruct from WAL.  The WAL-recoverability
+# property is what a fresh STANDBY skeleton exercises below -- so here we only use
+# $L/new as the source of the emitted upgrade WAL window.
 NBASE=$(find "$L/new/base" -type f 2>/dev/null | wc -l | tr -d ' ')
-log "wal new cluster on-disk base files (should be 0): $NBASE"
-[ "$NBASE" = "0" ] || { echo "FAIL: wal new cluster is not data-empty"; exit 1; }
+log "wal new cluster on-disk base files (primary keeps them): $NBASE"
 
 # ---------------------------------------------------------------- fresh target
 # A brand-new empty skeleton (as a new-version compute/standby would have),

@@ -629,6 +629,7 @@ PerformWalUpgradeIfNeeded(void)
 				(errmsg("pg_upgrade --commit: releasing quarantine and finalizing")));
 		ConsumeUpgradeCommitRequest();
 		ReleaseControlFileUpgradeQuarantine();
+		ClearUpgradeQuarantineArm();	/* so a later shutdown is not re-quarantined */
 		return false;			/* ordinary startup finalizes; no re-replay */
 	}
 

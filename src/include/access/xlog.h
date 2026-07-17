@@ -289,6 +289,11 @@ extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
 extern XLogRecPtr GetControlFileCheckPointLSN(void);
 /* LEE: mark pg_control DB_UPGRADE_QUARANTINED (revertable upgrade hold) */
 extern void SetControlFileUpgradeQuarantined(void);
+/* LEE: arm the next shutdown checkpoint to record DB_UPGRADE_QUARANTINED
+ * (pg_upgrade calls this on the running new cluster just before clean shutdown) */
+extern void ArmUpgradeQuarantineOnShutdown(void);
+/* LEE: remove the quarantine arm marker (on commit-release) */
+extern void ClearUpgradeQuarantineArm(void);
 /* LEE: informational DB_IN_UPGRADE flips during window replay (set at START,
  * cleared back to DB_IN_PRODUCTION at COMPLETE) -- diagnostics only */
 extern void SetControlFileInUpgrade(void);

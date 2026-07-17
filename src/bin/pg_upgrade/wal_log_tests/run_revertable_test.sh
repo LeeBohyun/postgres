@@ -69,22 +69,24 @@ OLD_T1=$("$BIN/pg_ctl" -D "$OLD" -l "$WORK/o.log" -w start >/dev/null 2>&1; \
          "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1)
 run_upgrade "$OLD" "$NEW" || { tail -30 "$WORK/upgrade.log"; fail "upgrade exited nonzero"; }
 
-# In the new model the upgrade leaves the window PENDING in pg_wal/ (not yet
-# reconstructed).  The FIRST start reconstructs the cluster, writes its
-# end-of-recovery checkpoint, then HOLDS in quarantine (not serving).
+# In the primary model the upgraded new cluster is a NORMAL cluster on disk,
+# already stamped DB_UPGRADE_QUARANTINED at pg_upgrade time (via the shutdown
+# checkpoint).  It does NOT reconstruct from WAL on start; it simply REFUSES to
+# serve until --wal-log-commit releases the hold.
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
+# The upgrade itself must have left it quarantined (no start needed to hold).
+STATE=$(db_state "$NEW")
+log "new cluster state after upgrade: '$STATE'"
+echo "$STATE" | grep -qi "quarantine" || fail "new cluster is not quarantined (got '$STATE')"
+# Starting it must REFUSE (held, not serving).
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new_hold.log" -w start >/dev/null 2>&1
-# It must NOT serve while held: no connection should be possible.
 if "$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
     "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
     fail "held cluster accepted a connection (should be held/dark)"
 fi
-grep -qi "holding in quarantine" "$WORK/new_hold.log" \
-    || fail "expected quarantine-hold message in startup log"
-STATE=$(db_state "$NEW")
-log "new cluster state after first start: '$STATE'"
-echo "$STATE" | grep -qi "quarantine" || fail "new cluster is not quarantined (got '$STATE')"
+grep -qi "held in pg_upgrade quarantine" "$WORK/new_hold.log" \
+    || fail "expected 'held in pg_upgrade quarantine' refusal in startup log"
 # A restart must re-hold (stay quarantined), not serve or re-replay.
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new_rehold.log" -w start >/dev/null 2>&1
 if "$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then

@@ -40,15 +40,17 @@ log "start NEW cluster (mid-upgrade, no COMPLETE): must HOLD in quarantine, neve
 # atomicity via quarantine + rollback, not via a pre-scan refusal.
 echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1
-# It must NOT be serving.
+# It must NOT be serving.  In the primary model the cluster is armed to
+# DB_UPGRADE_QUARANTINED at pg_upgrade time (via the shutdown checkpoint), so a
+# start REFUSES with "held in pg_upgrade quarantine" -- it never goes live.
 if "$BIN/psql" -h "$W" -p $P -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
     "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
     echo "FAIL: half-upgraded (no COMPLETE) cluster ACCEPTED a connection"; FAIL=1
-elif grep -qi "holding in quarantine" "$W/new.log"; then
-    echo "new cluster held in quarantine without COMPLETE (good, did not go live):"
-    grep -i "holding in quarantine" "$W/new.log" | head -1
+elif grep -qi "held in pg_upgrade quarantine" "$W/new.log"; then
+    echo "new cluster refused to serve (held in quarantine), good:"
+    grep -i "held in pg_upgrade quarantine" "$W/new.log" | head -1
 else
-    echo "FAIL: new cluster neither served nor held in quarantine:"; tail -6 "$W/new.log"; FAIL=1
+    echo "FAIL: new cluster neither served nor refused-as-held:"; tail -6 "$W/new.log"; FAIL=1
 fi
 
 log "partial cluster: held in quarantine, COMPLETE marker absent (cannot be committed)"

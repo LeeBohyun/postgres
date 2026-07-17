@@ -91,17 +91,17 @@ else
   echo "  OK: non-zero members segment $MAXSEG captured with its correct number"
 fi
 
-log "5. start new cluster: WAL replay + functional check"
+log "5. commit + functional check"
 cat >> "$W/n/postgresql.conf" <<CONF
 unix_socket_directories='$W'
 port=$PP
 CONF
-# Hold-start: first start applies the WAL window (reconstruct from CN) and holds
-# in quarantine (pg_ctl returns non-zero by design as it exits at the hold).
-"$BIN/pg_ctl" -D "$W/n" -l "$W/hold.log" -w start >/dev/null 2>&1 || true
-# The CN-anchored replay happened during that hold-start.
-grep -q "arming recovery from end-of-upgrade checkpoint" "$W/hold.log" && log "  replayed from CN" || { echo "  FAIL: did not replay from CN"; FAIL=1; }
-# Now adopt the held cluster.
+# Primary model: the upgraded new cluster is held (DB_UPGRADE_QUARANTINED) with its
+# files on disk (no reconstruct-from-WAL on the primary).  It must be held.
+"$BIN/pg_controldata" -D "$W/n" | grep -i 'cluster state' | grep -qi quarantine \
+  && log "  new cluster held in quarantine (good)" || { echo "  FAIL: new cluster not quarantined after upgrade"; FAIL=1; }
+# Adopt it: --wal-log-commit releases the hold and it goes live from the on-disk
+# files (the multixact members segments captured above are already present).
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/o" -D "$W/n" --wal-log-commit > "$W/commit.log" 2>&1 \
     || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 "$BIN/pg_ctl" -D "$W/n" -l "$W/n.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/n.log"; FAIL=1; }

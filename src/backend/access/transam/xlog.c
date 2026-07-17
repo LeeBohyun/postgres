@@ -4734,6 +4734,65 @@ SetControlFileUpgradeQuarantined(void)
 }
 
 /*
+ * LEE: "arm quarantine on the next shutdown checkpoint."
+ *
+ * For --wal-log-upgrade, the primary is a NORMAL, fully-upgraded cluster (its
+ * files are on disk; it does NOT reconstruct from WAL).  To hold it "not serving
+ * until the operator commits", pg_upgrade calls pg_arm_upgrade_quarantine() after
+ * emitting the window and just before the clean shutdown; CreateCheckPoint()'s
+ * shutdown path then writes DB_UPGRADE_QUARANTINED (instead of DB_SHUTDOWNED)
+ * atomically with the shutdown checkpoint -- which also sits PAST
+ * XLOG_PG_UPGRADE_COMPLETE.  So the last durable control-file write is the
+ * quarantine state on a checkpoint past the window: a restart is refused
+ * (PerformWalUpgradeIfNeeded's ControlFileInUpgradeQuarantine gate), and
+ * --wal-log-commit releases it to an ordinary go-live with no replay (the window
+ * is behind the checkpoint).
+ *
+ * The signal must cross processes: pg_arm_upgrade_quarantine() runs in a regular
+ * BACKEND, but the shutdown checkpoint runs in the CHECKPOINTER.  So the arm
+ * drops a marker file in DataDir, and the shutdown-checkpoint control-file update
+ * checks for it.  The file is removed when consumed / on release.
+ */
+#define UPGRADE_QUARANTINE_ARM_FILE "pg_upgrade_quarantine.arm"
+
+void
+ArmUpgradeQuarantineOnShutdown(void)
+{
+	int			fd;
+
+	fd = BasicOpenFile(UPGRADE_QUARANTINE_ARM_FILE,
+					   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create \"%s\": %m", UPGRADE_QUARANTINE_ARM_FILE)));
+	if (pg_fsync(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync \"%s\": %m", UPGRADE_QUARANTINE_ARM_FILE)));
+	close(fd);
+}
+
+/* True if the arm marker is present (checked by the shutdown checkpoint). */
+static bool
+UpgradeQuarantineArmed(void)
+{
+	struct stat st;
+
+	return stat(UPGRADE_QUARANTINE_ARM_FILE, &st) == 0;
+}
+
+/* Remove the arm marker so a later legitimate shutdown is NOT re-quarantined. */
+void
+ClearUpgradeQuarantineArm(void)
+{
+	if (unlink(UPGRADE_QUARANTINE_ARM_FILE) != 0 && errno != ENOENT)
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not remove \"%s\": %m", UPGRADE_QUARANTINE_ARM_FILE)));
+}
+
+/*
  * LEE: INFORMATIONAL state flips for the "currently replaying the upgrade window"
  * period.  The arm sets DB_IN_PRODUCTION (a crash-recovery trigger); the redo
  * path calls SetControlFileInUpgrade() at XLOG_PG_UPGRADE_START and
@@ -8027,7 +8086,19 @@ CreateCheckPoint(int flags)
 	 */
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	if (shutdown)
-		ControlFile->state = DB_SHUTDOWNED;
+	{
+		/*
+		 * LEE: --wal-log-upgrade holds the upgraded primary "not serving until
+		 * commit" by recording DB_UPGRADE_QUARANTINED on THIS shutdown checkpoint
+		 * (which also sits past XLOG_PG_UPGRADE_COMPLETE) when pg_upgrade armed it
+		 * via pg_arm_upgrade_quarantine() (marker file, cross-process).  Otherwise
+		 * the normal DB_SHUTDOWNED.
+		 */
+		if (UpgradeQuarantineArmed())
+			ControlFile->state = DB_UPGRADE_QUARANTINED;
+		else
+			ControlFile->state = DB_SHUTDOWNED;
+	}
 	ControlFile->checkPoint = ProcLastRecPtr;
 	ControlFile->checkPointCopy = checkPoint;
 	/* crash recovery should always recover to the end of WAL */
