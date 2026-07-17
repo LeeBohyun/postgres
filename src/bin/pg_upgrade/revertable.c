@@ -7,19 +7,19 @@
  *	window replays to XLOG_PG_UPGRADE_COMPLETE, instead of going live.  These
  *	subcommands are how the operator resolves that hold:
  *
- *	  --commit     -D new   finalize: start new_dir (recovery goes live),
+ *	  --wal-log-commit     -D new   finalize: start new_dir (recovery goes live),
  *	                        verify it is up, THEN stamp old_dir superseded
- *	  --rollback   -D new   discard the quarantined new_dir (old_dir untouched)
- *	  --delete-old -d old   delete an old_dir that a commit has superseded
- *	  --prepare-standby -D new   stamp a fresh skeleton to STREAM the window
- *	  --signal-handoff  -d old   trigger streaming standbys to stand down
+ *	  --wal-log-rollback   -D new   discard the quarantined new_dir (old_dir untouched)
+ *	  --wal-log-delete-old -d old   delete an old_dir that a commit has superseded
+ *	  --wal-log-prepare-standby -D new   stamp a fresh skeleton to STREAM the window
+ *	  --wal-log-signal-handoff  -d old   trigger streaming standbys to stand down
  *
  *	(cluster lifecycle state is available from pg_controldata; no --status flag.)
  *
  *	The old cluster is marked "superseded" by renaming its control file to
  *	pg_control.old (as stock disable_old_cluster() does): a durable, on-disk
  *	mark that (a) proves a commit completed and (b) stops the old vN binary
- *	from starting.  --delete-old refuses unless it sees that mark.
+ *	from starting.  --wal-log-delete-old refuses unless it sees that mark.
  *
  *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/revertable.c
@@ -44,7 +44,7 @@
  * fsync'd by the XLOG_PG_UPGRADE_COMPLETE redo handler in the backend (see
  * UPGRADE_COMPLETE_MARKER in pgupgrade_wal.c).  A held cluster is
  * DB_UPGRADE_QUARANTINED whether or not its window reached COMPLETE, so this
- * file -- present only after a full replay -- is what lets --commit refuse a
+ * file -- present only after a full replay -- is what lets --wal-log-commit refuse a
  * partial (crash-truncated) cluster.  Keep this string in sync with the backend.
  */
 #define UPGRADE_COMPLETE_MARKER "pg_upgrade_complete.done"
@@ -138,7 +138,7 @@ new_cluster_complete(const char *new_datadir)
 }
 
 /*
- * --commit: finalize a quarantined new cluster, then stamp old_dir superseded.
+ * --wal-log-commit: finalize a quarantined new cluster, then stamp old_dir superseded.
  *
  * STRICT ORDER (the stamp must be last): start new_dir so recovery finalizes
  * and it goes live, verify it is live, and ONLY THEN mark old_dir.  If new_dir
@@ -159,8 +159,8 @@ do_commit(void)
 	 * Committing means finalizing an already-reconstructed cluster, so the new
 	 * cluster must be HELD in quarantine -- i.e. it was started once, replayed
 	 * its upgrade window to COMPLETE, and is holding (DB_UPGRADE_QUARANTINED).
-	 * This is also the gate that confines --commit to real --wal-log-upgrade
-	 * clusters: no ordinary cluster is ever in this state, so --commit refuses a
+	 * This is also the gate that confines --wal-log-commit to real --wal-log-upgrade
+	 * clusters: no ordinary cluster is ever in this state, so --wal-log-commit refuses a
 	 * random -D.  (A never-started cluster is still pending -- start it first.)
 	 */
 	if (read_db_state(new_cluster.pgdata) != DB_UPGRADE_QUARANTINED)
@@ -175,14 +175,14 @@ do_commit(void)
 	 * (crash-truncated) window too, so the state check above is not enough --
 	 * only the durable COMPLETE marker proves the reconstruction is whole.  A
 	 * partial cluster is clean but incomplete; it must be discarded with
-	 * --rollback (or, once streaming-resume lands, have the rest of its window
+	 * --wal-log-rollback (or, once streaming-resume lands, have the rest of its window
 	 * delivered) -- never committed as-is.
 	 */
 	if (!new_cluster_complete(new_cluster.pgdata))
 		pg_fatal("new cluster \"%s\" is held but its upgrade did not fully replay "
 				 "(no \"%s\")\n"
 				 "This is a partial/crash-truncated upgrade; discard it with "
-				 "\"pg_upgrade --rollback\".  The old cluster is untouched.",
+				 "\"pg_upgrade --wal-log-rollback\".  The old cluster is untouched.",
 				 new_cluster.pgdata, UPGRADE_COMPLETE_MARKER);
 
 	/* Drop the commit sentinel so startup finalizes instead of re-holding. */
@@ -239,12 +239,12 @@ do_commit(void)
 	pg_log(PG_REPORT, "\nCommit complete.  The new cluster is now the live cluster.");
 	pg_log(PG_REPORT, "Start it with: pg_ctl -D \"%s\" start", new_cluster.pgdata);
 	if (old_cluster.pgdata != NULL && old_cluster.pgdata[0] != '\0')
-		pg_log(PG_REPORT, "The old cluster at \"%s\" is superseded; remove it with \"pg_upgrade --delete-old -d %s\".",
+		pg_log(PG_REPORT, "The old cluster at \"%s\" is superseded; remove it with \"pg_upgrade --wal-log-delete-old -d %s\".",
 			   old_cluster.pgdata, old_cluster.pgdata);
 }
 
 /*
- * --rollback: discard a quarantined new cluster.  old_dir was never touched.
+ * --wal-log-rollback: discard a quarantined new cluster.  old_dir was never touched.
  */
 static void
 do_rollback(void)
@@ -269,9 +269,9 @@ do_rollback(void)
  *
  * The slot (UPGRADE_WINDOW_SLOT) was created during capture to pin the upgrade
  * window in the new cluster's pg_wal so a standby could stream it after commit.
- * Once the operator runs --delete-old (the teardown step) the standby has been
+ * Once the operator runs --wal-log-delete-old (the teardown step) the standby has been
  * re-provisioned and the window is no longer needed, so we drop the slot to stop
- * it pinning WAL.  Best-effort: --delete-old takes -d (old cluster); the slot
+ * it pinning WAL.  Best-effort: --wal-log-delete-old takes -d (old cluster); the slot
  * lives on the NEW cluster, so this only runs if -D (new) was also supplied AND
  * the new cluster is reachable.  If not, we warn the operator to drop it by hand
  * rather than fail the deletion (the old-cluster removal is the primary job).
@@ -292,7 +292,7 @@ drop_upgrade_window_slot(void)
 	if (new_cluster.pgdata == NULL || new_cluster.pgdata[0] == '\0')
 	{
 		pg_log(PG_REPORT,
-			   "\nNote: pass -D <new datadir> to --delete-old to also drop the "
+			   "\nNote: pass -D <new datadir> to --wal-log-delete-old to also drop the "
 			   "upgrade-window\nreplication slot \"%s\"; otherwise drop it manually "
 			   "on the new cluster:\n  SELECT pg_drop_replication_slot('%s');",
 			   UPGRADE_WINDOW_SLOT, UPGRADE_WINDOW_SLOT);
@@ -300,7 +300,7 @@ drop_upgrade_window_slot(void)
 	}
 
 	/*
-	 * Best-effort: the slot lives on the NEW cluster, which at --delete-old time
+	 * Best-effort: the slot lives on the NEW cluster, which at --wal-log-delete-old time
 	 * is normally the live production server.  Read its postmaster.pid directly
 	 * to learn the running port + socket dir (its presence also tells us the
 	 * server is up).  We deliberately do NOT use connectToServer()/get_sock_dir()
@@ -364,7 +364,7 @@ drop_upgrade_window_slot(void)
 	 * Emit the set-wide delete-authorize signal into the live new primary's WAL
 	 * FIRST (before dropping the slot): it streams to NEW standbys, which on
 	 * replay mark their own old cluster delete-authorized, so the operator can run
-	 * "pg_upgrade --delete-old" on each standby without extra ceremony.  This is a
+	 * "pg_upgrade --wal-log-delete-old" on each standby without extra ceremony.  This is a
 	 * no-op if there are no standbys.  Best-effort: a failure here must not fail
 	 * the primary's own old-cluster deletion (already done by the caller).
 	 */
@@ -402,10 +402,10 @@ delete_authorized_by_signal(const char *new_datadir)
 }
 
 /*
- * --delete-old: delete an old cluster that a commit has superseded.
+ * --wal-log-delete-old: delete an old cluster that a commit has superseded.
  *
  * On a STANDBY, the new cluster may also carry a replayed set-wide
- * delete-authorize signal (pg_upgrade_delete_authorized), emitted by --delete-old
+ * delete-authorize signal (pg_upgrade_delete_authorized), emitted by --wal-log-delete-old
  * on the primary.  We report that as the authorizing reason, but still require
  * the old dir to be superseded (the real safety gate): the signal is a fleet-wide
  * "go", not a license to delete a still-live cluster.
@@ -414,7 +414,7 @@ static void
 do_delete_old(void)
 {
 	if (old_cluster.pgdata == NULL || old_cluster.pgdata[0] == '\0')
-		pg_fatal("--delete-old requires the old cluster data directory (-d)");
+		pg_fatal("--wal-log-delete-old requires the old cluster data directory (-d)");
 
 	if (!old_cluster_superseded(old_cluster.pgdata))
 		pg_fatal("old cluster \"%s\" has not been superseded by a committed upgrade; "
@@ -450,7 +450,7 @@ do_delete_old(void)
 }
 
 /*
- * --signal-handoff: connect to the LIVE old primary and write the
+ * --wal-log-signal-handoff: connect to the LIVE old primary and write the
  * streaming-handoff trigger into its (old-format) WAL.  This does NOT push to
  * each standby directly -- it emits a WAL record, which propagates to streaming
  * standbys through the normal WAL path (in Neon, primary -> safekeepers ->
@@ -471,7 +471,7 @@ do_signal_handoff(void)
 	char		query[128];
 
 	if (old_cluster.pgdata == NULL || old_cluster.pgdata[0] == '\0')
-		pg_fatal("--signal-handoff requires the old cluster data directory (-d)");
+		pg_fatal("--wal-log-signal-handoff requires the old cluster data directory (-d)");
 
 	/*
 	 * The old primary is RUNNING here.  Flag a live check so get_sock_dir()
@@ -502,13 +502,13 @@ do_signal_handoff(void)
 }
 
 /*
- * --prepare-standby: stamp a fresh skeleton (-D) so it can STREAM the upgrade
+ * --wal-log-prepare-standby: stamp a fresh skeleton (-D) so it can STREAM the upgrade
  * window from the LIVE primary (named by the standard primary_conninfo GUC in the
  * skeleton's config) -- no cp of WAL.
  *
  * Runs on the standby host AFTER the primary has been committed and is live as
  * the new version, and while it still RETAINS the upgrade window (pinned by the
- * UPGRADE_WINDOW_SLOT retention slot; --delete-old drops it).  We connect to the
+ * UPGRADE_WINDOW_SLOT retention slot; --wal-log-delete-old drops it).  We connect to the
  * primary, learn the three facts a fresh skeleton needs to stream the window --
  * its system identifier, its timeline, and the window anchor CN -- and drop them
  * into the skeleton as UPGRADE_STREAM_ANCHOR, then wire up streaming config
@@ -601,7 +601,7 @@ do_prepare_standby(void)
 	char	   *primary_conninfo;
 
 	if (new_cluster.pgdata == NULL || new_cluster.pgdata[0] == '\0')
-		pg_fatal("--prepare-standby requires the new (skeleton) data directory (-D)");
+		pg_fatal("--wal-log-prepare-standby requires the new (skeleton) data directory (-D)");
 
 	/*
 	 * The primary is named by the standard primary_conninfo GUC in the skeleton's
@@ -613,7 +613,7 @@ do_prepare_standby(void)
 	if (primary_conninfo == NULL)
 		pg_fatal("no primary_conninfo found in \"%s\"\n"
 				 "Set primary_conninfo (in postgresql.conf or postgresql.auto.conf) "
-				 "to the live primary, as for any standby, then re-run --prepare-standby.",
+				 "to the live primary, as for any standby, then re-run --wal-log-prepare-standby.",
 				 new_cluster.pgdata);
 
 	prep_status("Preparing standby to stream the upgrade window from the primary");
@@ -638,7 +638,7 @@ do_prepare_standby(void)
 	if (PQgetisnull(res, 0, 0))
 		pg_fatal("the primary is not retaining a pg_upgrade window "
 				 "(no anchor); is it a committed --wal-log-upgrade primary that "
-				 "has not yet run --delete-old?");
+				 "has not yet run --wal-log-delete-old?");
 	anchor = pg_strdup(PQgetvalue(res, 0, 0));
 	PQclear(res);
 	PQfinish(conn);
@@ -672,7 +672,7 @@ do_prepare_standby(void)
 			 new_cluster.pgdata);
 	if ((fp = fopen(autoconf_path, "a")) == NULL)
 		pg_fatal("could not append to \"%s\": %m", autoconf_path);
-	fprintf(fp, "\n# added by pg_upgrade --prepare-standby\n");
+	fprintf(fp, "\n# added by pg_upgrade --wal-log-prepare-standby\n");
 	fprintf(fp, "primary_slot_name = '%s'\n", UPGRADE_WINDOW_SLOT);
 	fclose(fp);
 
@@ -703,8 +703,8 @@ do_prepare_standby(void)
  * all paths baked in, so the operator runs a path-free script rather than
  * re-typing -b/-B/-d/-D.  Written at the end of a --wal-log-upgrade run.
  *
- *   pg_upgrade_commit.sh   -> pg_upgrade --commit   (adopt new, stamp old)
- *   pg_upgrade_rollback.sh -> pg_upgrade --rollback (discard new, keep old)
+ *   pg_upgrade_commit.sh   -> pg_upgrade --wal-log-commit   (adopt new, stamp old)
+ *   pg_upgrade_rollback.sh -> pg_upgrade --wal-log-rollback (discard new, keep old)
  *
  * (delete_old_cluster.sh is still produced by the stock deletion-script path.)
  */
@@ -731,7 +731,7 @@ create_revertable_scripts(void)
 			"# cluster superseded.  The old cluster is retained; remove it\n"
 			"# afterwards with delete_old_cluster.%s once you are confident.\n\n",
 			SCRIPT_EXT);
-	fprintf(script, "%c%s%cpg_upgrade%c --commit -b %c%s%c -B %c%s%c -d %c%s%c -D %c%s%c\n",
+	fprintf(script, "%c%s%cpg_upgrade%c --wal-log-commit -b %c%s%c -B %c%s%c -d %c%s%c -D %c%s%c\n",
 			PATH_QUOTE, newbin, PATH_SEPARATOR, PATH_QUOTE,
 			PATH_QUOTE, old_cluster.bindir, PATH_QUOTE,
 			PATH_QUOTE, newbin, PATH_QUOTE,
@@ -748,7 +748,7 @@ create_revertable_scripts(void)
 	fprintf(script,
 			"# Discard the upgraded cluster.  The old cluster was never\n"
 			"# touched; start it again with its original (old) binaries.\n\n");
-	fprintf(script, "%c%s%cpg_upgrade%c --rollback -D %c%s%c\n",
+	fprintf(script, "%c%s%cpg_upgrade%c --wal-log-rollback -D %c%s%c\n",
 			PATH_QUOTE, newbin, PATH_SEPARATOR, PATH_QUOTE,
 			PATH_QUOTE, new_cluster.pgdata, PATH_QUOTE);
 	fclose(script);

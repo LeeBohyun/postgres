@@ -5,11 +5,11 @@
 # run_crash_test.sh proves atomicity of the ORIGINAL upgrade replay (START
 # without COMPLETE).  This proves the NEW lifecycle transitions survive a crash:
 #
-#   A1. Crash (SIGKILL) DURING --commit's finalize, between "quarantine released"
+#   A1. Crash (SIGKILL) DURING --wal-log-commit's finalize, between "quarantine released"
 #       and "live".  A restart must converge to a consistent outcome -- either
 #       re-held (quarantined) or finalized-live -- NEVER a half-committed cluster
 #       that serves partial/corrupt data.
-#   A2. --rollback interrupted mid rm -rf (leave a partial new_dir), then retried:
+#   A2. --wal-log-rollback interrupted mid rm -rf (leave a partial new_dir), then retried:
 #       must still fully discard new_dir; old_dir untouched throughout.
 #   A3. Crash AFTER old_dir is stamped superseded but BEFORE the new cluster is
 #       (re)started as live: the new cluster must still be adoptable/serve, and
@@ -51,13 +51,13 @@ FP=$("$BIN/pg_ctl" -D "$W/old" -l "$W/f.log" -w start >/dev/null 2>&1; \
 log "old fingerprint: $FP"
 
 # ================================================== A1: crash during commit finalize
-log "A1: SIGKILL during --commit finalize -> restart converges (no half-commit)"
+log "A1: SIGKILL during --wal-log-commit finalize -> restart converges (no half-commit)"
 do_upgrade "$W/old" "$W/new1"
 hold_start "$W/new1"
 echo "$(db_state "$W/new1")" | grep -qi quarantine || fail "A1: not quarantined after hold-start"
-# --commit starts the cluster to finalize.  Simulate a crash of THAT server: drop
+# --wal-log-commit starts the cluster to finalize.  Simulate a crash of THAT server: drop
 # the commit sentinel ourselves, launch the postmaster directly, and SIGKILL it
-# once it announces it is finalizing (mirrors what pg_upgrade --commit does).
+# once it announces it is finalizing (mirrors what pg_upgrade --wal-log-commit does).
 touch "$W/new1/pg_upgrade_commit.signal"
 "$BIN/postgres" -D "$W/new1" >"$W/commit_crash.log" 2>&1 &
 PM=$!
@@ -75,7 +75,7 @@ else
     echo "$(db_state "$W/new1")" | grep -qiE "quarantine|shut down" || fail "A1: restart neither serves nor holds cleanly (state '$(db_state "$W/new1")')"
     # re-hold path: commit again for real, must succeed + serve intact.
     hold_start "$W/new1"
-    "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new1" --commit >"$W/a1commit.log" 2>&1 || { cat "$W/a1commit.log"; fail "A1: re-commit after crash failed"; }
+    "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new1" --wal-log-commit >"$W/a1commit.log" 2>&1 || { cat "$W/a1commit.log"; fail "A1: re-commit after crash failed"; }
     "$BIN/pg_ctl" -D "$W/new1" -l "$W/new1_live.log" -w start >/dev/null 2>&1 || fail "A1: start after re-commit"
     A1FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint) FROM t" 2>&1)
     "$BIN/pg_ctl" -D "$W/new1" -w stop >/dev/null 2>&1
@@ -88,15 +88,15 @@ fi
 log "PASS A1"
 
 # ================================================== A2: interrupted rollback retried
-log "A2: interrupted --rollback (partial rm) retried -> fully discarded"
+log "A2: interrupted --wal-log-rollback (partial rm) retried -> fully discarded"
 do_upgrade "$W/old" "$W/new2"
 hold_start "$W/new2"
 echo "$(db_state "$W/new2")" | grep -qi quarantine || fail "A2: not quarantined"
 # Simulate an interrupted rollback: delete SOME of new_dir, leaving a partial
-# directory (as a killed rm -rf would).  A retried --rollback must finish it.
+# directory (as a killed rm -rf would).  A retried --wal-log-rollback must finish it.
 rm -rf "$W/new2/base" 2>/dev/null           # partial deletion
 [ -d "$W/new2" ] || fail "A2 setup: new2 already gone"
-"$BIN/pg_upgrade" -D "$W/new2" --rollback >"$W/a2.log" 2>&1
+"$BIN/pg_upgrade" -D "$W/new2" --wal-log-rollback >"$W/a2.log" 2>&1
 # rollback may error if the partial dir is no longer a recognizable held cluster;
 # either way the operator's intent is "discard it", so ensure it is gone (retry
 # with a plain rm to model the operator finishing the discard).
@@ -118,7 +118,7 @@ echo "$(db_state "$W/new3")" | grep -qi quarantine || fail "A3: not quarantined"
 # old.  Model the "crash right after the stamp, before the operator's final
 # restart" by doing the commit (which stamps) and then NOT starting new3 -- and
 # assert the on-disk invariant: old is un-startable (stamped), new3 is adoptable.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new3" --commit >"$W/a3.log" 2>&1 || { cat "$W/a3.log"; fail "A3 commit"; }
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new3" --wal-log-commit >"$W/a3.log" 2>&1 || { cat "$W/a3.log"; fail "A3 commit"; }
 # Invariant 1: old is stamped superseded -> its live pg_control is gone.
 [ -f "$W/old/global/pg_control.old" ] || fail "A3: old not stamped superseded"
 [ -f "$W/old/global/pg_control" ] && fail "A3: old still has a live pg_control (would allow split brain)"

@@ -7,7 +7,7 @@
 #
 #   - the retention slot (UPGRADE_WINDOW_SLOT) that pins the window on the primary
 #     so it survives commit and is streamable, and
-#   - "pg_upgrade --prepare-standby", which stamps the skeleton's control file
+#   - "pg_upgrade --wal-log-prepare-standby", which stamps the skeleton's control file
 #     with the primary's sysid + CN anchor + TLI so its walreceiver accepts the
 #     primary and recovery starts at CN.
 #
@@ -16,7 +16,7 @@
 #
 # DECISIVE ASSERTIONS:
 #   * the operator NEVER cp's a WAL segment into the skeleton (this script copies
-#     nothing; it only runs --prepare-standby + pg_ctl start), and
+#     nothing; it only runs --wal-log-prepare-standby + pg_ctl start), and
 #   * the skeleton's log shows it STREAMED (walreceiver "started streaming" /
 #     "arming streaming standby from anchor"), came up as a hot standby
 #     (pg_is_in_recovery=t), and serves data byte-identical to the primary.
@@ -62,7 +62,7 @@ echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
 echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
 # hold-start (applies window, holds; pg_ctl exits non-zero by design), then commit
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new_hold.log" -w start >/dev/null 2>&1 || true
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --commit >"$W/commit.log" 2>&1 \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --wal-log-commit >"$W/commit.log" 2>&1 \
     || { echo "FAIL commit"; tail -20 "$W/commit.log"; exit 1; }
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/new.log"; exit 1; }
 NEW_FP=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t) FROM t")
@@ -87,7 +87,7 @@ log "3. fresh new-version SKELETON, prepared to STREAM (no cp of any WAL)"
 rm -f "$SKEL"/base/*/[0-9]* 2>/dev/null
 rm -f "$SKEL"/global/[0-9]* "$SKEL"/global/pg_filenode.map 2>/dev/null
 # primary_conninfo is set in the skeleton config (standard for any standby);
-# --prepare-standby reads it (no dedicated flag).
+# --wal-log-prepare-standby reads it (no dedicated flag).
 cat >> "$SKEL/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
@@ -97,7 +97,7 @@ CONF
 SKEL_ID_BEFORE=$("$BIN/pg_controldata" -D "$SKEL" | grep -i 'system identifier' | grep -oE '[0-9]+')
 log "skeleton sysid BEFORE prepare: $SKEL_ID_BEFORE (differs from primary $NEW_ID)"
 
-"$BIN/pg_upgrade" -B "$BIN" -D "$SKEL" --prepare-standby >"$W/prep.log" 2>&1 \
+"$BIN/pg_upgrade" -B "$BIN" -D "$SKEL" --wal-log-prepare-standby >"$W/prep.log" 2>&1 \
     || { echo "FAIL prepare-standby"; cat "$W/prep.log"; FAIL=1; }
 # The prepare step must have created the anchor + standby.signal, but NO WAL cp.
 [ -f "$SKEL/pg_upgrade_stream.anchor" ] || { echo "FAIL: no streaming anchor written"; FAIL=1; }

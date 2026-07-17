@@ -35,8 +35,8 @@ log "start NEW cluster (mid-upgrade, no COMPLETE): must HOLD in quarantine, neve
 # New atomicity model: there is no COMPLETE pre-scan FATAL.  A crash-truncated
 # window (START but no COMPLETE) is armed and the partial window is replayed, but
 # the cluster is HELD in quarantine at the end-of-recovery hold and NEVER goes
-# live.  Because it never reaches COMPLETE, "--commit" would refuse; the operator
-# discards it with "--rollback".  So a half-upgraded cluster never serves --
+# live.  Because it never reaches COMPLETE, "--wal-log-commit" would refuse; the operator
+# discards it with "--wal-log-rollback".  So a half-upgraded cluster never serves --
 # atomicity via quarantine + rollback, not via a pre-scan refusal.
 echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1
@@ -58,19 +58,19 @@ case "$st" in *quarantine*) echo "control state: $st (good)";; *) echo "FAIL: pa
 # The COMPLETE marker must be ABSENT for a crash-truncated window.
 [ -e "$NEW/pg_upgrade_complete.done" ] && { echo "FAIL: COMPLETE marker present on a partial (no-COMPLETE) cluster"; FAIL=1; }
 
-log "--commit MUST REFUSE the partial cluster (quarantined but not fully replayed)"
-if "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" --commit >"$W/commit_partial.log" 2>&1; then
-    echo "FAIL: --commit finalized a partial (crash-truncated) cluster -- must have refused:"; cat "$W/commit_partial.log"; FAIL=1
+log "--wal-log-commit MUST REFUSE the partial cluster (quarantined but not fully replayed)"
+if "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" --wal-log-commit >"$W/commit_partial.log" 2>&1; then
+    echo "FAIL: --wal-log-commit finalized a partial (crash-truncated) cluster -- must have refused:"; cat "$W/commit_partial.log"; FAIL=1
 else
     grep -qi "did not fully replay\|PARTIAL\|crash-truncated" "$W/commit_partial.log" \
         && echo "commit refused the partial cluster (good):" && grep -i "did not fully replay" "$W/commit_partial.log" | head -1 \
-        || { echo "FAIL: --commit refused but for the wrong reason:"; cat "$W/commit_partial.log"; FAIL=1; }
+        || { echo "FAIL: --wal-log-commit refused but for the wrong reason:"; cat "$W/commit_partial.log"; FAIL=1; }
     # Refusing must NOT have touched the old cluster (no superseded stamp).
     [ -e "$OLD/global/pg_control.old" ] && { echo "FAIL: refused commit still stamped the old cluster superseded"; FAIL=1; }
 fi
 
 log "rollback the half-upgraded cluster (discard it); old must be untouched"
-"$BIN/pg_upgrade" -D "$NEW" --rollback >"$W/rollback.log" 2>&1 || { cat "$W/rollback.log"; echo "FAIL: rollback of half-upgraded cluster"; FAIL=1; }
+"$BIN/pg_upgrade" -D "$NEW" --wal-log-rollback >"$W/rollback.log" 2>&1 || { cat "$W/rollback.log"; echo "FAIL: rollback of half-upgraded cluster"; FAIL=1; }
 [ -d "$NEW" ] && { echo "FAIL: rollback did not remove the half-upgraded new cluster"; FAIL=1; }
 
 log "verify OLD cluster is still fully usable"
@@ -91,7 +91,7 @@ echo "unix_socket_directories='$W'">>$W/new2/postgresql.conf; echo "port=$P">>$W
 # --wal-log-upgrade holds the new cluster in quarantine.  Hold-start it (applies
 # the window, reconstructs, holds; pg_ctl exits non-zero by design), then commit.
 "$BIN/pg_ctl" -D "$W/new2" -l "$W/new2_hold.log" -w start >/dev/null 2>&1 || true
-"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" --commit >"$W/commit2.log" 2>&1 \
+"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" --wal-log-commit >"$W/commit2.log" 2>&1 \
     || { echo "FAIL: control commit"; tail -20 "$W/commit2.log"; FAIL=1; }
 if "$BIN/pg_ctl" -D "$W/new2" -l "$W/new2.log" -w start >/dev/null 2>&1; then
     CTRL_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(b)::bigint) FROM t")

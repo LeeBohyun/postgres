@@ -50,7 +50,7 @@ hold_start(){ "$BIN/pg_ctl" -D "$1" -l "$W/hold.log" -w start >/dev/null 2>&1 ||
 # =========================================================== E1: commit random
 log "E1: commit refuses a random (non-wal-log) cluster"
 make_old "$W/rand" 100
-if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/rand" -D "$W/rand" --commit >"$W/e1.log" 2>&1; then
+if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/rand" -D "$W/rand" --wal-log-commit >"$W/e1.log" 2>&1; then
     fail "commit succeeded on a random cluster (should be refused)"
 fi
 grep -qi "not held in pg_upgrade quarantine\|not a --wal-log-upgrade" "$W/e1.log" || { cat "$W/e1.log"; fail "E1 wrong error"; }
@@ -63,7 +63,7 @@ make_old "$W/old2" 3000
 OLD2_FP=$(fp "$W/old2")
 do_upgrade "$W/old2" "$W/new2"
 # NO hold-start yet -> still pending; commit must refuse.
-if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old2" -D "$W/new2" --commit >"$W/e2.log" 2>&1; then
+if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old2" -D "$W/new2" --wal-log-commit >"$W/e2.log" 2>&1; then
     fail "commit succeeded on a pending cluster (must hold-start first)"
 fi
 grep -qi "not held in pg_upgrade quarantine" "$W/e2.log" || { cat "$W/e2.log"; fail "E2 wrong error"; }
@@ -83,7 +83,7 @@ log "PASS E4 (5 restarts, always held/dark)"
 
 # =========================================================== E3: rollback guards
 log "E3: rollback refuses a random cluster"
-if "$BIN/pg_upgrade" -D "$W/rand" --rollback >"$W/e3.log" 2>&1; then
+if "$BIN/pg_upgrade" -D "$W/rand" --wal-log-rollback >"$W/e3.log" 2>&1; then
     fail "rollback succeeded on a random cluster (should refuse)"
 fi
 [ -d "$W/rand" ] || fail "E3: rollback removed the random cluster"
@@ -91,7 +91,7 @@ log "PASS E3"
 
 # =========================================================== E5: big rollback
 log "E5: rollback of the held new2 -> old2 byte-identical + serves"
-"$BIN/pg_upgrade" -D "$W/new2" --rollback >"$W/e5.log" 2>&1 || { cat "$W/e5.log"; fail "rollback new2"; }
+"$BIN/pg_upgrade" -D "$W/new2" --wal-log-rollback >"$W/e5.log" 2>&1 || { cat "$W/e5.log"; fail "rollback new2"; }
 [ -d "$W/new2" ] && fail "E5: rollback did not remove new2"
 AFTER_FP=$(fp "$W/old2")
 [ "$OLD2_FP" = "$AFTER_FP" ] || fail "E5: old2 changed after rollback (old=$OLD2_FP after=$AFTER_FP)"
@@ -102,7 +102,7 @@ log "E6: re-upgrade old2 after a rollback, hold, commit -> data intact"
 do_upgrade "$W/old2" "$W/new2b"
 hold_start "$W/new2b"
 echo "$(db_state "$W/new2b")" | grep -qi quarantine || fail "E6: not quarantined after hold-start"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old2" -D "$W/new2b" --commit >"$W/e6.log" 2>&1 || { cat "$W/e6.log"; fail "E6 commit"; }
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old2" -D "$W/new2b" --wal-log-commit >"$W/e6.log" 2>&1 || { cat "$W/e6.log"; fail "E6 commit"; }
 "$BIN/pg_ctl" -D "$W/new2b" -l "$W/new2b.log" -w start >/dev/null 2>&1 || { tail -20 "$W/new2b.log"; fail "E6 start"; }
 N_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint) FROM t" 2>&1)
 "$BIN/pg_ctl" -D "$W/new2b" -w stop >/dev/null 2>&1
@@ -114,12 +114,12 @@ log "E7: delete-old refuses unstamped, succeeds after commit"
 # old2 was superseded by the E6 commit -> stamped -> deletable.
 [ -f "$W/old2/global/pg_control.old" ] || fail "E7: E6 commit did not stamp old2 superseded"
 # a random (never-committed-against) dir must be refused.
-if "$BIN/pg_upgrade" -d "$W/rand" --delete-old >"$W/e7a.log" 2>&1; then
+if "$BIN/pg_upgrade" -d "$W/rand" --wal-log-delete-old >"$W/e7a.log" 2>&1; then
     fail "E7: delete-old succeeded on an unstamped cluster"
 fi
 [ -d "$W/rand" ] || fail "E7: delete-old removed the unstamped cluster"
 # the stamped old2 deletes cleanly.
-"$BIN/pg_upgrade" -d "$W/old2" --delete-old >"$W/e7b.log" 2>&1 || { cat "$W/e7b.log"; fail "E7 delete-old old2"; }
+"$BIN/pg_upgrade" -d "$W/old2" --wal-log-delete-old >"$W/e7b.log" 2>&1 || { cat "$W/e7b.log"; fail "E7 delete-old old2"; }
 [ -d "$W/old2" ] && fail "E7: delete-old did not remove old2"
 log "PASS E7"
 

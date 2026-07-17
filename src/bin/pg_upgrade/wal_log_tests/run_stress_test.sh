@@ -111,7 +111,7 @@ CONF
     # Hold-start: first start applies the WAL window, reconstructs, and holds
     # in quarantine (pg_ctl returns non-zero by design as it exits at the hold).
     "$BIN/pg_ctl" -D "$NEW" -l "$WORK/hold.log" -w start >/dev/null 2>&1 || true
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$WORK/commit.log" 2>&1 \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-log-commit > "$WORK/commit.log" 2>&1 \
     || { echo FAIL commit; tail -20 "$WORK/commit.log"; exit 1; }
 log "start new cluster (triggers WAL-replay recovery of ~${GB}GB + >1GB catalog)"
 t0=$SECONDS

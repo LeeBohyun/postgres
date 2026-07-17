@@ -102,7 +102,7 @@ CONF
 # The CN-anchored replay happened during that hold-start.
 grep -q "arming recovery from end-of-upgrade checkpoint" "$W/hold.log" && log "  replayed from CN" || { echo "  FAIL: did not replay from CN"; FAIL=1; }
 # Now adopt the held cluster.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/o" -D "$W/n" --commit > "$W/commit.log" 2>&1 \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/o" -D "$W/n" --wal-log-commit > "$W/commit.log" 2>&1 \
     || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 "$BIN/pg_ctl" -D "$W/n" -l "$W/n.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/n.log"; FAIL=1; }
 NEW_MXID=$(Q "SELECT next_multixact_id FROM pg_control_checkpoint()")

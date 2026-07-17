@@ -13,7 +13,7 @@
 #   delete-old (after commit)  -> removes old cluster
 #
 # Proves: (a) the hold actually happens, (b) rollback restores the old cluster,
-# (c) commit adopts the new cluster with data intact, (d) --delete-old is gated
+# (c) commit adopts the new cluster with data intact, (d) --wal-log-delete-old is gated
 # on the superseded stamp.
 #
 set -u
@@ -97,7 +97,7 @@ log "PASS: first start reconstructed + held; restart re-held (never served)"
 
 # =========================================================== Scenario 2: ROLLBACK
 log "Scenario 2: rollback discards new, old still serves"
-"$BIN/pg_upgrade" -D "$NEW" --rollback > "$WORK/rollback.log" 2>&1 || { cat "$WORK/rollback.log"; fail "rollback exited nonzero"; }
+"$BIN/pg_upgrade" -D "$NEW" --wal-log-rollback > "$WORK/rollback.log" 2>&1 || { cat "$WORK/rollback.log"; fail "rollback exited nonzero"; }
 [ -d "$NEW" ] && fail "rollback did not remove new cluster dir"
 # old cluster must still start and have the data
 "$BIN/pg_ctl" -D "$OLD" -l "$WORK/old2.log" -w start >/dev/null 2>&1 || fail "old cluster did not start after rollback"
@@ -117,15 +117,15 @@ echo "port = $PORT" >> "$NEW/postgresql.conf"
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new3_hold.log" -w start >/dev/null 2>&1 || true
 echo "$(db_state "$NEW")" | grep -qi "quarantine" || fail "hold-start did not quarantine (got '$(db_state "$NEW")')"
 
-# --delete-old BEFORE commit must be refused (old not yet superseded)
-if "$BIN/pg_upgrade" -d "$OLD" --delete-old > "$WORK/del_early.log" 2>&1; then
-    fail "--delete-old succeeded before commit (should be refused)"
+# --wal-log-delete-old BEFORE commit must be refused (old not yet superseded)
+if "$BIN/pg_upgrade" -d "$OLD" --wal-log-delete-old > "$WORK/del_early.log" 2>&1; then
+    fail "--wal-log-delete-old succeeded before commit (should be refused)"
 fi
-[ -d "$OLD" ] || fail "--delete-old removed old dir despite being refused"
-log "PASS: --delete-old refused before commit"
+[ -d "$OLD" ] || fail "--wal-log-delete-old removed old dir despite being refused"
+log "PASS: --wal-log-delete-old refused before commit"
 
 # commit
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit > "$WORK/commit.log" 2>&1 || { cat "$WORK/commit.log"; fail "commit exited nonzero"; }
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-log-commit > "$WORK/commit.log" 2>&1 || { cat "$WORK/commit.log"; fail "commit exited nonzero"; }
 STATE=$(db_state "$NEW")
 log "new cluster state after commit: '$STATE'"
 echo "$STATE" | grep -qi "production\|shut down" || fail "committed cluster not in a live/normal state (got '$STATE')"
@@ -144,8 +144,8 @@ log "PASS: old cluster stamped superseded"
 
 # ======================================================= Scenario 4: DELETE-OLD
 log "Scenario 4: delete-old after commit"
-"$BIN/pg_upgrade" -d "$OLD" --delete-old > "$WORK/del.log" 2>&1 || { cat "$WORK/del.log"; fail "--delete-old exited nonzero"; }
-[ -d "$OLD" ] && fail "--delete-old did not remove old dir"
+"$BIN/pg_upgrade" -d "$OLD" --wal-log-delete-old > "$WORK/del.log" 2>&1 || { cat "$WORK/del.log"; fail "--wal-log-delete-old exited nonzero"; }
+[ -d "$OLD" ] && fail "--wal-log-delete-old did not remove old dir"
 log "PASS: delete-old removed the superseded old cluster"
 
 log "ALL SCENARIOS PASSED"

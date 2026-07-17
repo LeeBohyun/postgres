@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# --commit must NOT stamp the old cluster superseded if the new cluster fails to
+# --wal-log-commit must NOT stamp the old cluster superseded if the new cluster fails to
 # come up live.  This is the C4 point-of-no-return ordering under a REAL failure:
 # commit does (1) start new -> finalize, (2) verify live, and only THEN (3) stamp
 # old.  If step 1/2 fails, old_dir must be left fully startable so the operator
 # still has a good cluster.
 #
 # We force the new cluster's start to fail by occupying its port with a
-# blocker process before running --commit.
+# blocker process before running --wal-log-commit.
 #
 set -u
 BIN="${PGBIN:?set PGBIN}"
@@ -39,8 +39,8 @@ log "poison the new cluster's config so commit's start cannot succeed"
 # commit must NOT stamp old_dir when the new cluster cannot come up.
 echo "shared_buffers = 'not_a_valid_size'" >> "$W/new/postgresql.conf"
 
-log "run --commit (expected to FAIL: new cannot start)"
-if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new" --commit >"$W/commit.log" 2>&1; then
+log "run --wal-log-commit (expected to FAIL: new cannot start)"
+if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new" --wal-log-commit >"$W/commit.log" 2>&1; then
     fail "commit SUCCEEDED despite the new cluster being unable to start"
 fi
 log "commit failed as expected:"; grep -iE "could not|fail|old cluster is untouched" "$W/commit.log" | head -3

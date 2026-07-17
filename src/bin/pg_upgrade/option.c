@@ -66,15 +66,17 @@ parseCommandLine(int argc, char *argv[])
 		{"initdb", no_argument, NULL, 8},
 		/* LEE: capture the upgrade as WAL and reconstruct it on first startup */
 		{"wal-log-upgrade", no_argument, NULL, 9},
-		/* LEE: revertable-upgrade lifecycle subcommands (act on -D new / -d old) */
-		{"commit", no_argument, NULL, 10},
-		{"rollback", no_argument, NULL, 11},
-		{"delete-old", no_argument, NULL, 12},
-		{"signal-handoff", no_argument, NULL, 14},
-		/* LEE: prepare a fresh skeleton to STREAM the upgrade window from the live
+		/* LEE: --wal-log-upgrade lifecycle subcommands (act on -D new / -d old).
+		 * Namespaced with the "wal-log-" prefix so they are clearly part of THIS
+		 * feature and never mistaken for stock pg_upgrade behavior. */
+		{"wal-log-commit", no_argument, NULL, 10},
+		{"wal-log-rollback", no_argument, NULL, 11},
+		{"wal-log-delete-old", no_argument, NULL, 12},
+		{"wal-log-signal-handoff", no_argument, NULL, 14},
+		/* prepare a fresh skeleton to STREAM the upgrade window from the live
 		 * primary (stamps its control file; no cp).  Needs -D; reads the standard
 		 * primary_conninfo GUC from the skeleton's config (no dedicated flag). */
-		{"prepare-standby", no_argument, NULL, 15},
+		{"wal-log-prepare-standby", no_argument, NULL, 15},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -327,7 +329,7 @@ parseCommandLine(int argc, char *argv[])
 	if (user_opts.revertable_op == REVERTABLE_OP_DELETE_OLD)
 	{
 		if (old_cluster.pgdata == NULL)
-			pg_fatal("--delete-old requires the old cluster data directory (-d/--old-datadir)");
+			pg_fatal("--wal-log-delete-old requires the old cluster data directory (-d/--old-datadir)");
 		return;
 	}
 	else if (user_opts.revertable_op == REVERTABLE_OP_SIGNAL_HANDOFF)
@@ -338,7 +340,7 @@ parseCommandLine(int argc, char *argv[])
 		 * cluster's socket); unlike other ops the old cluster is RUNNING here.
 		 */
 		if (old_cluster.pgdata == NULL)
-			pg_fatal("--signal-handoff requires the old cluster data directory (-d/--old-datadir)");
+			pg_fatal("--wal-log-signal-handoff requires the old cluster data directory (-d/--old-datadir)");
 		return;
 	}
 	else if (user_opts.revertable_op == REVERTABLE_OP_PREPARE_STANDBY)
@@ -350,7 +352,7 @@ parseCommandLine(int argc, char *argv[])
 		 * standby) -- no dedicated flag.  It needs only -D; no old cluster/bindir.
 		 */
 		if (new_cluster.pgdata == NULL)
-			pg_fatal("--prepare-standby requires the new (skeleton) data directory (-D/--new-datadir)");
+			pg_fatal("--wal-log-prepare-standby requires the new (skeleton) data directory (-D/--new-datadir)");
 		return;
 	}
 	else if (user_opts.revertable_op != REVERTABLE_OP_NONE)

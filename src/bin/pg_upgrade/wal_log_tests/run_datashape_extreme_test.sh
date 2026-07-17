@@ -90,7 +90,7 @@ echo "unix_socket_directories='$W'">>"$W/new/postgresql.conf"; echo "port=$PORT"
 log "hold-start (reconstruct + hold), then commit"
 "$BIN/pg_ctl" -D "$W/new" -l "$W/hold.log" -w -t 600 start >/dev/null 2>&1 || true
 "$BIN/pg_controldata" -D "$W/new" | grep -qi quarantine || fail "new not quarantined after hold-start"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new" --commit >"$W/commit.log" 2>&1 || { cat "$W/commit.log"; fail "commit"; }
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new" --wal-log-commit >"$W/commit.log" 2>&1 || { cat "$W/commit.log"; fail "commit"; }
 "$BIN/pg_ctl" -D "$W/new" -l "$W/new.log" -w -t 600 start >/dev/null 2>&1 || { tail -30 "$W/new.log"; fail "start after commit"; }
 
 log "verify each data shape survived"

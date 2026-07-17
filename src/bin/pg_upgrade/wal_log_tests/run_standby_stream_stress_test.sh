@@ -3,7 +3,7 @@
 #
 # run_standby_stream_e2e_test proves the streaming path on a small dataset.  This
 # runs the SAME path (upgrade primary -> commit -> live; fresh skeleton STREAMS
-# the window via --prepare-standby; becomes a hot standby) across several harder
+# the window via --wal-log-prepare-standby; becomes a hot standby) across several harder
 # data SHAPES, to shake out chunking / many-relation / big-catalog issues in the
 # streamed window:
 #
@@ -127,7 +127,7 @@ CONF
   echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
   echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
   "$BIN/pg_ctl" -D "$NEW" -l "$W/new_hold.log" -w start >/dev/null 2>&1 || true
-  "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --commit >"$W/commit.log" 2>&1 \
+  "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --wal-log-commit >"$W/commit.log" 2>&1 \
     || { echo "FAIL: $shape commit"; tail -12 "$W/commit.log"; GRC=1; cd /; continue; }
   "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL: $shape new start"; tail "$W/new.log"; GRC=1; cd /; continue; }
   for d in $("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('template0','template1')" 2>/dev/null); do
@@ -149,7 +149,7 @@ unix_socket_directories='$W'
 hot_standby=on
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
-  "$BIN/pg_upgrade" -B "$BIN" -D "$SKEL" --prepare-standby >"$W/prep.log" 2>&1 \
+  "$BIN/pg_upgrade" -B "$BIN" -D "$SKEL" --wal-log-prepare-standby >"$W/prep.log" 2>&1 \
     || { echo "FAIL: $shape prepare-standby"; cat "$W/prep.log"; GRC=1; cd /; continue; }
   "$BIN/pg_ctl" -D "$SKEL" -l "$W/skel.log" -w -t 120 start >/dev/null 2>&1 || true
   UP=0

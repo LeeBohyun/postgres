@@ -70,7 +70,7 @@ PROBEPID=$!
 wait $PROBEPID 2>/dev/null
 
 # Now adopt the held cluster and bring it live for the final consistency check.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" --commit > "$W/commit.log" 2>&1 \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" --wal-log-commit > "$W/commit.log" 2>&1 \
     || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 "$BIN/pg_ctl" -D "$N" -l "$W/n.log" -w start >/dev/null 2>&1
 STARTRC=$?

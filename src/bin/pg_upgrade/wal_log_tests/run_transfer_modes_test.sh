@@ -5,16 +5,16 @@
 #   --copy, --clone, --link : the old cluster's data SURVIVES the transfer, so the
 #         upgrade is REVERTABLE.  --copy/--clone duplicate the files; --link only
 #         READS them (hard links).  For all three, --wal-log-upgrade must keep the
-#         old cluster intact until --commit (the old-cluster disable is DEFERRED to
-#         commit), so --rollback can restore it.
+#         old cluster intact until --wal-log-commit (the old-cluster disable is DEFERRED to
+#         commit), so --wal-log-rollback can restore it.
 #   --copy-file-range : same family as copy, but needs the copy_file_range syscall
 #         (Linux); skipped where unavailable.
 #   --swap  : MOVES the old cluster's data into the new cluster, so there is nothing
 #         to roll back to -- it must be REFUSED with --wal-log-upgrade.
 #
 # This test asserts, per mode:
-#   copy/clone/link -> old cluster stays intact through the hold; --rollback
-#                      restores it (data intact); --commit disables it and the new
+#   copy/clone/link -> old cluster stays intact through the hold; --wal-log-rollback
+#                      restores it (data intact); --wal-log-commit disables it and the new
 #                      cluster serves the upgraded data.
 #   swap            -> pg_upgrade refuses the combination up front.
 set -u
@@ -55,7 +55,7 @@ for MODE in copy clone link; do
   case "$ST" in *quarantine*) : ;; *) echo "FAIL: --$MODE did not hold in quarantine (state='$ST')"; FAIL=1;; esac
 
   # ROLLBACK: new discarded, old restored + startable with data
-  "$BIN/pg_upgrade" -D "$NEW" --rollback >"$W/${MODE}_rb.log" 2>&1 || { echo "FAIL: --$MODE rollback"; cat "$W/${MODE}_rb.log"; FAIL=1; }
+  "$BIN/pg_upgrade" -D "$NEW" --wal-log-rollback >"$W/${MODE}_rb.log" 2>&1 || { echo "FAIL: --$MODE rollback"; cat "$W/${MODE}_rb.log"; FAIL=1; }
   [ -d "$NEW" ] && { echo "FAIL: --$MODE rollback left new_dir"; FAIL=1; }
   "$BIN/pg_ctl" -D "$OLD" -l "$W/${MODE}_old2.log" -w -t 20 start >/dev/null 2>&1
   ROWS=$("$BIN/psql" -h "$W" -p $P -U postgres -tAc "SELECT count(*) FROM t" 2>&1 | head -1)
@@ -69,7 +69,7 @@ for MODE in copy clone link; do
     || { echo "FAIL: --$MODE re-upgrade"; tail -8 "$W/${MODE}_up2.log"; FAIL=1; cd /; continue; }
   { echo "unix_socket_directories='$W'"; echo "port=$P"; } >> "$NEW/postgresql.conf"
   "$BIN/pg_ctl" -D "$NEW" -l "$W/${MODE}_hold2.log" -w -t 40 start >/dev/null 2>&1 || true
-  "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --commit >"$W/${MODE}_commit.log" 2>&1 \
+  "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --wal-log-commit >"$W/${MODE}_commit.log" 2>&1 \
     || { echo "FAIL: --$MODE commit"; tail -8 "$W/${MODE}_commit.log"; FAIL=1; }
   # commit must have disabled the old cluster (deferred disable happens here)
   [ -f "$OLD/global/pg_control.old" ] || { echo "FAIL: --$MODE commit did not disable old cluster"; FAIL=1; }

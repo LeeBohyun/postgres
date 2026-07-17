@@ -60,7 +60,7 @@ SQL
     # pg_ctl exits non-zero by design), then commit, then start for real.
     echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$port">>$NEW/postgresql.conf
     "$BIN/pg_ctl" -D "$NEW" -l "$W/hold.log" -w start >/dev/null 2>&1 || true
-    "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit >"$W/commit.log" 2>&1 \
+    "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-log-commit >"$W/commit.log" 2>&1 \
         || { echo "[$name] FAIL commit"; tail -20 "$W/commit.log"; return 1; }
     "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "[$name] FAIL start new"; tail -20 "$W/new.log"; return 1; }
     local NEW_FP=$("$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint), (SELECT count(*) FROM toast_t) FROM t")
@@ -110,7 +110,7 @@ SQL
     sleep 1
     # After a mid-replay crash, a restart must re-arm and converge idempotently
     # to the quarantine HOLD (not silently go live).  A plain start therefore
-    # re-holds (exits at the recovery target); then --commit adopts it and it
+    # re-holds (exits at the recovery target); then --wal-log-commit adopts it and it
     # serves with the data intact.  This proves crash-idempotency AND that the
     # quarantine gate still governs the outcome after a crash.
     log "[$name] restart after crash -- must re-arm and re-hold (idempotent)"
@@ -122,7 +122,7 @@ SQL
         echo "[$name] FAIL: restart after crash did not re-hold in quarantine"; tail -20 "$W/new2.log"; RC=1
     else
         log "[$name] commit after crash-restart -- must converge and serve"
-        "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --commit >"$W/commit2.log" 2>&1 \
+        "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-log-commit >"$W/commit2.log" 2>&1 \
             || { echo "[$name] FAIL commit after crash"; tail -20 "$W/commit2.log"; RC=1; }
         "$BIN/pg_ctl" -D "$NEW" -l "$W/new3.log" -w -t 120 start >/dev/null 2>&1
         if [ $? -ne 0 ]; then echo "[$name] FAIL: did not come up after commit"; tail -20 "$W/new3.log"; RC=1

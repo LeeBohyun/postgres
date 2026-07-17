@@ -85,7 +85,7 @@ SQL
     echo "$st" | grep -qi quarantine || { echo "  FAIL: $OLDVER new cluster not quarantined after hold-start (got '$st')"; FAIL_LIST="$FAIL_LIST $OLDVER(nohold)"; FAILED=$((FAILED+1)); return; }
 
     # ---- commit -> live ----
-    "$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" --commit >"$W/commit_$P.log" 2>&1 \
+    "$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" --wal-log-commit >"$W/commit_$P.log" 2>&1 \
         || { echo "  FAIL: $OLDVER commit"; tail -15 "$W/commit_$P.log"; FAIL_LIST="$FAIL_LIST $OLDVER(commit)"; FAILED=$((FAILED+1)); return; }
 
     "$NEWBIN/pg_ctl" -D "$NEW" -l "$W/new_$P.log" -w start >/dev/null 2>&1 || { echo "  FAIL: $OLDVER start after commit"; tail -15 "$W/new_$P.log"; FAIL_LIST="$FAIL_LIST $OLDVER(newstart)"; FAILED=$((FAILED+1)); return; }
