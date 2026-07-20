@@ -3,23 +3,21 @@
  *
  *	LEE: revertable-upgrade lifecycle subcommands for --wal-log-upgrade.
  *
- *	A --wal-log-upgrade new cluster is held (DB_UPGRADE_QUARANTINED) after its
- *	window replays to XLOG_PG_UPGRADE_COMPLETE, instead of going live.  These
- *	subcommands are how the operator resolves that hold:
+ *	AUTO-SERVE model: a --wal-log-upgrade new cluster comes up read-write on its
+ *	first start, like upstream pg_upgrade -- there is NO quarantine hold and NO
+ *	commit step.  These subcommands cover the remaining lifecycle:
  *
- *	  --wal-log-commit     -D new   finalize: start new_dir (recovery goes live),
- *	                        verify it is up, THEN stamp old_dir superseded
- *	  --wal-log-rollback   -D new   discard the quarantined new_dir (old_dir untouched)
- *	  --wal-log-delete-old -d old   delete an old_dir that a commit has superseded
- *	  --wal-log-prepare-standby -D new   stamp a fresh skeleton to STREAM the window
+ *	  --wal-log-rollback   -D new [-d old]   discard new_dir and return to old_dir
+ *	                        (allowed while old_dir is intact; warns on data loss)
+ *	  --wal-log-delete-old -d old -D new     delete old_dir once new is a completed
+ *	                        upgrade (gated on new's pg_upgrade_complete.done)
+ *	  --wal-log-prepare-standby -D new   stage a fresh skeleton to STREAM the window
+ *	                        (fallback; a skeleton with primary_conninfo auto-fetches
+ *	                        the anchor on its own -- see ArmFromPrimaryAnchorIfConfigured)
  *	  --wal-log-signal-handoff  -d old   trigger streaming standbys to stand down
+ *	  --wal-log-commit     obsolete no-op (kept only to print a helpful message)
  *
  *	(cluster lifecycle state is available from pg_controldata; no --status flag.)
- *
- *	The old cluster is marked "superseded" by renaming its control file to
- *	pg_control.old (as stock disable_old_cluster() does): a durable, on-disk
- *	mark that (a) proves a commit completed and (b) stops the old vN binary
- *	from starting.  --wal-log-delete-old refuses unless it sees that mark.
  *
  *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/revertable.c
@@ -37,95 +35,20 @@
 #include "utils/pidfile.h"			/* LOCK_FILE_LINE_PORT / _SOCKET_DIR */
 #include "pg_upgrade.h"
 
-#define UPGRADE_COMMIT_SENTINEL "pg_upgrade_commit.signal"
-
 /*
  * Durable "the upgrade window fully replayed to COMPLETE" marker, written and
  * fsync'd by the XLOG_PG_UPGRADE_COMPLETE redo handler in the backend (see
- * UPGRADE_COMPLETE_MARKER in pgupgrade_wal.c).  A held cluster is
- * DB_UPGRADE_QUARANTINED whether or not its window reached COMPLETE, so this
- * file -- present only after a full replay -- is what lets --wal-log-commit refuse a
- * partial (crash-truncated) cluster.  Keep this string in sync with the backend.
+ * UPGRADE_COMPLETE_MARKER in pgupgrade_wal.c).  Present only after a full replay,
+ * so --wal-log-delete-old uses it to confirm the new cluster is a completed
+ * upgrade before removing the old one.  Keep this string in sync with the backend.
  */
 #define UPGRADE_COMPLETE_MARKER "pg_upgrade_complete.done"
 
 /*
- * Read the DB state recorded in a cluster's control file.  Fatals if the
- * control file cannot be read or its CRC is bad -- we must not act on a
- * cluster we cannot reliably identify.
- */
-static DBState
-read_db_state(const char *datadir)
-{
-	ControlFileData *cf;
-	bool		crc_ok;
-	DBState		state;
-
-	cf = get_controlfile(datadir, &crc_ok);
-	if (cf == NULL)
-		pg_fatal("could not read control file in \"%s\"", datadir);
-	if (!crc_ok)
-		pg_fatal("control file in \"%s\" has a bad CRC", datadir);
-
-	state = cf->state;
-	pg_free(cf);
-	return state;
-}
-
-/*
- * Run "pg_ctl <verb>" against a data directory; return true on success.
- *
- * Uses the NEW cluster's binaries (new_cluster.bindir): the lifecycle
- * subcommands only ever start/stop the NEW cluster (reconstructed at the new
- * major version), never the old one -- the old cluster is only ever renamed
- * (superseded stamp) or rm -rf'd, never started by us.  If a future op ever
- * needs to run pg_ctl against the old cluster it must pass the old bindir
- * explicitly rather than reuse this helper.
- *
- * We shell out via system() rather than reuse pg_upgrade's exec_prog() /
- * start_postmaster() on purpose: those carry upgrade-run-specific setup (output
- * dirs, IsBinaryUpgrade options, PGOPTIONS, atexit stop hooks) that does not
- * apply to a standalone lifecycle subcommand acting on an already-built cluster.
- * datadir/logfile come from -D/-d and an internal path, and are double-quoted;
- * pg_ctl's own -w handles wait semantics.
- */
-static bool
-run_pg_ctl(const char *verb, const char *datadir, const char *logfile)
-{
-	char		cmd[MAXPGPATH * 3];
-	int			rc;
-
-	if (logfile)
-		snprintf(cmd, sizeof(cmd),
-				 "\"%s/pg_ctl\" -w -D \"%s\" -l \"%s\" %s",
-				 new_cluster.bindir, datadir, logfile, verb);
-	else
-		snprintf(cmd, sizeof(cmd),
-				 "\"%s/pg_ctl\" -w -D \"%s\" %s",
-				 new_cluster.bindir, datadir, verb);
-
-	fflush(NULL);
-	rc = system(cmd);
-	return rc == 0;
-}
-
-/* Does old_dir carry the "superseded by commit" stamp? */
-static bool
-old_cluster_superseded(const char *old_datadir)
-{
-	char		path[MAXPGPATH];
-	struct stat st;
-
-	snprintf(path, sizeof(path), "%s/%s.old", old_datadir, XLOG_CONTROL_FILE);
-	return stat(path, &st) == 0;
-}
-
-/*
  * Did the new cluster's upgrade window fully replay to COMPLETE?  True iff the
- * durable marker the COMPLETE redo handler drops is present.  A held cluster is
- * DB_UPGRADE_QUARANTINED whether or not it reached COMPLETE, so this file is the
- * only thing that distinguishes a fully-upgraded held cluster (commit-able) from
- * a crash-truncated one (rollback-only).
+ * durable marker the COMPLETE redo handler drops is present.  --wal-log-delete-old
+ * uses this to confirm the new cluster is a completed upgrade before removing the
+ * old one (a crash-truncated cluster never wrote the marker).
  */
 static bool
 new_cluster_complete(const char *new_datadir)
@@ -138,122 +61,115 @@ new_cluster_complete(const char *new_datadir)
 }
 
 /*
- * --wal-log-commit: finalize a quarantined new cluster, then stamp old_dir superseded.
- *
- * STRICT ORDER (the stamp must be last): start new_dir so recovery finalizes
- * and it goes live, verify it is live, and ONLY THEN mark old_dir.  If new_dir
- * failed to come up, we must not stamp/disable old_dir, or the operator would
- * be left with no startable cluster.
+ * --wal-log-commit: OBSOLETE under auto-serve.  The new cluster comes up
+ * read-write on first start (there is no quarantine hold to release), so there
+ * is nothing to commit -- a cluster is adopted simply by starting it, and backed
+ * out with --wal-log-rollback (gated on old_dir integrity).  The option is kept
+ * only so an operator or script that still passes it gets a clear message rather
+ * than an "unknown option" error.
  */
 static void
 do_commit(void)
 {
-	char		sentinel[MAXPGPATH];
-	char		logfile[MAXPGPATH];
-	char		old_ctl[MAXPGPATH],
-				old_ctl_new[MAXPGPATH];
-	FILE	   *fp;
-
-	/*
-	 * Gate: you cannot commit a cluster whose upgrade has not been applied yet.
-	 * Committing means finalizing an already-reconstructed cluster, so the new
-	 * cluster must be HELD in quarantine -- i.e. it was started once, replayed
-	 * its upgrade window to COMPLETE, and is holding (DB_UPGRADE_QUARANTINED).
-	 * This is also the gate that confines --wal-log-commit to real --wal-log-upgrade
-	 * clusters: no ordinary cluster is ever in this state, so --wal-log-commit refuses a
-	 * random -D.  (A never-started cluster is still pending -- start it first.)
-	 */
-	if (read_db_state(new_cluster.pgdata) != DB_UPGRADE_QUARANTINED)
-		pg_fatal("new cluster \"%s\" is not held in pg_upgrade quarantine\n"
-				 "Start it once so it reconstructs and holds, then commit; "
-				 "or this is not a --wal-log-upgrade cluster.",
-				 new_cluster.pgdata);
-
-	/*
-	 * Completeness gate: refuse to finalize a held cluster whose upgrade window
-	 * did not fully replay to COMPLETE.  The quarantine hold fires for a partial
-	 * (crash-truncated) window too, so the state check above is not enough --
-	 * only the durable COMPLETE marker proves the reconstruction is whole.  A
-	 * partial cluster is clean but incomplete; it must be discarded with
-	 * --wal-log-rollback (or, once streaming-resume lands, have the rest of its window
-	 * delivered) -- never committed as-is.
-	 */
-	if (!new_cluster_complete(new_cluster.pgdata))
-		pg_fatal("new cluster \"%s\" is held but its upgrade did not fully replay "
-				 "(no \"%s\")\n"
-				 "This is a partial/crash-truncated upgrade; discard it with "
-				 "\"pg_upgrade --wal-log-rollback\".  The old cluster is untouched.",
-				 new_cluster.pgdata, UPGRADE_COMPLETE_MARKER);
-
-	/* Drop the commit sentinel so startup finalizes instead of re-holding. */
-	snprintf(sentinel, sizeof(sentinel), "%s/%s", new_cluster.pgdata,
-			 UPGRADE_COMMIT_SENTINEL);
-	fp = fopen(sentinel, "w");
-	if (fp == NULL)
-		pg_fatal("could not create commit sentinel \"%s\": %m", sentinel);
-	fclose(fp);
-
-	/* Start the new cluster: recovery replays to COMPLETE and finalizes. */
-	snprintf(logfile, sizeof(logfile), "%s/pg_upgrade_commit.log",
-			 new_cluster.pgdata);
-	prep_status("Committing: starting new cluster to finalize recovery");
-	if (!run_pg_ctl("start", new_cluster.pgdata, logfile))
-	{
-		/* leave old_dir untouched; the commit did not take */
-		(void) unlink(sentinel);
-		pg_fatal("could not start new cluster to finalize commit; "
-				 "old cluster is untouched (see \"%s\")", logfile);
-	}
-	check_ok();
-
-	/* Verify the finalized cluster is actually live. */
-	if (read_db_state(new_cluster.pgdata) != DB_IN_PRODUCTION)
-	{
-		run_pg_ctl("stop", new_cluster.pgdata, NULL);
-		pg_fatal("new cluster did not reach production state after commit; "
-				 "old cluster is untouched");
-	}
-
-	/* Stop it again; the operator restarts it as the live cluster. */
-	run_pg_ctl("stop", new_cluster.pgdata, NULL);
-
-	/*
-	 * New cluster is verified live -> NOW stamp old_dir superseded (rename its
-	 * control file).  This is the point of no return (C4).
-	 */
-	if (old_cluster.pgdata != NULL && old_cluster.pgdata[0] != '\0')
-	{
-		snprintf(old_ctl, sizeof(old_ctl), "%s/%s",
-				 old_cluster.pgdata, XLOG_CONTROL_FILE);
-		snprintf(old_ctl_new, sizeof(old_ctl_new), "%s/%s.old",
-				 old_cluster.pgdata, XLOG_CONTROL_FILE);
-		prep_status("Marking old cluster as superseded");
-		if (rename(old_ctl, old_ctl_new) != 0)
-			pg_log(PG_WARNING,
-				   "commit succeeded but could not stamp old cluster \"%s\": %m",
-				   old_cluster.pgdata);
-		else
-			check_ok();
-	}
-
-	pg_log(PG_REPORT, "\nCommit complete.  The new cluster is now the live cluster.");
-	pg_log(PG_REPORT, "Start it with: pg_ctl -D \"%s\" start", new_cluster.pgdata);
-	if (old_cluster.pgdata != NULL && old_cluster.pgdata[0] != '\0')
-		pg_log(PG_REPORT, "The old cluster at \"%s\" is superseded; remove it with \"pg_upgrade --wal-log-delete-old -d %s\".",
-			   old_cluster.pgdata, old_cluster.pgdata);
+	pg_log(PG_REPORT,
+		   "--wal-log-commit is no longer required: the new cluster auto-serves "
+		   "on first start.  Just start it to adopt the upgrade; use "
+		   "\"pg_upgrade --wal-log-rollback\" to back out while the old cluster "
+		   "is intact.");
 }
 
 /*
- * --wal-log-rollback: discard a quarantined new cluster.  old_dir was never touched.
+ * Is old_dir a usable pre-upgrade cluster to roll back to?  Auto-serve (no
+ * quarantine hold) means rollback is no longer gated on "before first write";
+ * it is gated on old_dir being INTACT.  We check the ACTUAL state of old_dir
+ * (its control file reads as a cleanly shut-down cluster), not which transfer
+ * mode was used: on this branch --wal-log-upgrade keeps the old cluster's files
+ * intact for every allowed mode (copy AND link -- the primary is not demolished;
+ * old-cluster deletion is a separate deferred step, and --swap is rejected at
+ * parse time).  If old_dir is instead damaged, missing, or was already started
+ * post-upgrade, refuse and point at PITR rather than start something unsound.
+ */
+static bool
+old_cluster_intact(const char *old_datadir)
+{
+	ControlFileData *cf;
+	bool		crc_ok;
+	bool		ok;
+
+	cf = get_controlfile(old_datadir, &crc_ok);
+	if (cf == NULL || !crc_ok)
+	{
+		if (cf)
+			pg_free(cf);
+		return false;
+	}
+
+	/*
+	 * A cleanly shut-down old cluster is DB_SHUTDOWNED (or _IN_RECOVERY for a
+	 * standby).  Anything else -- in production, in recovery mid-crash, or the
+	 * commit "superseded" stamp -- means it is not a safe rollback target.
+	 */
+	ok = (cf->state == DB_SHUTDOWNED ||
+		  cf->state == DB_SHUTDOWNED_IN_RECOVERY);
+	pg_free(cf);
+	return ok;
+}
+
+/*
+ * --wal-log-rollback: discard the new cluster and return to the old one.
+ *
+ * Auto-serve model: the new cluster may already be live and have taken writes.
+ * Rollback is allowed as long as old_dir is intact; if the new cluster diverged,
+ * those writes are permanently lost (a warning, not an error).  If old_dir is
+ * NOT intact (--link/--swap, or damaged), refuse and point at PITR.
  */
 static void
 do_rollback(void)
 {
-	DBState		state = read_db_state(new_cluster.pgdata);
+	/*
+	 * Guard: -D must be given and be a real data directory before we rm -rf it.
+	 * We do NOT require the COMPLETE marker here: a crash-truncated (partial)
+	 * upgrade is precisely a case that needs rolling back, and it never wrote
+	 * COMPLETE.  The real safety net is that we only return to old_dir if old_dir
+	 * itself is intact (checked next); discarding new_dir is the operator's
+	 * explicit intent.
+	 */
+	{
+		char		verfile[MAXPGPATH];
+		struct stat st;
 
-	if (state != DB_UPGRADE_QUARANTINED)
-		pg_fatal("new cluster \"%s\" is not held in pg_upgrade quarantine "
-				 "(refusing to roll back)", new_cluster.pgdata);
+		if (new_cluster.pgdata == NULL || new_cluster.pgdata[0] == '\0')
+			pg_fatal("--wal-log-rollback requires the new cluster data directory (-D)");
+		snprintf(verfile, sizeof(verfile), "%s/PG_VERSION", new_cluster.pgdata);
+		if (stat(verfile, &st) != 0)
+			pg_fatal("\"%s\" is not a PostgreSQL data directory (no PG_VERSION); "
+					 "refusing to roll back", new_cluster.pgdata);
+	}
+
+	/*
+	 * Hard precondition: old_dir must be a valid, cleanly shut-down pre-upgrade
+	 * cluster to return to.  If its control file is missing or unreadable (e.g.
+	 * it was started after the upgrade, or damaged), there is nothing safe to
+	 * start -- the only recovery is a backup/PITR restore.
+	 */
+	if (!old_cluster_intact(old_cluster.pgdata))
+		pg_fatal("cannot roll back: the old cluster \"%s\" is not intact\n"
+				 "Its control file is missing or does not read as a cleanly "
+				 "shut-down cluster (e.g. it was started after the upgrade, or "
+				 "damaged).  Restore from a backup / PITR instead.",
+				 old_cluster.pgdata);
+
+	/*
+	 * Rolling back discards the new cluster wholesale.  If it was ever started
+	 * after the upgrade it may have taken writes, and those are lost -- we cannot
+	 * cheaply prove it took none, so warn unconditionally.  This is sound (old_dir
+	 * is frozen, C5), just lossy.
+	 */
+	pg_log(PG_REPORT,
+		   "WARNING: discarding the new cluster \"%s\".  Any changes made to it "
+		   "after the upgrade (if it was started) are permanently lost.  The old "
+		   "cluster is unaffected.",
+		   new_cluster.pgdata);
 
 	prep_status("Rolling back: discarding new cluster \"%s\"", new_cluster.pgdata);
 	if (!rmtree(new_cluster.pgdata, true))
@@ -261,7 +177,8 @@ do_rollback(void)
 	check_ok();
 
 	pg_log(PG_REPORT, "\nRollback complete.  The new cluster was discarded.");
-	pg_log(PG_REPORT, "The old cluster is untouched; start it with your original binary.");
+	pg_log(PG_REPORT, "The old cluster at \"%s\" is intact; start it with your original binary.",
+		   old_cluster.pgdata);
 }
 
 /*
@@ -416,9 +333,23 @@ do_delete_old(void)
 	if (old_cluster.pgdata == NULL || old_cluster.pgdata[0] == '\0')
 		pg_fatal("--wal-log-delete-old requires the old cluster data directory (-d)");
 
-	if (!old_cluster_superseded(old_cluster.pgdata))
-		pg_fatal("old cluster \"%s\" has not been superseded by a committed upgrade; "
-				 "refusing to delete", old_cluster.pgdata);
+	/*
+	 * LEE (2026-07-20, auto-serve): the old gate required a "superseded by
+	 * commit" stamp (pg_control.old) that --wal-log-commit wrote.  Commit is gone,
+	 * so nothing stamps it; the safety check is now that the operator has actually
+	 * adopted a new cluster.  Require -D to point at a valid, fully-upgraded new
+	 * cluster (its COMPLETE marker is present) before removing the old one.  This
+	 * prevents deleting the old cluster when there is no usable replacement (which
+	 * would leave the operator with nothing to fall back to and no upgraded
+	 * cluster).  Running --wal-log-delete-old is itself the adoption confirmation.
+	 */
+	if (new_cluster.pgdata == NULL || new_cluster.pgdata[0] == '\0')
+		pg_fatal("--wal-log-delete-old requires the new cluster data directory (-D) "
+				 "to confirm an upgraded cluster exists before deleting the old one");
+	if (!new_cluster_complete(new_cluster.pgdata))
+		pg_fatal("new cluster \"%s\" is not a completed --wal-log-upgrade cluster "
+				 "(no \"%s\"); refusing to delete the old cluster",
+				 new_cluster.pgdata, UPGRADE_COMPLETE_MARKER);
 
 	if (delete_authorized_by_signal(new_cluster.pgdata))
 		pg_log(PG_REPORT,
@@ -637,7 +568,7 @@ do_prepare_standby(void)
 	res = executeQueryOrDie(conn, "SELECT pg_upgrade_window_anchor()");
 	if (PQgetisnull(res, 0, 0))
 		pg_fatal("the primary is not retaining a pg_upgrade window "
-				 "(no anchor); is it a committed --wal-log-upgrade primary that "
+				 "(no anchor); is it a live --wal-log-upgrade primary that "
 				 "has not yet run --wal-log-delete-old?");
 	anchor = pg_strdup(PQgetvalue(res, 0, 0));
 	PQclear(res);

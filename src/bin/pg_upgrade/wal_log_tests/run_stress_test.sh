@@ -107,12 +107,9 @@ cat >> "$NEW/postgresql.conf" <<CONF
 unix_socket_directories='$WORK'
 port=$PORT
 CONF
-# --wal-log-upgrade holds the new cluster in quarantine; commit to adopt it.
-    # Hold-start: first start applies the WAL window, reconstructs, and holds
-    # in quarantine (pg_ctl returns non-zero by design as it exits at the hold).
-    "$BIN/pg_ctl" -D "$NEW" -l "$WORK/hold.log" -w start >/dev/null 2>&1 || true
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-log-commit > "$WORK/commit.log" 2>&1 \
-    || { echo FAIL commit; tail -20 "$WORK/commit.log"; exit 1; }
+# --wal-log-upgrade auto-serves the new cluster: the first start applies the WAL
+# window, reconstructs, and comes up read-write -- no quarantine hold, no
+# --wal-log-commit.
 log "start new cluster (triggers WAL-replay recovery of ~${GB}GB + >1GB catalog)"
 t0=$SECONDS
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w -t 900 start >/dev/null 2>&1 || { echo FAIL start new; tail -40 "$WORK/new.log"; exit 1; }

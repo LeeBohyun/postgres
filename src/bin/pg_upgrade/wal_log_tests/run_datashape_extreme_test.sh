@@ -12,7 +12,7 @@
 #   B4. Many tiny relations that straddle the RELFILE max-payload BATCH boundary
 #       (hundreds of 0-8KB relfiles) -- exercises the batch-flush cut points.
 #
-# All reconstructed from WAL (disk wiped), then committed and verified.
+# All reconstructed from WAL (disk wiped), then auto-served and verified.
 #
 set -u
 BIN="${PGBIN:?set PGBIN}"
@@ -87,11 +87,10 @@ log "base/ bytes on disk after upgrade (should be 0): $TOTAL_BASE"
 [ "${TOTAL_BASE:-0}" = "0" ] || fail "data not wiped ($TOTAL_BASE) -- replay unproven"
 
 echo "unix_socket_directories='$W'">>"$W/new/postgresql.conf"; echo "port=$PORT">>"$W/new/postgresql.conf"
-log "hold-start (reconstruct + hold), then commit"
-"$BIN/pg_ctl" -D "$W/new" -l "$W/hold.log" -w -t 600 start >/dev/null 2>&1 || true
-"$BIN/pg_controldata" -D "$W/new" | grep -qi quarantine || fail "new not quarantined after hold-start"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new" --wal-log-commit >"$W/commit.log" 2>&1 || { cat "$W/commit.log"; fail "commit"; }
-"$BIN/pg_ctl" -D "$W/new" -l "$W/new.log" -w -t 600 start >/dev/null 2>&1 || { tail -30 "$W/new.log"; fail "start after commit"; }
+log "start (auto-serves: reconstruct from WAL, then come up read-write)"
+# --wal-log-upgrade auto-serves: the first start applies the WAL window,
+# reconstructs, and comes up read-write -- no quarantine hold, no --wal-log-commit.
+"$BIN/pg_ctl" -D "$W/new" -l "$W/new.log" -w -t 600 start >/dev/null 2>&1 || { tail -30 "$W/new.log"; fail "start"; }
 
 log "verify each data shape survived"
 FAIL=0

@@ -401,14 +401,15 @@ main(int argc, char **argv)
 		PQclear(executeQueryOrDie(conn, "SELECT pg_switch_wal()"));
 
 		/*
-		 * LEE: arm the quarantine hold.  This sets a flag so the CLEAN shutdown
-		 * below records DB_UPGRADE_QUARANTINED on its shutdown checkpoint (atomic
-		 * with the checkpoint, which is past COMPLETE).  Must be done on the still-
-		 * running server, immediately before the shutdown, so it is the last
-		 * durable control-file write.  new_dir then refuses to serve on start until
-		 * "pg_upgrade --wal-log-commit" releases the hold.
+		 * LEE (2026-07-20, auto-serve): the quarantine hold is REMOVED.  We used
+		 * to call pg_arm_upgrade_quarantine() here so the shutdown checkpoint
+		 * recorded DB_UPGRADE_QUARANTINED and the primary refused to serve until
+		 * "pg_upgrade --wal-log-commit".  The primary now comes up read-write on
+		 * first start, like upstream pg_upgrade: its control checkpoint lands past
+		 * COMPLETE, so PerformWalUpgradeIfNeeded()'s "already applied" guard makes
+		 * it skip the window and serve.  Rollback is a frontend operation gated on
+		 * old_dir integrity ("pg_upgrade --wal-log-rollback"), not a startup hold.
 		 */
-		PQclear(executeQueryOrDie(conn, "SELECT pg_arm_upgrade_quarantine()"));
 		PQfinish(conn);
 
 		/*

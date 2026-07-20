@@ -122,15 +122,11 @@ echo "  skeleton sysid=$SKEL_SYSID  burst sysid=$WAL_SYSID (DIFFERENT; adopted i
 rm -f "$T/pg_wal"/[0-9A-F]* 2>/dev/null
 cp "$L/new/pg_wal"/[0-9A-F]* "$T/pg_wal/" 2>/dev/null || true
 
-log "hold-start target -> replay the upgrade purely from WAL, then commit"
-# Give the target its socket/port config, then hold-start it: the first start
-# applies the WAL window (reconstruct), and holds in quarantine (pg_ctl exits
-# non-zero by design).  Then --wal-log-commit adopts the held target (fresh skeleton,
-# no old cluster, so no -d/old-dir stamping).
+log "start target -> replay the upgrade purely from WAL, then auto-serve"
+# Give the target its socket/port config, then start it: the first start applies
+# the WAL window (reconstruct) and auto-serves the cluster read-write -- no
+# quarantine hold, no --wal-log-commit.
 echo "port=55542">>"$T/postgresql.conf"; echo "unix_socket_directories='$W'">>"$T/postgresql.conf"
-"$BIN/pg_ctl" -D "$T" -l "$W/target_hold.log" -w start >/dev/null 2>&1 || true
-"$BIN/pg_upgrade" -B "$BIN" -D "$T" --wal-log-commit >"$W/target_commit.log" 2>&1 \
-  || { echo "TARGET COMMIT FAILED"; tail -20 "$W/target_commit.log"; exit 1; }
 
 log "start target -> serve the WAL-reconstructed cluster"
 TGT_FP=$(fingerprint "$T" 55542)

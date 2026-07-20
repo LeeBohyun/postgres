@@ -47,7 +47,7 @@ SQL
 OLD_FP=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t) FROM t")
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-log "2. upgrade the primary (--wal-log-upgrade), hold, COMMIT -> live; slot retains the window"
+log "2. upgrade the primary (--wal-log-upgrade), auto-serve -> live; slot retains the window"
 cd "$W"
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -20 "$W/up.log"; exit 1; }
@@ -60,10 +60,8 @@ listen_addresses='localhost'
 CONF
 echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
 echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
-# hold-start (applies window, holds; pg_ctl exits non-zero by design), then commit
-"$BIN/pg_ctl" -D "$NEW" -l "$W/new_hold.log" -w start >/dev/null 2>&1 || true
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --wal-log-commit >"$W/commit.log" 2>&1 \
-    || { echo "FAIL commit"; tail -20 "$W/commit.log"; exit 1; }
+# Auto-serve: the primary comes up read-write on first start (no --wal-log-commit).
+# The retention slot keeps the upgrade window streamable for the standby.
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/new.log"; exit 1; }
 NEW_FP=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t) FROM t")
 NEW_ID=$("$BIN/pg_controldata" -D "$NEW" | grep -i 'system identifier' | grep -oE '[0-9]+')

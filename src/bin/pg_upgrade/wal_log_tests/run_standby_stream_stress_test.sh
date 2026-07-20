@@ -126,9 +126,7 @@ listen_addresses='localhost'
 CONF
   echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
   echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
-  "$BIN/pg_ctl" -D "$NEW" -l "$W/new_hold.log" -w start >/dev/null 2>&1 || true
-  "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --wal-log-commit >"$W/commit.log" 2>&1 \
-    || { echo "FAIL: $shape commit"; tail -12 "$W/commit.log"; GRC=1; cd /; continue; }
+  # Auto-serve: the primary comes up read-write on first start (no --wal-log-commit).
   "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL: $shape new start"; tail "$W/new.log"; GRC=1; cd /; continue; }
   for d in $("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('template0','template1')" 2>/dev/null); do
     "$BIN/psql" -h "$W" -p $PP -U postgres -d "$d" -qc "ANALYZE" >/dev/null 2>&1

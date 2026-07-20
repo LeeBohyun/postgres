@@ -52,12 +52,14 @@ unix_socket_directories='$W'
 hot_standby=on
 CONF
 
-# The upgrade replay happens on the HOLD-START (first start): it reconstructs the
-# cluster and holds in quarantine (dark), so no connection may observe a
-# half-upgraded cluster during it.  Hammer connections THROUGH that hold-start --
-# every probe must either be cleanly rejected (recovering / not accepting) or,
-# once held, refused; never a partial count.  pg_ctl exits non-zero at the hold.
-log "hammer connections while the new cluster replays the upgrade (hold-start)"
+# The upgrade replay happens on the FIRST start: --wal-log-upgrade now auto-serves,
+# so the single start reconstructs the cluster from WAL and comes up read-write --
+# no quarantine hold, no --wal-log-commit.  During that reconstruction the cluster
+# is in crash recovery (dark), so no connection may observe a half-upgraded
+# cluster.  Hammer connections THROUGH the auto-serving start -- every probe must
+# either be cleanly rejected (recovering / not accepting) or return the correct
+# final count once the cluster is live; never a partial count.
+log "hammer connections while the new cluster replays the upgrade (auto-serve start)"
 PROBE="$W/probe.out"; : > "$PROBE"
 (
   for i in $(seq 1 400); do
@@ -66,16 +68,11 @@ PROBE="$W/probe.out"; : > "$PROBE"
   done
 ) > "$PROBE" 2>&1 &
 PROBEPID=$!
-"$BIN/pg_ctl" -D "$N" -l "$W/n.log" -w start >/dev/null 2>&1 || true
-wait $PROBEPID 2>/dev/null
-
-# Now adopt the held cluster and bring it live for the final consistency check.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" --wal-log-commit > "$W/commit.log" 2>&1 \
-    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 "$BIN/pg_ctl" -D "$N" -l "$W/n.log" -w start >/dev/null 2>&1
 STARTRC=$?
+wait $PROBEPID 2>/dev/null
 "$BIN/pg_ctl" -D "$N" -w stop >/dev/null 2>&1
-[ $STARTRC -eq 0 ] || { echo "FAIL: new cluster did not start after commit"; tail -15 "$W/n.log"; exit 1; }
+[ $STARTRC -eq 0 ] || { echo "FAIL: new cluster did not auto-serve on first start"; tail -15 "$W/n.log"; exit 1; }
 
 log "analyze probe results"
 # Every outcome is one of:

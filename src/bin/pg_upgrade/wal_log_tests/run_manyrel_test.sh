@@ -106,19 +106,14 @@ TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]
 log "base/ data-file bytes on disk after pg_upgrade (should be 0 = wiped): $TOTAL_BASE"
 [ "${TOTAL_BASE:-0}" = "0" ] || { echo "FAIL: data not wiped ($TOTAL_BASE) -- replay unproven"; exit 1; }
 
-# --wal-log-upgrade holds the new cluster in quarantine.  Commit AFTER the
-# disk-wiped assertion above (commit replays the window and reconstructs the
-# data files on disk, so checking the wipe post-commit would wrongly see data).
+# --wal-log-upgrade auto-serves: the new cluster comes up read-write on the
+# first start (no quarantine hold, no commit).  The disk-wiped assertion above
+# ran before first start, so it still reflects the wipe.
 cat >> "$NEW/postgresql.conf" <<CONF
 unix_socket_directories='$W'
 port=$P
 max_connections=200
 CONF
-# Hold-start: first start applies the WAL window, reconstructs, and holds
-# in quarantine (pg_ctl returns non-zero by design as it exits at the hold).
-"$BIN/pg_ctl" -D "$NEW" -l "$W/hold.log" -w start >/dev/null 2>&1 || true
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-log-commit > "$W/commit.log" 2>&1 \
-    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
 log "start new cluster (WAL replay)"
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w -t 300 start >/dev/null 2>&1 || { echo FAIL start new; tail -30 "$W/new.log"; exit 1; }
 NEW_FP=$(data_fp)

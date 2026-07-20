@@ -30,14 +30,8 @@ run_upgrade() { # $1=variant  $2=extraflag
   cd "$D"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$D/old" -D "$D/new" -U postgres --initdb $FLAG --copy >"$D/up.log" 2>&1 \
     || { echo "$V UPGRADE FAILED"; tail -8 "$D/up.log"; exit 1; }
   echo "unix_socket_directories='$W'">>$D/new/postgresql.conf; echo "port=$P">>$D/new/postgresql.conf; echo "autovacuum=off">>$D/new/postgresql.conf
-  # --wal-log-upgrade now holds the new cluster in quarantine; commit to adopt it.
-  case "$FLAG" in *wal-log-upgrade*)
-    # Hold-start: first start applies the WAL window, reconstructs, and holds
-    # in quarantine (pg_ctl returns non-zero by design as it exits at the hold).
-    "$BIN/pg_ctl" -D "$D/new" -l "$D/hold.log" -w start >/dev/null 2>&1 || true
-    "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$D/old" -D "$D/new" --wal-log-commit >"$D/commit.log" 2>&1 \
-      || { echo "$V COMMIT FAILED"; tail -8 "$D/commit.log"; exit 1; } ;;
-  esac
+  # --wal-log-upgrade now auto-serves: the new cluster comes up read-write on the
+  # first start, exactly like upstream pg_upgrade (no quarantine hold, no commit).
   # start + clean stop so both go through an identical startup/shutdown cycle
   PGPORT=$P "$BIN/pg_ctl" -D "$D/new" -l "$D/new.log" -w start >/dev/null 2>&1 || { echo "$V START FAILED"; tail -20 "$D/new.log"; exit 1; }
   PGPORT=$P "$BIN/pg_ctl" -D "$D/new" -w stop >/dev/null 2>&1

@@ -38,7 +38,7 @@ seed() {
 
 # ---- revertable modes: copy, clone, link ----
 for MODE in copy clone link; do
-  log "MODE --$MODE : upgrade -> hold -> rollback restores old; then upgrade -> commit"
+  log "MODE --$MODE : upgrade -> rollback restores old; then upgrade -> auto-serve"
   OLD=$W/${MODE}_old NEW=$W/${MODE}_new
   seed "$OLD" || { echo "FAIL: seed --$MODE"; FAIL=1; continue; }
 
@@ -46,16 +46,23 @@ for MODE in copy clone link; do
   "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --$MODE >"$W/${MODE}_up.log" 2>&1
   if [ $? -ne 0 ]; then echo "FAIL: --$MODE upgrade"; tail -8 "$W/${MODE}_up.log"; FAIL=1; cd /; continue; fi
 
-  # old cluster must stay INTACT through the upgrade (disable deferred to commit)
+  # old cluster must stay INTACT through the upgrade (nothing disables it now --
+  # only --wal-log-delete-old does, explicitly, later)
   [ -f "$OLD/global/pg_control" ] || { echo "FAIL: --$MODE disabled old cluster during upgrade (not revertable)"; FAIL=1; }
 
+  # After upgrade the new cluster is a normal "shut down" cluster (auto-serve),
+  # NOT quarantined.
   { echo "unix_socket_directories='$W'"; echo "port=$P"; } >> "$NEW/postgresql.conf"
-  "$BIN/pg_ctl" -D "$NEW" -l "$W/${MODE}_hold.log" -w -t 40 start >/dev/null 2>&1 || true
   ST=$("$BIN/pg_controldata" -D "$NEW" | grep -i "cluster state" | sed 's/.*: *//')
-  case "$ST" in *quarantine*) : ;; *) echo "FAIL: --$MODE did not hold in quarantine (state='$ST')"; FAIL=1;; esac
+  case "$ST" in *quarantine*) echo "FAIL: --$MODE quarantined; auto-serve expected (state='$ST')"; FAIL=1;; esac
 
-  # ROLLBACK: new discarded, old restored + startable with data
-  "$BIN/pg_upgrade" -D "$NEW" --wal-log-rollback >"$W/${MODE}_rb.log" 2>&1 || { echo "FAIL: --$MODE rollback"; cat "$W/${MODE}_rb.log"; FAIL=1; }
+  # ROLLBACK before starting new.  On this branch --wal-log-upgrade keeps the old
+  # cluster's files INTACT for every allowed transfer mode (the primary is not
+  # demolished; old-cluster deletion is a separate, deferred step).  copy and link
+  # therefore both leave old_dir intact, so rollback SUCCEEDS and restores it.
+  # (--swap is rejected at parse time, tested separately below.)
+  "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-log-rollback >"$W/${MODE}_rb.log" 2>&1 \
+    || { echo "FAIL: --$MODE rollback should succeed (old_dir intact on this branch)"; cat "$W/${MODE}_rb.log"; FAIL=1; }
   [ -d "$NEW" ] && { echo "FAIL: --$MODE rollback left new_dir"; FAIL=1; }
   "$BIN/pg_ctl" -D "$OLD" -l "$W/${MODE}_old2.log" -w -t 20 start >/dev/null 2>&1
   ROWS=$("$BIN/psql" -h "$W" -p $P -U postgres -tAc "SELECT count(*) FROM t" 2>&1 | head -1)
@@ -63,21 +70,17 @@ for MODE in copy clone link; do
   [ "$ROWS" = 500 ] && log "  --$MODE rollback: old cluster intact (500 rows)" \
                     || { echo "FAIL: --$MODE old cluster not intact after rollback (rows=$ROWS)"; FAIL=1; }
 
-  # Now COMMIT a fresh upgrade of the same old cluster.
+  # Now ADOPT a fresh upgrade of the same old cluster by simply starting it.
   rm -rf "$NEW"
   "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --$MODE >"$W/${MODE}_up2.log" 2>&1 \
     || { echo "FAIL: --$MODE re-upgrade"; tail -8 "$W/${MODE}_up2.log"; FAIL=1; cd /; continue; }
   { echo "unix_socket_directories='$W'"; echo "port=$P"; } >> "$NEW/postgresql.conf"
-  "$BIN/pg_ctl" -D "$NEW" -l "$W/${MODE}_hold2.log" -w -t 40 start >/dev/null 2>&1 || true
-  "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --wal-log-commit >"$W/${MODE}_commit.log" 2>&1 \
-    || { echo "FAIL: --$MODE commit"; tail -8 "$W/${MODE}_commit.log"; FAIL=1; }
-  # commit must have disabled the old cluster (deferred disable happens here)
-  [ -f "$OLD/global/pg_control.old" ] || { echo "FAIL: --$MODE commit did not disable old cluster"; FAIL=1; }
-  "$BIN/pg_ctl" -D "$NEW" -l "$W/${MODE}_new.log" -w -t 20 start >/dev/null 2>&1
+  "$BIN/pg_ctl" -D "$NEW" -l "$W/${MODE}_new.log" -w -t 40 start >/dev/null 2>&1 \
+    || { echo "FAIL: --$MODE new cluster did not auto-serve"; tail -8 "$W/${MODE}_new.log"; FAIL=1; cd /; continue; }
   CROWS=$("$BIN/psql" -h "$W" -p $P -U postgres -tAc "SELECT count(*) FROM t" 2>&1 | head -1)
   "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
-  [ "$CROWS" = 500 ] && log "  --$MODE commit: new cluster serves upgraded data (500 rows); old disabled" \
-                     || { echo "FAIL: --$MODE committed cluster wrong data (rows=$CROWS)"; FAIL=1; }
+  [ "$CROWS" = 500 ] && log "  --$MODE auto-serve: new cluster serves upgraded data (500 rows)" \
+                     || { echo "FAIL: --$MODE auto-served cluster wrong data (rows=$CROWS)"; FAIL=1; }
   cd /
 done
 

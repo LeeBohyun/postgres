@@ -53,6 +53,7 @@
 
 #include "access/timeline.h"
 #include "access/transam.h"
+#include "access/pgupgrade_wal.h"
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
@@ -292,6 +293,7 @@ static void XLogSendLogical(void);
 pg_noreturn static void WalSndDoneImmediate(void);
 static void WalSndDone(WalSndSendDataCallback send_data);
 static void IdentifySystem(void);
+static void PgUpgradeWindowAnchor(void);
 static void UploadManifest(void);
 static bool HandleUploadManifestPacket(StringInfo buf, off_t *offset,
 									   IncrementalBackupInfo *ib);
@@ -503,6 +505,66 @@ IdentifySystem(void)
 	/* send it to dest */
 	do_tup_output(tstate, values, nulls);
 
+	end_tup_output(tstate);
+}
+
+/*
+ * Handle the PG_UPGRADE_WINDOW_ANCHOR command.
+ *
+ * LEE: reply with the --wal-log-upgrade window anchor retained on this live
+ * upgraded primary, so a fresh vN+1 standby skeleton can arm its control file at
+ * CN and stream the window -- without the operator running "pg_upgrade
+ * --wal-log-prepare-standby".  One row, one text column "anchor" =
+ * "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>" (the same string pg_upgrade_window_anchor()
+ * returns).  The standby learns sysid + TLI from IDENTIFY_SYSTEM separately.  The
+ * column is NULL if this primary retains no upgrade window (not an upgrade
+ * primary, or the window was already released by --wal-log-delete-old).
+ */
+static void
+PgUpgradeWindowAnchor(void)
+{
+	char		wal_dir[MAXPGPATH];
+	bool		found_start = false;
+	bool		found_complete = false;
+	CheckPoint	cn;
+	XLogRecPtr	cn_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	complete_lsn = InvalidXLogRecPtr;
+	uint64		wal_sysid = 0;
+	DestReceiver *dest;
+	TupOutputState *tstate;
+	TupleDesc	tupdesc;
+	Datum		values[1];
+	bool		nulls[1] = {0};
+
+	snprintf(wal_dir, sizeof(wal_dir), XLOGDIR);
+
+	dest = CreateDestReceiver(DestRemoteSimple);
+
+	tupdesc = CreateTemplateTupleDesc(1);
+	TupleDescInitBuiltinEntry(tupdesc, (AttrNumber) 1, "anchor",
+							  TEXTOID, -1, 0);
+	TupleDescFinalize(tupdesc);
+
+	tstate = begin_tup_output_tupdesc(dest, tupdesc, &TTSOpsVirtual);
+
+	if (!upgrade_wal_scan_markers(wal_dir, &found_start, &found_complete,
+								  &cn, &cn_lsn, &complete_lsn, &wal_sysid) ||
+		!found_start ||
+		XLogRecPtrIsInvalid(cn_lsn))
+	{
+		/* no retained upgrade window here */
+		nulls[0] = true;
+	}
+	else
+	{
+		char	   *anchor = psprintf("%X/%08X/%X/%08X",
+									  LSN_FORMAT_ARGS(cn_lsn),
+									  LSN_FORMAT_ARGS(cn.redo));
+
+		values[0] = CStringGetTextDatum(anchor);
+	}
+
+	do_tup_output(tstate, values, nulls);
 	end_tup_output(tstate);
 }
 
@@ -2222,6 +2284,13 @@ exec_replication_command(const char *cmd_string)
 			cmdtag = "IDENTIFY_SYSTEM";
 			set_ps_display(cmdtag);
 			IdentifySystem();
+			EndReplicationCommand(cmdtag);
+			break;
+
+		case T_PgUpgradeWindowAnchorCmd:
+			cmdtag = "PG_UPGRADE_WINDOW_ANCHOR";
+			set_ps_display(cmdtag);
+			PgUpgradeWindowAnchor();
 			EndReplicationCommand(cmdtag);
 			break;
 

@@ -8,10 +8,11 @@
 # available old major to the current NEW (20devel) via --wal-log-upgrade and
 # asserts, for each pair, that:
 #   * pg_upgrade succeeds,
-#   * the new cluster HOLDS in quarantine on first start (then commits),
+#   * the new cluster auto-serves read-write on first start (no quarantine hold,
+#     no --wal-log-commit),
 #   * the catalog version actually changed old->new (a real cross-version jump),
 #   * the data matches after the WAL-replay reconstruction, and
-#   * the committed cluster is writable.
+#   * the served cluster is writable.
 #
 # Why every pair targets 20devel (not e.g. 16->18): this feature is developed for
 # upstream, i.e. against master (currently 20devel), and that is where it will
@@ -91,16 +92,11 @@ SQL
 
     echo "unix_socket_directories='$W'">>"$NEW/postgresql.conf"; echo "port=$P">>"$NEW/postgresql.conf"
 
-    # ---- hold-start: reconstruct + hold (pg_ctl exits non-zero at the hold) ----
-    "$NEWBIN/pg_ctl" -D "$NEW" -l "$W/hold_$P.log" -w start >/dev/null 2>&1 || true
-    local st; st=$("$NEWBIN/pg_controldata" -D "$NEW" | grep -i 'cluster state' | sed 's/.*: *//')
-    echo "$st" | grep -qi quarantine || { echo "  FAIL: $OLDVER new cluster not quarantined after hold-start (got '$st')"; FAIL_LIST="$FAIL_LIST $OLDVER(nohold)"; FAILED=$((FAILED+1)); return; }
-
-    # ---- commit -> live ----
-    "$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" --wal-log-commit >"$W/commit_$P.log" 2>&1 \
-        || { echo "  FAIL: $OLDVER commit"; tail -15 "$W/commit_$P.log"; FAIL_LIST="$FAIL_LIST $OLDVER(commit)"; FAILED=$((FAILED+1)); return; }
-
-    "$NEWBIN/pg_ctl" -D "$NEW" -l "$W/new_$P.log" -w start >/dev/null 2>&1 || { echo "  FAIL: $OLDVER start after commit"; tail -15 "$W/new_$P.log"; FAIL_LIST="$FAIL_LIST $OLDVER(newstart)"; FAILED=$((FAILED+1)); return; }
+    # ---- start: auto-serve (reconstruct from WAL, then come up read-write) ----
+    # --wal-log-upgrade auto-serves: the first start applies the WAL window,
+    # reconstructs, and comes up read-write -- no quarantine hold, no
+    # --wal-log-commit.
+    "$NEWBIN/pg_ctl" -D "$NEW" -l "$W/new_$P.log" -w start >/dev/null 2>&1 || { echo "  FAIL: $OLDVER new cluster did not auto-serve on first start"; tail -15 "$W/new_$P.log"; FAIL_LIST="$FAIL_LIST $OLDVER(newstart)"; FAILED=$((FAILED+1)); return; }
     NEW_FP=$("$NEWBIN/psql" -h "$W" -p $P -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t) FROM t" 2>&1)
     NEW_CATVER=$("$NEWBIN/pg_controldata" -D "$NEW" | grep 'Catalog version' | grep -oE '[0-9]+')
     # writable?

@@ -47,6 +47,7 @@
 #include "storage/copydir.h"	/* copydir() for WAL segment migration */
 #include "storage/ipc.h"		/* proc_exit() for the quarantine hold */
 #include "storage/lwlock.h"
+#include "replication/walreceiver.h"	/* libpqwalreceiver client for auto-anchor */
 #include "utils/builtins.h"		/* cstring_to_text, psprintf */
 #include "utils/elog.h"
 
@@ -175,7 +176,7 @@ UpgradeWalPageRead(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
  * makes the atomicity guarantee sound — a crash mid-upgrade (START but no
  * COMPLETE) is reliably distinguished from a completed one.
  */
-static bool
+bool
 upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 						 bool *found_complete, CheckPoint *cn,
 						 XLogRecPtr *cn_lsn, XLogRecPtr *complete_lsn,
@@ -497,6 +498,127 @@ IsUpgradeBootstrap(void)
 }
 
 /*
+ * LEE: AUTOMATIC streaming-standby arming from the primary.
+ *
+ * This is the auto-fetch counterpart of ArmFromStreamingAnchorIfPresent(): rather
+ * than requiring the operator to run "pg_upgrade --wal-log-prepare-standby" (which
+ * pre-writes UPGRADE_STREAM_ANCHOR), a fresh vN+1 skeleton with primary_conninfo
+ * set fetches the anchor itself over the SAME replication connection it is about
+ * to stream on.  It:
+ *   - loads libpqwalreceiver and connects to the primary (replication conn),
+ *   - runs IDENTIFY_SYSTEM (sysid + primary TLI),
+ *   - runs the PG_UPGRADE_WINDOW_ANCHOR replication command (CN lsn + redo),
+ *   - arms the control file at CN via ArmControlFileForUpgradeRecovery(for_streaming),
+ * then lets StartupXLOG enter standby mode and stream the window forward.
+ *
+ * This runs in the startup process BEFORE StartupXLOG (see PerformWalUpgradeIfNeeded),
+ * which is why it works: no SQL backend/libpq in the server binary is needed --
+ * libpqwalreceiver is a loadable module, exactly as the walreceiver uses it.
+ *
+ * Fallbacks (all return false so the caller tries the file-anchor / local paths):
+ *   - primary_conninfo not set                     -> not an auto-fetch standby
+ *   - a UPGRADE_STREAM_ANCHOR file already present  -> the explicit path wins
+ *   - primary has no retained window (NULL anchor)  -> not upgrading, or released
+ *   - primary too old to know the command           -> operator uses --prepare-standby
+ * Connection failure (conninfo IS set and points at a live primary that should
+ * have the window) is a hard FATAL: the operator asked for an auto-fetch standby.
+ */
+static bool
+ArmFromPrimaryAnchorIfConfigured(void)
+{
+	WalReceiverConn *conn;
+	char	   *err = NULL;
+	char	   *primary_sysid;
+	TimeLineID	primary_tli = 0;
+	char	   *anchor_str;
+	uint64		sysid = 0;
+	uint32		cn_hi = 0,
+				cn_lo = 0,
+				redo_hi = 0,
+				redo_lo = 0;
+	XLogRecPtr	cn_lsn;
+	CheckPoint	cn;
+	struct stat st;
+
+	/* No primary configured -> not an auto-fetch standby. */
+	if (PrimaryConnInfo == NULL || PrimaryConnInfo[0] == '\0')
+		return false;
+
+	/* An explicit pre-written anchor file takes precedence over auto-fetch. */
+	if (stat(UPGRADE_STREAM_ANCHOR, &st) == 0)
+		return false;
+
+	/* Load libpqwalreceiver, exactly as the walreceiver process does. */
+	load_file("libpqwalreceiver", false);
+	if (WalReceiverFunctions == NULL)
+		ereport(FATAL,
+				(errmsg("libpqwalreceiver didn't initialize correctly")));
+
+	conn = walrcv_connect(PrimaryConnInfo, true, false, false,
+						  "pg_upgrade_anchor", &err);
+	if (conn == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not connect to the primary to fetch the pg_upgrade window anchor: %s",
+						err ? err : "unknown error"),
+				 errhint("Set primary_conninfo to a live --wal-log-upgrade primary, "
+						 "or run \"pg_upgrade --wal-log-prepare-standby\" to stage the anchor.")));
+
+	/* sysid + primary timeline from the standard IDENTIFY_SYSTEM. */
+	primary_sysid = walrcv_identify_system(conn, &primary_tli);
+	if (primary_sysid == NULL || sscanf(primary_sysid, UINT64_FORMAT, &sysid) != 1 ||
+		sysid == 0 || primary_tli == 0)
+	{
+		walrcv_disconnect(conn);
+		ereport(FATAL,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("IDENTIFY_SYSTEM on the primary returned an invalid identity")));
+	}
+
+	/*
+	 * CN lsn + redo from the new PG_UPGRADE_WINDOW_ANCHOR replication command.
+	 * A NULL result means the primary retains no upgrade window (not upgrading,
+	 * or already released) -> fall back to normal startup.  A primary too old to
+	 * know the command raises an ERROR inside walrcv_upgrade_window_anchor; we
+	 * catch nothing here, so that surfaces -- but since this path only runs for a
+	 * skeleton that a newer operator pointed at a newer primary, that is
+	 * acceptable (the explicit --wal-log-prepare-standby remains for mixed cases).
+	 */
+	anchor_str = walrcv_upgrade_window_anchor(conn);
+	walrcv_disconnect(conn);
+	if (anchor_str == NULL)
+	{
+		ereport(LOG,
+				(errmsg("primary is not retaining a pg_upgrade window; "
+						"this node will start normally (no upgrade to stream)")));
+		return false;
+	}
+
+	/* "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>" */
+	if (sscanf(anchor_str, "%X/%X/%X/%X", &cn_hi, &cn_lo, &redo_hi, &redo_lo) != 4)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("malformed pg_upgrade window anchor from primary: \"%s\"",
+						anchor_str)));
+
+	cn_lsn = ((uint64) cn_hi << 32) | cn_lo;
+
+	MemSet(&cn, 0, sizeof(cn));
+	cn.redo = ((uint64) redo_hi << 32) | redo_lo;
+	cn.ThisTimeLineID = primary_tli;
+	cn.PrevTimeLineID = primary_tli;
+
+	ereport(LOG,
+			(errmsg("pg_upgrade: auto-armed streaming standby from primary "
+					"(sysid " UINT64_FORMAT ", CN %X/%08X, redo %X/%08X, TLI %u)",
+					sysid, LSN_FORMAT_ARGS(cn_lsn),
+					LSN_FORMAT_ARGS(cn.redo), primary_tli)));
+
+	ArmControlFileForUpgradeRecovery(&cn, cn_lsn, sysid, true);
+	return true;
+}
+
+/*
  * LEE: streaming-standby arming.  If UPGRADE_STREAM_ANCHOR is present, this is a
  * fresh skeleton that will STREAM the upgrade window from the live primary.  Read
  * the anchor, stamp the control file (sysid + CN + TLI) via
@@ -647,6 +769,21 @@ PerformWalUpgradeIfNeeded(void)
 		in_upgrade_bootstrap = true;
 		return true;
 	}
+
+	/*
+	 * AUTO-FETCH STANDBY PATH.  No pre-staged anchor file, but if primary_conninfo
+	 * is set we try to fetch the anchor directly from the primary over the
+	 * replication connection (PG_UPGRADE_WINDOW_ANCHOR) and arm from it -- so a
+	 * fresh skeleton needs no "pg_upgrade --wal-log-prepare-standby" step.  Returns
+	 * false (fall through to the local path / normal startup) when there is no
+	 * primary configured or the primary retains no window.
+	 */
+	if (ArmFromPrimaryAnchorIfConfigured())
+	{
+		in_upgrade_bootstrap = true;
+		return true;
+	}
+
 
 	snprintf(wal_dir, sizeof(wal_dir), XLOGDIR);
 

@@ -91,19 +91,17 @@ else
   echo "  OK: non-zero members segment $MAXSEG captured with its correct number"
 fi
 
-log "5. commit + functional check"
+log "5. functional check"
 cat >> "$W/n/postgresql.conf" <<CONF
 unix_socket_directories='$W'
 port=$PP
 CONF
-# Primary model: the upgraded new cluster is held (DB_UPGRADE_QUARANTINED) with its
-# files on disk (no reconstruct-from-WAL on the primary).  It must be held.
-"$BIN/pg_controldata" -D "$W/n" | grep -i 'cluster state' | grep -qi quarantine \
-  && log "  new cluster held in quarantine (good)" || { echo "  FAIL: new cluster not quarantined after upgrade"; FAIL=1; }
-# Adopt it: --wal-log-commit releases the hold and it goes live from the on-disk
-# files (the multixact members segments captured above are already present).
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/o" -D "$W/n" --wal-log-commit > "$W/commit.log" 2>&1 \
-    || { echo FAIL commit; tail -20 "$W/commit.log"; exit 1; }
+# Primary model: the upgraded new cluster keeps its files on disk (no
+# reconstruct-from-WAL on the primary).  --wal-log-upgrade auto-serves: it
+# comes up read-write on the first start, exactly like upstream pg_upgrade
+# (no quarantine hold, no commit).  Post-upgrade control state is "shut down".
+"$BIN/pg_controldata" -D "$W/n" | grep -i 'cluster state' | grep -qi 'shut down' \
+  && log "  new cluster in shut down state (good)" || { echo "  FAIL: new cluster not in shut down state after upgrade"; FAIL=1; }
 "$BIN/pg_ctl" -D "$W/n" -l "$W/n.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/n.log"; FAIL=1; }
 NEW_MXID=$(Q "SELECT next_multixact_id FROM pg_control_checkpoint()")
 RELOCK=$(Q "WITH x AS (SELECT id FROM t FOR KEY SHARE LIMIT 100) SELECT count(*) FROM x")

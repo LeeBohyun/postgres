@@ -16,6 +16,18 @@
 extern bool PerformWalUpgradeIfNeeded(void);
 
 /*
+ * LEE: scan a pg_wal directory for the --wal-log-upgrade markers (START/COMPLETE)
+ * and the end-of-upgrade checkpoint (CN) that precedes START.  Exposed so the
+ * walsender's PG_UPGRADE_WINDOW_ANCHOR command can compute the anchor a streaming
+ * standby needs, reusing the exact same scan the startup path uses.  Returns
+ * false if there is no readable WAL at all.
+ */
+extern bool upgrade_wal_scan_markers(const char *waldir, bool *found_start,
+									 bool *found_complete, CheckPoint *cn,
+									 XLogRecPtr *cn_lsn, XLogRecPtr *complete_lsn,
+									 uint64 *wal_sysid);
+
+/*
  * LEE: revertable upgrade.  IsUpgradeBootstrap() is true once
  * PerformWalUpgradeIfNeeded() has armed the sanctioned upgrade replay for this
  * startup; StartupXLOG() consults it at end-of-recovery to hold the newly

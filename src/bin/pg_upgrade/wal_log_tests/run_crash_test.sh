@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Crash-mid-upgrade atomicity test.
+# Crash-mid-upgrade atomicity test (AUTO-SERVE model).
 #
 # PG_UPGRADE_TEST_SKIP_COMPLETE makes pg_upgrade emit the whole upgrade image
 # but omit the terminal PG_UPGRADE_COMPLETE marker -- exactly the state left by
@@ -31,48 +31,31 @@ ls "$NEW/pg_wal"/[0-9A-F]* >/dev/null 2>&1 && echo "upgrade WAL present in pg_wa
 
 FAIL=0
 
-log "start NEW cluster (mid-upgrade, no COMPLETE): must HOLD in quarantine, never serve"
-# New atomicity model: there is no COMPLETE pre-scan FATAL.  A crash-truncated
-# window (START but no COMPLETE) is armed and the partial window is replayed, but
-# the cluster is HELD in quarantine at the end-of-recovery hold and NEVER goes
-# live.  Because it never reaches COMPLETE, "--wal-log-commit" would refuse; the operator
-# discards it with "--wal-log-rollback".  So a half-upgraded cluster never serves --
-# atomicity via quarantine + rollback, not via a pre-scan refusal.
+log "start NEW cluster (mid-upgrade, no COMPLETE): must FATAL, never serve"
+# Auto-serve atomicity model: a local window with START but no COMPLETE is a
+# crash-truncated (half-built) upgrade.  Since the new cluster now auto-serves on
+# a good start, PerformWalUpgradeIfNeeded() refuses to arm/replay a partial window
+# and FATALs instead -- it must NOT serve a half-upgraded catalog.  (The old model
+# held it in quarantine; there is no quarantine anymore.)
 echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1
-# It must NOT be serving.  In the primary model the cluster is armed to
-# DB_UPGRADE_QUARANTINED at pg_upgrade time (via the shutdown checkpoint), so a
-# start REFUSES with "held in pg_upgrade quarantine" -- it never goes live.
 if "$BIN/psql" -h "$W" -p $P -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
     "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
     echo "FAIL: half-upgraded (no COMPLETE) cluster ACCEPTED a connection"; FAIL=1
-elif grep -qi "held in pg_upgrade quarantine" "$W/new.log"; then
-    echo "new cluster refused to serve (held in quarantine), good:"
-    grep -i "held in pg_upgrade quarantine" "$W/new.log" | head -1
+elif grep -qi "pg_upgrade WAL is incomplete\|found START without COMPLETE" "$W/new.log"; then
+    echo "new cluster FATALed on the partial window (good):"
+    grep -i "incomplete\|START without COMPLETE" "$W/new.log" | head -1
 else
-    echo "FAIL: new cluster neither served nor refused-as-held:"; tail -6 "$W/new.log"; FAIL=1
+    echo "FAIL: new cluster neither served nor FATALed-as-incomplete:"; tail -6 "$W/new.log"; FAIL=1
 fi
 
-log "partial cluster: held in quarantine, COMPLETE marker absent (cannot be committed)"
-# State is visible via pg_controldata (no --status flag).
-st=$("$BIN/pg_controldata" -D "$NEW" | grep -i "cluster state" | sed 's/.*: *//')
-case "$st" in *quarantine*) echo "control state: $st (good)";; *) echo "FAIL: partial cluster not in quarantine (state='$st')"; FAIL=1;; esac
+log "partial cluster: COMPLETE marker absent (nothing to adopt)"
 # The COMPLETE marker must be ABSENT for a crash-truncated window.
-[ -e "$NEW/pg_upgrade_complete.done" ] && { echo "FAIL: COMPLETE marker present on a partial (no-COMPLETE) cluster"; FAIL=1; }
-
-log "--wal-log-commit MUST REFUSE the partial cluster (quarantined but not fully replayed)"
-if "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" --wal-log-commit >"$W/commit_partial.log" 2>&1; then
-    echo "FAIL: --wal-log-commit finalized a partial (crash-truncated) cluster -- must have refused:"; cat "$W/commit_partial.log"; FAIL=1
-else
-    grep -qi "did not fully replay\|PARTIAL\|crash-truncated" "$W/commit_partial.log" \
-        && echo "commit refused the partial cluster (good):" && grep -i "did not fully replay" "$W/commit_partial.log" | head -1 \
-        || { echo "FAIL: --wal-log-commit refused but for the wrong reason:"; cat "$W/commit_partial.log"; FAIL=1; }
-    # Refusing must NOT have touched the old cluster (no superseded stamp).
-    [ -e "$OLD/global/pg_control.old" ] && { echo "FAIL: refused commit still stamped the old cluster superseded"; FAIL=1; }
-fi
+[ -e "$NEW/pg_upgrade_complete.done" ] && { echo "FAIL: COMPLETE marker present on a partial (no-COMPLETE) cluster"; FAIL=1; } || echo "COMPLETE marker absent (good)"
 
 log "rollback the half-upgraded cluster (discard it); old must be untouched"
-"$BIN/pg_upgrade" -D "$NEW" --wal-log-rollback >"$W/rollback.log" 2>&1 || { cat "$W/rollback.log"; echo "FAIL: rollback of half-upgraded cluster"; FAIL=1; }
+# old_dir is intact (--copy, never started), so rollback is allowed.
+"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" --wal-log-rollback >"$W/rollback.log" 2>&1 || { cat "$W/rollback.log"; echo "FAIL: rollback of half-upgraded cluster"; FAIL=1; }
 [ -d "$NEW" ] && { echo "FAIL: rollback did not remove the half-upgraded new cluster"; FAIL=1; }
 
 log "verify OLD cluster is still fully usable"
@@ -83,27 +66,22 @@ log "old cluster after: $OLD_FP2"
 [ "$OLD_FP" = "$OLD_FP2" ] || { echo "FAIL: old cluster damaged (was '$OLD_FP', now '$OLD_FP2')"; FAIL=1; }
 
 # --- Control: a NORMAL (with COMPLETE) upgrade of the same data MUST reach
-# COMPLETE, commit, and recover the exact data -- proving the quarantine hold
-# above is specific to the missing COMPLETE, not a general inability to upgrade
-# these clusters.
-log "control: same upgrade WITH COMPLETE must start and recover the data"
+# COMPLETE and AUTO-SERVE, recovering the exact data -- proving the FATAL above
+# is specific to the missing COMPLETE, not a general inability to upgrade these
+# clusters.
+log "control: same upgrade WITH COMPLETE must auto-serve and recover the data"
 rm -rf "$W/new2"
 cd "$W"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" -U postgres --initdb --wal-log-upgrade --copy >"$W/up2.log" 2>&1
 echo "unix_socket_directories='$W'">>$W/new2/postgresql.conf; echo "port=$P">>$W/new2/postgresql.conf
-# --wal-log-upgrade holds the new cluster in quarantine.  Hold-start it (applies
-# the window, reconstructs, holds; pg_ctl exits non-zero by design), then commit.
-"$BIN/pg_ctl" -D "$W/new2" -l "$W/new2_hold.log" -w start >/dev/null 2>&1 || true
-"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" --wal-log-commit >"$W/commit2.log" 2>&1 \
-    || { echo "FAIL: control commit"; tail -20 "$W/commit2.log"; FAIL=1; }
 if "$BIN/pg_ctl" -D "$W/new2" -l "$W/new2.log" -w start >/dev/null 2>&1; then
     CTRL_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(b)::bigint) FROM t")
     "$BIN/pg_ctl" -D "$W/new2" -w stop >/dev/null 2>&1
     log "control recovered: $CTRL_FP"
     [ "$CTRL_FP" = "$OLD_FP" ] || { echo "FAIL: control data mismatch (old '$OLD_FP' vs control '$CTRL_FP')"; FAIL=1; }
 else
-    echo "FAIL: control (with COMPLETE) did not start"; tail -10 "$W/new2.log"; FAIL=1
+    echo "FAIL: control (with COMPLETE) did not auto-serve"; tail -10 "$W/new2.log"; FAIL=1
 fi
 
-[ "$FAIL" = 0 ] && log "PASS: mid-upgrade held in quarantine (never served) + rolled back; old cluster intact; control recovers" \
+[ "$FAIL" = 0 ] && log "PASS: mid-upgrade FATALed (never served) + rolled back; old cluster intact; control auto-serves" \
                 || log "FAIL: crash-atomicity not upheld"
 exit $FAIL

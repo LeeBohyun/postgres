@@ -285,6 +285,17 @@ typedef char *(*walrcv_identify_system_fn) (WalReceiverConn *conn,
 											TimeLineID *primary_tli);
 
 /*
+ * walrcv_upgrade_window_anchor_fn
+ *
+ * LEE: run the PG_UPGRADE_WINDOW_ANCHOR replication command on the primary and
+ * return the retained --wal-log-upgrade window anchor as a palloc'd string
+ * "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>", or NULL if the primary retains no window.
+ * Like IDENTIFY_SYSTEM, this is a replication-protocol command (no database
+ * connection required), so it must NOT go through walrcv_exec.
+ */
+typedef char *(*walrcv_upgrade_window_anchor_fn) (WalReceiverConn *conn);
+
+/*
  * walrcv_get_dbname_from_conninfo_fn
  *
  * Returns the database name from the primary_conninfo
@@ -417,6 +428,7 @@ typedef struct WalReceiverFunctionsType
 	walrcv_get_conninfo_fn walrcv_get_conninfo;
 	walrcv_get_senderinfo_fn walrcv_get_senderinfo;
 	walrcv_identify_system_fn walrcv_identify_system;
+	walrcv_upgrade_window_anchor_fn walrcv_upgrade_window_anchor;
 	walrcv_get_dbname_from_conninfo_fn walrcv_get_dbname_from_conninfo;
 	walrcv_server_version_fn walrcv_server_version;
 	walrcv_readtimelinehistoryfile_fn walrcv_readtimelinehistoryfile;
@@ -443,6 +455,8 @@ extern PGDLLIMPORT WalReceiverFunctionsType *WalReceiverFunctions;
 	WalReceiverFunctions->walrcv_get_senderinfo(conn, sender_host, sender_port)
 #define walrcv_identify_system(conn, primary_tli) \
 	WalReceiverFunctions->walrcv_identify_system(conn, primary_tli)
+#define walrcv_upgrade_window_anchor(conn) \
+	WalReceiverFunctions->walrcv_upgrade_window_anchor(conn)
 #define walrcv_get_dbname_from_conninfo(conninfo) \
 	WalReceiverFunctions->walrcv_get_dbname_from_conninfo(conninfo)
 #define walrcv_server_version(conn) \

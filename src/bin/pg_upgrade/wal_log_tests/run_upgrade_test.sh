@@ -98,21 +98,14 @@ echo "pg_xact bytes on disk after pg_upgrade (should be 0 = skipped): $XACT_BYTE
 [ "${XACT_BYTES:-0}" = "0" ] || { echo "FAIL: pg_xact not wiped ($XACT_BYTES bytes) — WAL-replay claim unproven"; exit 1; }
 
 # ------------------------------------------------------------------ new cluster
-# --wal-log-upgrade holds the new cluster in quarantine.  All the pre-start
-# assertions above (upgrade WAL present, disk wiped) inspect that held state.
-# Commit now to adopt it, which replays the window and brings it live.
+# Auto-serve: --wal-log-upgrade now leaves the new cluster ready to come up
+# read-write on first start, exactly like upstream pg_upgrade -- there is NO
+# quarantine hold and NO --wal-log-commit step.  The pre-start assertions above
+# (upgrade WAL present, disk wiped) inspect the on-disk state before first start.
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
 
-# Hold-start: first start applies the WAL window, reconstructs, and holds
-# in quarantine (pg_ctl returns non-zero by design as it exits at the hold).
-"$BIN/pg_ctl" -D "$NEW" -l "$WORK/hold.log" -w start >/dev/null 2>&1 || true
-
-log "pg_upgrade --wal-log-commit"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-log-commit > "$WORK/commit.log" 2>&1 \
-    || { echo "---- commit.log tail ----"; tail -20 "$WORK/commit.log"; exit 1; }
-
-log "start new cluster (triggers WAL-replay recovery)"
+log "start new cluster (auto-serves; no --wal-log-commit)"
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1
 START_RC=$?
 log "new cluster start exit=$START_RC"

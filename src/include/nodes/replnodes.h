@@ -35,6 +35,21 @@ typedef struct IdentifySystemCmd
 
 
 /* ----------------------
+ *		PG_UPGRADE_WINDOW_ANCHOR command
+ *
+ * LEE: returns the --wal-log-upgrade window anchor (CN lsn + redo) retained on a
+ * live upgraded primary, so a fresh vN+1 standby skeleton can auto-fetch it over
+ * the replication connection it already makes (instead of the operator running
+ * "pg_upgrade --wal-log-prepare-standby").
+ * ----------------------
+ */
+typedef struct PgUpgradeWindowAnchorCmd
+{
+	NodeTag		type;
+} PgUpgradeWindowAnchorCmd;
+
+
+/* ----------------------
  *		BASE_BACKUP command
  * ----------------------
  */

@@ -2,7 +2,8 @@
 # Set-wide delete-authorize signal (task #4).
 #
 # After a --wal-log-upgrade, both the primary and a streaming standby are
-# committed and live.  Running "pg_upgrade --wal-log-delete-old" on the PRIMARY must:
+# live (the primary auto-serves on first start).  Running
+# "pg_upgrade --wal-log-delete-old" on the PRIMARY must:
 #   1. delete the primary's own old cluster, and
 #   2. emit an XLOG_PG_UPGRADE_DELETE_AUTHORIZE signal into the live primary's WAL,
 #      which streams to the standby; the standby replays it and drops the durable
@@ -41,11 +42,10 @@ listen_addresses='localhost'
 CONF
 echo "host replication all 127.0.0.1/32 trust" >> "$PNEW/pg_hba.conf"
 echo "host all all 127.0.0.1/32 trust" >> "$PNEW/pg_hba.conf"
-"$BIN/pg_ctl" -D "$PNEW" -l "$W/pnew_hold.log" -w start >/dev/null 2>&1 || true
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$POLD" -D "$PNEW" -U postgres --wal-log-commit >"$W/pcommit.log" 2>&1 \
-    || { echo "FAIL primary commit"; tail -20 "$W/pcommit.log"; exit 1; }
+# --wal-log-upgrade auto-serves: the first start brings the primary up read-write
+# directly -- no quarantine hold, no --wal-log-commit.
 "$BIN/pg_ctl" -D "$PNEW" -l "$W/pnew.log" -w start >/dev/null 2>&1 || { echo "FAIL primary start"; tail "$W/pnew.log"; exit 1; }
-log "committed live primary up; old primary dir retained at $POLD"
+log "live primary up; old primary dir retained at $POLD"
 
 log "2. bring up a STREAMING standby via --wal-log-prepare-standby (no hold, no commit)"
 "$BIN/initdb" -D "$SNEW" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb-skel; exit 1; }
