@@ -287,21 +287,10 @@ extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
 											  bool for_streaming);
 /* LEE: control-file checkpoint LSN, for the "upgrade already applied?" test */
 extern XLogRecPtr GetControlFileCheckPointLSN(void);
-/* LEE: mark pg_control DB_UPGRADE_QUARANTINED (revertable upgrade hold) */
-extern void SetControlFileUpgradeQuarantined(void);
-/* LEE: arm the next shutdown checkpoint to record DB_UPGRADE_QUARANTINED
- * (pg_upgrade calls this on the running new cluster just before clean shutdown) */
-extern void ArmUpgradeQuarantineOnShutdown(void);
-/* LEE: remove the quarantine arm marker (on commit-release) */
-extern void ClearUpgradeQuarantineArm(void);
 /* LEE: informational DB_IN_UPGRADE flips during window replay (set at START,
  * cleared back to DB_IN_PRODUCTION at COMPLETE) -- diagnostics only */
 extern void SetControlFileInUpgrade(void);
 extern void ClearControlFileInUpgrade(void);
-/* LEE: release the quarantine hold (commit path) */
-extern void ReleaseControlFileUpgradeQuarantine(void);
-/* LEE: true if pg_control state is DB_UPGRADE_QUARANTINED (re-hold test) */
-extern bool ControlFileInUpgradeQuarantine(void);
 /* LEE: batched relation-file images live in access/pgupgrade_wal.h */
 extern void UpdateFullPageWrites(void);
 extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p);

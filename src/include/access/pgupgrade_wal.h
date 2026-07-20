@@ -30,14 +30,9 @@ extern bool upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 /*
  * LEE: revertable upgrade.  IsUpgradeBootstrap() is true once
  * PerformWalUpgradeIfNeeded() has armed the sanctioned upgrade replay for this
- * startup; StartupXLOG() consults it at end-of-recovery to hold the newly
- * reconstructed cluster in quarantine instead of going live.
- * UpgradeCommitRequested() is true when "pg_upgrade --commit" has asked to
- * finalize a held cluster (so the hold is released to a normal go-live).
+ * startup; StartupXLOG() consults it at end-of-recovery.
  */
 extern bool IsUpgradeBootstrap(void);
-extern bool UpgradeCommitRequested(void);
-extern void ConsumeUpgradeCommitRequest(void);
 
 /* RM_PG_UPGRADE_ID rmgr callbacks (registered in rmgrlist.h) */
 extern void pg_upgrade_redo(XLogReaderState *record);

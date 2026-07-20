@@ -6850,11 +6850,6 @@
   proname => 'pg_write_pg_upgrade_delete_authorize', provolatile => 'v',
   prorettype => 'pg_lsn', proargtypes => '',
   prosrc => 'pg_write_pg_upgrade_delete_authorize' },
-# LEE: arm DB_UPGRADE_QUARANTINED on the next shutdown checkpoint (primary hold)
-{ oid => '9709', descr => 'arm pg_upgrade quarantine on next shutdown checkpoint',
-  proname => 'pg_arm_upgrade_quarantine', provolatile => 'v',
-  prorettype => 'void', proargtypes => '',
-  prosrc => 'pg_arm_upgrade_quarantine' },
 # LEE: force-flush SLRU dirty pages for --wal-log-upgrade (bypasses fsync=off)
 { oid => '9705', descr => 'flush upgrade SLRU pages to disk',
   proname => 'pg_flush_upgrade_slru', provolatile => 'v',

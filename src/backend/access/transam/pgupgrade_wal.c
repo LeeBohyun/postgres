@@ -45,7 +45,7 @@
 #include "storage/bufpage.h"	/* PageSetLSN */
 #include "storage/fd.h"
 #include "storage/copydir.h"	/* copydir() for WAL segment migration */
-#include "storage/ipc.h"		/* proc_exit() for the quarantine hold */
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "replication/walreceiver.h"	/* libpqwalreceiver client for auto-anchor */
 #include "utils/builtins.h"		/* cstring_to_text, psprintf */
@@ -415,27 +415,13 @@ pg_upgrade_window_anchor(PG_FUNCTION_ARGS)
 static bool in_upgrade_bootstrap = false;
 
 /*
- * LEE: revertable upgrade commit request sentinel.
- *
- * "pg_upgrade --commit" drops this file in the new cluster's data directory,
- * then starts the server.  Its presence tells StartupXLOG() to FINALIZE a held
- * cluster (release the quarantine and go live) rather than re-entering the
- * hold.  It is consumed once finalization begins so a later crash re-holds.
- */
-#define UPGRADE_COMMIT_SENTINEL	"pg_upgrade_commit.signal"
-
-/*
  * LEE: durable "the upgrade window fully replayed to COMPLETE" marker.
  *
- * The end-of-recovery quarantine hold (StartupXLOG) fires for ANY armed upgrade
- * bootstrap -- including a crash-truncated window that stopped before COMPLETE.
- * So DB_UPGRADE_QUARANTINED alone cannot tell a fully-upgraded held cluster from
- * a partial one: both hold in quarantine.  This marker is the ground truth.  It
- * is written+fsync'd by the XLOG_PG_UPGRADE_COMPLETE redo handler (below) the
+ * It is written+fsync'd by the XLOG_PG_UPGRADE_COMPLETE redo handler (below) the
  * instant redo actually reaches COMPLETE, so its presence proves the window
- * replayed in full.  "pg_upgrade --commit" refuses to finalize a held cluster
- * that lacks it (a partial cluster can only be --rollback'd), and --status
- * reports it.  Written with a relative path: redo runs with cwd == DataDir.
+ * replayed in full.  A frontend "pg_upgrade --wal-log-rollback" consults it, and
+ * --status reports it.  Written with a relative path: redo runs with cwd ==
+ * DataDir.
  */
 #define UPGRADE_COMPLETE_MARKER	"pg_upgrade_complete.done"
 
@@ -468,28 +454,9 @@ static bool in_upgrade_bootstrap = false;
  */
 #define UPGRADE_DELETE_AUTHORIZED_MARKER	"pg_upgrade_delete_authorized"
 
-bool
-UpgradeCommitRequested(void)
-{
-	struct stat st;
-
-	return stat(UPGRADE_COMMIT_SENTINEL, &st) == 0;
-}
-
-void
-ConsumeUpgradeCommitRequest(void)
-{
-	if (unlink(UPGRADE_COMMIT_SENTINEL) != 0 && errno != ENOENT)
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not remove pg_upgrade commit sentinel \"%s\": %m",
-						UPGRADE_COMMIT_SENTINEL)));
-}
-
 /*
  * LEE: true once PerformWalUpgradeIfNeeded() has armed the sanctioned upgrade
- * replay for this startup.  StartupXLOG() consults it at end-of-recovery to
- * decide whether to hold the reconstructed cluster in quarantine.
+ * replay for this startup.  StartupXLOG() consults it at end-of-recovery.
  */
 bool
 IsUpgradeBootstrap(void)
@@ -698,8 +665,8 @@ ArmFromStreamingAnchorIfPresent(void)
 
 	/*
 	 * Consume the anchor so a later restart re-reads pg_control (by then the
-	 * control file is armed / the cluster is quarantined, and the ordinary paths
-	 * take over).  Best-effort: a stale anchor would just re-arm identically.
+	 * control file is armed and the ordinary paths take over).  Best-effort: a
+	 * stale anchor would just re-arm identically.
 	 */
 	if (unlink(UPGRADE_STREAM_ANCHOR) != 0 && errno != ENOENT)
 		ereport(WARNING,
@@ -724,36 +691,6 @@ PerformWalUpgradeIfNeeded(void)
 	/* Skip during pg_upgrade internal server starts (-b binary upgrade mode) */
 	if (IsBinaryUpgrade)
 		return false;
-
-	/*
-	 * Held in pg_upgrade quarantine?  Decide this from the durable pg_control
-	 * STATE, BEFORE scanning pg_wal/ -- because the first hold already wrote an
-	 * end-of-recovery checkpoint that RECYCLED the upgrade WAL window, so the
-	 * scan would no longer find START/COMPLETE and would wrongly let the cluster
-	 * serve.  The reconstructed data is durable on disk and the control
-	 * checkpoint is past COMPLETE, so:
-	 *
-	 *   - commit requested ("pg_upgrade --commit"): release the quarantine,
-	 *     consume the sentinel, return false -> ordinary startup finalizes from
-	 *     the durable checkpoint and goes live.  No re-replay.
-	 *   - otherwise: refuse to serve (re-hold).  The operator must "--commit"
-	 *     to adopt or "--rollback" to discard.
-	 */
-	if (ControlFileInUpgradeQuarantine())
-	{
-		if (!UpgradeCommitRequested())
-			ereport(FATAL,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("new cluster is held in pg_upgrade quarantine"),
-					 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
-
-		ereport(LOG,
-				(errmsg("pg_upgrade --commit: releasing quarantine and finalizing")));
-		ConsumeUpgradeCommitRequest();
-		ReleaseControlFileUpgradeQuarantine();
-		ClearUpgradeQuarantineArm();	/* so a later shutdown is not re-quarantined */
-		return false;			/* ordinary startup finalizes; no re-replay */
-	}
 
 	/*
 	 * STREAMING STANDBY PATH.  If the standby-prepare step dropped a streaming
@@ -784,7 +721,6 @@ PerformWalUpgradeIfNeeded(void)
 		return true;
 	}
 
-
 	snprintf(wal_dir, sizeof(wal_dir), XLOGDIR);
 
 	/*
@@ -802,14 +738,14 @@ PerformWalUpgradeIfNeeded(void)
 	 *                       finalized by a prior startup; its end-of-recovery
 	 *                       checkpoint sits past COMPLETE (on this or a later
 	 *                       timeline).
-	 *   START, no COMPLETE -> crash mid-upgrade.  Replay the partial window
-	 *                       anyway and HOLD it in quarantine at end-of-recovery
-	 *                       (it never serves and never leaves the COMPLETE
-	 *                       marker, so --commit refuses it).  The partial new_dir
-	 *                       is a dead end: it does NOT resume or repair in place.
-	 *                       Recovery is --rollback (discard new_dir) then re-run
-	 *                       pg_upgrade -- which is safe because the OLD cluster
-	 *                       was never written during the upgrade and is intact.
+	 *   START, no COMPLETE -> crash mid-upgrade.  Refuse to start (FATAL): since
+	 *                       the new cluster now auto-serves, replaying a partial
+	 *                       window would serve a corrupt half-built catalog.  The
+	 *                       partial new_dir is a dead end: it does NOT resume or
+	 *                       repair in place.  Recovery is --wal-log-rollback
+	 *                       (discard new_dir) then re-run pg_upgrade -- which is
+	 *                       safe because the OLD cluster was never written during
+	 *                       the upgrade and is intact.
 	 *   no START         -> not an upgrade; normal startup.
 	 *
 	 * Deriving CN here (rather than requiring a prior "pg_resetwal
@@ -827,31 +763,32 @@ PerformWalUpgradeIfNeeded(void)
 		return false;			/* no readable upgrade WAL — normal startup */
 
 	/*
-	 * found_complete / complete_lsn are populated by the scan but intentionally
-	 * NOT consulted here (see the atomicity note below): detection is by START,
-	 * completeness is enforced later by the quarantine + commit path.  Reference
-	 * them so the compiler does not flag them unused on this path.
+	 * complete_lsn is populated by the scan but not needed on this path (the
+	 * already-applied test below uses cn_lsn); reference it so the compiler does
+	 * not flag it unused.  found_complete IS now consulted (auto-serve gate).
 	 */
-	(void) found_complete;
 	(void) complete_lsn;
 
 	if (!found_start)
 		return false;			/* not an upgrade */
 
 	/*
-	 * An upgrade is detected by the START marker alone -- we do NOT require
-	 * COMPLETE to be present up front.  COMPLETE is intentionally not
-	 * pre-checked: when the window is delivered by STREAMING (into a standby
-	 * skeleton) it arrives incrementally and COMPLETE has not necessarily
-	 * streamed in yet at this point.  Atomicity is instead provided by the
-	 * quarantine + commit/rollback model: we arm and replay whatever is present,
-	 * NEVER auto-go-live (the end-of-recovery hold in StartupXLOG), and only a
-	 * "pg_upgrade --commit" -- which verifies COMPLETE actually replayed --
-	 * finalizes.  A window that never reaches COMPLETE (e.g. the primary died
-	 * mid-stream) simply stays quarantined and is discarded by "--rollback".
-	 * This is exactly why the feature is revertable: rollback-ability replaces
-	 * the old "refuse to start without COMPLETE" pre-scan.
+	 * LEE (2026-07-20, auto-serve): the LOCAL-window path now requires a
+	 * COMPLETE marker up front.  The window is entirely present on local disk
+	 * here (the incremental STREAMING case already returned above via the
+	 * streaming anchor), so START-without-COMPLETE means the upgrade crashed
+	 * mid-window and the reconstructed catalog is half-built.  Since the new
+	 * cluster now AUTO-SERVES read-write at end of recovery (the quarantine hold
+	 * is gone), we must NOT arm and replay a partial window -- that would serve a
+	 * corrupt half-upgraded catalog.  Refuse loudly instead; the old cluster was
+	 * never written during the upgrade and is intact, so re-running pg_upgrade is
+	 * the safe recovery (mirrors upstream's refusal to start a half-done upgrade).
 	 */
+	if (!found_complete)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_upgrade WAL is incomplete: found START without COMPLETE"),
+				 errhint("The upgrade did not finish; re-run pg_upgrade from the old cluster (which is intact).")));
 
 	/*
 	 * Already applied?  Decide from the control-file checkpoint vs CN, NOT vs
@@ -860,9 +797,8 @@ PerformWalUpgradeIfNeeded(void)
 	 * was armed at CN, or never armed); a finalized/committed cluster wrote its
 	 * end-of-recovery checkpoint PAST CN.  So "checkpoint strictly past CN" means
 	 * the upgrade already finalized -- re-arming at CN would re-replay over live
-	 * data, so treat it as an ordinary startup.  (The DB_UPGRADE_QUARANTINED
-	 * re-hold case is handled earlier, before the scan.)  This is
-	 * COMPLETE-independent and timeline-independent.
+	 * data, so treat it as an ordinary startup.  This is COMPLETE-independent and
+	 * timeline-independent.
 	 */
 	if (!XLogRecPtrIsInvalid(cn_lsn) && GetControlFileCheckPointLSN() > cn_lsn)
 		return false;
@@ -971,9 +907,9 @@ pg_upgrade_redo(XLogReaderState *record)
 		 * mid-window (or an operator peeking with pg_controldata) shows "in
 		 * pg_upgrade" instead of the misleading "in production" that the arm set as
 		 * its crash-recovery trigger.  This does NOT drive recovery -- COMPLETE
-		 * restores DB_IN_PRODUCTION, and the end-of-recovery seam then decides
-		 * quarantine vs. go-live as before.  Guarded by in_upgrade_bootstrap so it
-		 * only marks a sanctioned reconstruction, never an ordinary replay.
+		 * restores DB_IN_PRODUCTION, and the end-of-recovery seam then goes live.
+		 * Guarded by in_upgrade_bootstrap so it only marks a sanctioned
+		 * reconstruction, never an ordinary replay.
 		 */
 		if (in_upgrade_bootstrap)
 			SetControlFileInUpgrade();
@@ -1008,39 +944,30 @@ pg_upgrade_redo(XLogReaderState *record)
 		 * reconstructed on disk.  Clear the guard so hot standby may activate
 		 * normally (CheckRecoveryConsistency will pick it up on the next call).
 		 *
-		 * The revertable-upgrade quarantine hold does NOT happen here.  We let
-		 * the redo loop finish and StartupXLOG() write its normal end-of-recovery
-		 * checkpoint (flushing the reconstructed data durably and advancing the
-		 * control checkpoint past COMPLETE).  Only AFTER that -- at the
-		 * end-of-recovery seam in StartupXLOG(), guarded by IsUpgradeBootstrap()
-		 * -- do we set DB_UPGRADE_QUARANTINED and hold, so a later "pg_upgrade
-		 * --commit" is just a lightweight switch to live (no window re-replay)
-		 * and "--rollback" simply discards the reconstructed new cluster.
-		 *
-		 * A STREAMING standby (fresh skeleton streaming the window from the
-		 * already-committed primary) does NOT hold or quarantine: once the window
-		 * is replayed it simply continues as an ordinary hot standby following the
-		 * primary.  So there is nothing special to do here beyond clearing the
-		 * guard -- the local-window path still holds at StartupXLOG's seam.
+		 * The cluster now AUTO-SERVES: we let the redo loop finish and StartupXLOG()
+		 * write its normal end-of-recovery checkpoint (flushing the reconstructed
+		 * data durably and advancing the control checkpoint past COMPLETE), then it
+		 * comes up read-write.  A STREAMING standby (fresh skeleton streaming the
+		 * window from the already-committed primary) likewise simply continues as an
+		 * ordinary hot standby following the primary once the window is replayed.
 		 */
 		pgUpgradeReplayInProgress = false;
 
 		/*
 		 * Restore the DB_IN_PRODUCTION crash-recovery trigger we borrowed at START
 		 * (informational DB_IN_UPGRADE).  The window is fully applied; the
-		 * end-of-recovery seam will set the terminal state (DB_UPGRADE_QUARANTINED
-		 * for a held local primary, or DB_IN_PRODUCTION on go-live).  Only meaningful
-		 * for the sanctioned bootstrap that set it.
+		 * end-of-recovery seam will set the terminal state (DB_IN_PRODUCTION on
+		 * go-live).  Only meaningful for the sanctioned bootstrap that set it.
 		 */
 		if (in_upgrade_bootstrap)
 			ClearControlFileInUpgrade();
 
 		/*
-		 * Drop the durable COMPLETE marker.  Because the quarantine hold fires
-		 * for a partial (crash-truncated) window too, this file -- written only
-		 * when redo actually reaches COMPLETE -- is what lets "--commit" tell a
-		 * fully-upgraded held cluster from a partial one.  fsync it: a --commit
-		 * may run right after this without a clean shutdown in between.
+		 * Drop the durable COMPLETE marker.  This file -- written only when redo
+		 * actually reaches COMPLETE -- is what lets a frontend "pg_upgrade
+		 * --wal-log-rollback" tell a fully-upgraded cluster from a partial
+		 * (crash-truncated) one.  fsync it: a frontend command may run right after
+		 * this without a clean shutdown in between.
 		 */
 		{
 			int			mfd;

@@ -427,32 +427,6 @@ pg_write_pg_upgrade_delete_authorize(PG_FUNCTION_ARGS)
 }
 
 /*
- * LEE: pg_arm_upgrade_quarantine() → void
- *
- * Arm the next shutdown checkpoint to record DB_UPGRADE_QUARANTINED.  Called by
- * "pg_upgrade --wal-log-upgrade" on the running new cluster right after emitting
- * the upgrade window and just before the clean shutdown, so the primary is held
- * "not serving until commit" without reconstructing from WAL (its files are
- * already on disk).  Superuser-only; invalid during recovery.
- */
-Datum
-pg_arm_upgrade_quarantine(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to arm pg_upgrade quarantine")));
-
-	if (RecoveryInProgress())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("recovery is in progress")));
-
-	ArmUpgradeQuarantineOnShutdown();
-	PG_RETURN_VOID();
-}
-
-/*
  * LEE: pg_write_upgrade_slru_data(slru_type integer) → pg_lsn
  *
  * Emit XLOG_UPGRADE_SLRU_DATA records for all segment files in the given SLRU

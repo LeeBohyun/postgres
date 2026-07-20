@@ -4712,87 +4712,6 @@ ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn,
 }
 
 /*
- * LEE: Mark the control file as held in pg_upgrade quarantine.
- *
- * Called from StartupXLOG() at the end-of-recovery seam when a sanctioned
- * --wal-log-upgrade bootstrap has replayed the whole window AND its normal
- * end-of-recovery checkpoint has been written (so the reconstructed data is
- * durable and the control checkpoint is past COMPLETE).  Instead of going live
- * (DB_IN_PRODUCTION), we record this state and exit, leaving new_dir fully
- * reconstructed but NOT serving.  A restart reads this state and re-holds; an
- * explicit "pg_upgrade --commit" releases it to a lightweight go-live (no
- * window re-replay).  The control file is fsync'd so the state survives a crash.
- */
-void
-SetControlFileUpgradeQuarantined(void)
-{
-	Assert(ControlFile != NULL);
-
-	ControlFile->state = DB_UPGRADE_QUARANTINED;
-	ControlFile->time = (pg_time_t) time(NULL);
-	UpdateControlFile();
-}
-
-/*
- * LEE: "arm quarantine on the next shutdown checkpoint."
- *
- * For --wal-log-upgrade, the primary is a NORMAL, fully-upgraded cluster (its
- * files are on disk; it does NOT reconstruct from WAL).  To hold it "not serving
- * until the operator commits", pg_upgrade calls pg_arm_upgrade_quarantine() after
- * emitting the window and just before the clean shutdown; CreateCheckPoint()'s
- * shutdown path then writes DB_UPGRADE_QUARANTINED (instead of DB_SHUTDOWNED)
- * atomically with the shutdown checkpoint -- which also sits PAST
- * XLOG_PG_UPGRADE_COMPLETE.  So the last durable control-file write is the
- * quarantine state on a checkpoint past the window: a restart is refused
- * (PerformWalUpgradeIfNeeded's ControlFileInUpgradeQuarantine gate), and
- * --wal-log-commit releases it to an ordinary go-live with no replay (the window
- * is behind the checkpoint).
- *
- * The signal must cross processes: pg_arm_upgrade_quarantine() runs in a regular
- * BACKEND, but the shutdown checkpoint runs in the CHECKPOINTER.  So the arm
- * drops a marker file in DataDir, and the shutdown-checkpoint control-file update
- * checks for it.  The file is removed when consumed / on release.
- */
-#define UPGRADE_QUARANTINE_ARM_FILE "pg_upgrade_quarantine.arm"
-
-void
-ArmUpgradeQuarantineOnShutdown(void)
-{
-	int			fd;
-
-	fd = BasicOpenFile(UPGRADE_QUARANTINE_ARM_FILE,
-					   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
-	if (fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create \"%s\": %m", UPGRADE_QUARANTINE_ARM_FILE)));
-	if (pg_fsync(fd) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync \"%s\": %m", UPGRADE_QUARANTINE_ARM_FILE)));
-	close(fd);
-}
-
-/* True if the arm marker is present (checked by the shutdown checkpoint). */
-static bool
-UpgradeQuarantineArmed(void)
-{
-	struct stat st;
-
-	return stat(UPGRADE_QUARANTINE_ARM_FILE, &st) == 0;
-}
-
-/* Remove the arm marker so a later legitimate shutdown is NOT re-quarantined. */
-void
-ClearUpgradeQuarantineArm(void)
-{
-	if (unlink(UPGRADE_QUARANTINE_ARM_FILE) != 0 && errno != ENOENT)
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not remove \"%s\": %m", UPGRADE_QUARANTINE_ARM_FILE)));
-}
-
-/*
  * LEE: INFORMATIONAL state flips for the "currently replaying the upgrade window"
  * period.  The arm sets DB_IN_PRODUCTION (a crash-recovery trigger); the redo
  * path calls SetControlFileInUpgrade() at XLOG_PG_UPGRADE_START and
@@ -4823,39 +4742,6 @@ ClearControlFileInUpgrade(void)
 		ControlFile->time = (pg_time_t) time(NULL);
 		UpdateControlFile();
 	}
-}
-
-/*
- * LEE: Release the pg_upgrade quarantine hold (called by "pg_upgrade --commit"
- * path in PerformWalUpgradeIfNeeded()).  The reconstructed cluster's checkpoint
- * is already past COMPLETE, so moving the state to DB_SHUTDOWNED lets ordinary
- * startup finalize and go live from that durable checkpoint -- no re-replay.
- */
-void
-ReleaseControlFileUpgradeQuarantine(void)
-{
-	Assert(ControlFile != NULL);
-
-	if (ControlFile->state == DB_UPGRADE_QUARANTINED)
-	{
-		ControlFile->state = DB_SHUTDOWNED;
-		ControlFile->time = (pg_time_t) time(NULL);
-		UpdateControlFile();
-	}
-}
-
-/*
- * LEE: true if the control file is currently held in pg_upgrade quarantine.
- *
- * PerformWalUpgradeIfNeeded() uses this to decide, from the durable pg_control
- * STATE (not a checkpoint LSN), that a restart of a held new cluster must
- * re-hold rather than serve.
- */
-bool
-ControlFileInUpgradeQuarantine(void)
-{
-	Assert(ControlFile != NULL);
-	return ControlFile->state == DB_UPGRADE_QUARANTINED;
 }
 
 /*
@@ -6172,14 +6058,6 @@ StartupXLOG(void)
 									 timebuf, sizeof(timebuf)))));
 			break;
 
-		case DB_UPGRADE_QUARANTINED:
-			ereport(LOG,
-					(errmsg("database system is held in pg_upgrade quarantine (last known up at %s)",
-							str_time(ControlFile->time,
-									 timebuf, sizeof(timebuf))),
-					 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
-			break;
-
 		case DB_IN_UPGRADE:
 			/*
 			 * LEE: crashed while replaying the upgrade window (informational
@@ -6824,40 +6702,17 @@ StartupXLOG(void)
 		promoted = PerformRecoveryXLogAction();
 
 	/*
-	 * LEE: revertable --wal-log-upgrade quarantine hold.
-	 *
-	 * WHY THIS LIVES IN CORE StartupXLOG():  the hold must happen at exactly one
-	 * point -- AFTER PerformRecoveryXLogAction() has written the end-of-recovery
-	 * checkpoint (so the reconstructed cluster is durable on disk and the control
-	 * checkpoint is past COMPLETE), but BEFORE the state flips to
-	 * DB_IN_PRODUCTION / SharedRecoveryState = DONE and backends are let in
-	 * (below).  There is no hook or extension point in that window; a --wal-log-
-	 * upgrade new cluster would otherwise silently go live the instant recovery
-	 * finishes, which is the exact behavior this feature exists to prevent.  The
-	 * guard is a single cheap branch (two process-local reads) and is inert for
-	 * every non-upgrade startup: IsUpgradeBootstrap() is only true when
-	 * PerformWalUpgradeIfNeeded() armed a sanctioned window for THIS startup, so
-	 * ordinary crash/archive/standby recovery never enters it.
-	 *
-	 * When held: record DB_UPGRADE_QUARANTINED and exit cleanly -- new_dir is
-	 * fully built but not serving, and the old cluster is untouched.  A restart
-	 * re-holds (PerformWalUpgradeIfNeeded sees the quarantine state).  "pg_upgrade
-	 * --commit" later releases the hold (a lightweight go-live from the durable
-	 * checkpoint, no window re-replay); "pg_upgrade --rollback" discards new_dir.
+	 * LEE (2026-07-20, auto-serve): the --wal-log-upgrade new cluster now comes
+	 * up read-write on first start, exactly like upstream pg_upgrade -- there is
+	 * NO hold and NO explicit "pg_upgrade --commit" step.  The old revertable
+	 * design held here (recorded a quarantine state and proc_exit(3)) so an
+	 * operator could commit/rollback before first write; that gate is removed.
+	 * Atomicity is preserved earlier instead: PerformWalUpgradeIfNeeded() FATALs
+	 * on a START-without-COMPLETE (partial) local window before arming, so only a
+	 * fully-replayed window ever reaches this point and serves.  Rollback is now a
+	 * frontend operation gated on old_dir integrity ("pg_upgrade
+	 * --wal-log-rollback"), not a recovery-time hold.
 	 */
-	if (IsUpgradeBootstrap() && !UpgradeCommitRequested())
-	{
-		ereport(LOG,
-				(errmsg("pg_upgrade: new cluster reconstructed; holding in quarantine (not serving)"),
-				 errhint("Run \"pg_upgrade --commit\" to adopt this cluster, or \"pg_upgrade --rollback\" to discard it.")));
-		SetControlFileUpgradeQuarantined();
-		/*
-		 * Exit with the special code the postmaster reads as "shut down the
-		 * whole server" (same as recovery_target_action=shutdown's proc_exit(3)).
-		 * proc_exit(0) would let the postmaster proceed to accept connections.
-		 */
-		proc_exit(3);
-	}
 
 	/*
 	 * If any of the critical GUCs have changed, log them before we allow
@@ -8086,19 +7941,7 @@ CreateCheckPoint(int flags)
 	 */
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	if (shutdown)
-	{
-		/*
-		 * LEE: --wal-log-upgrade holds the upgraded primary "not serving until
-		 * commit" by recording DB_UPGRADE_QUARANTINED on THIS shutdown checkpoint
-		 * (which also sits past XLOG_PG_UPGRADE_COMPLETE) when pg_upgrade armed it
-		 * via pg_arm_upgrade_quarantine() (marker file, cross-process).  Otherwise
-		 * the normal DB_SHUTDOWNED.
-		 */
-		if (UpgradeQuarantineArmed())
-			ControlFile->state = DB_UPGRADE_QUARANTINED;
-		else
-			ControlFile->state = DB_SHUTDOWNED;
-	}
+		ControlFile->state = DB_SHUTDOWNED;
 	ControlFile->checkPoint = ProcLastRecPtr;
 	ControlFile->checkPointCopy = checkPoint;
 	/* crash recovery should always recover to the end of WAL */
@@ -8496,14 +8339,7 @@ CreateRestartPoint(int flags)
 		if (flags & CHECKPOINT_IS_SHUTDOWN)
 		{
 			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-			/*
-			 * LEE: don't clobber the revertable-upgrade quarantine state.  The
-			 * COMPLETE redo handler set DB_UPGRADE_QUARANTINED and proc_exit(3)'d;
-			 * the ensuing shutdown restartpoint must leave that state intact so
-			 * "pg_upgrade --commit/--rollback/--status" can read it durably.
-			 */
-			if (ControlFile->state != DB_UPGRADE_QUARANTINED)
-				ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
+			ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
 			UpdateControlFile();
 			LWLockRelease(ControlFileLock);
 		}
@@ -8599,9 +8435,7 @@ CreateRestartPoint(int flags)
 				LocalMinRecoveryPoint = ControlFile->minRecoveryPoint;
 				LocalMinRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
 			}
-			/* LEE: preserve the revertable-upgrade quarantine state (see above) */
-			if ((flags & CHECKPOINT_IS_SHUTDOWN) &&
-				ControlFile->state != DB_UPGRADE_QUARANTINED)
+			if (flags & CHECKPOINT_IS_SHUTDOWN)
 				ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
 		}
 
