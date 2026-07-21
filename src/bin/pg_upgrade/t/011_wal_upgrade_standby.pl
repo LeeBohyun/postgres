@@ -10,7 +10,7 @@
 # upgraded primary AUTO-FETCHES the window anchor over the replication
 # connection (the PG_UPGRADE_WINDOW_ANCHOR command), arms its control file at
 # CN, and streams the window forward -- becoming a hot standby that serves the
-# upgraded data.  No operator "pg_upgrade --wal-prepare-standby" step and no
+# upgraded data.  No operator "prepare" step and no
 # hand-copied WAL are required.
 #
 # This test drives that path and, at each step, asserts the state transitions
@@ -136,7 +136,7 @@ ok($nslots >= 1, "primary: retention slot present ($nslots physical slot(s))");
 # Build a skeleton with the *new* binaries, then reduce it to a bare skeleton
 # (as the real feature does on the standby) so it has nothing but a control file
 # and must obtain everything by streaming.  It is given ONLY primary_conninfo:
-# no pre-staged anchor file, no --wal-prepare-standby.
+# no pre-staged anchor file.
 my $standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init;    # always the new/in-tree version
 
@@ -174,7 +174,7 @@ like(
 like(
 	$slog,
 	qr/started streaming|streaming WAL/,
-	'standby: STREAMED the window (no cp, no prepare-standby)');
+	'standby: STREAMED the window (no cp, no prepare step)');
 
 # State oracle: it is a hot standby (in recovery) that converged to the primary.
 # First wait until the standby has replayed the whole upgrade window and reached

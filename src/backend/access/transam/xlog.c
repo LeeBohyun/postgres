@@ -6711,7 +6711,7 @@ StartupXLOG(void)
 	 * on a START-without-COMPLETE (partial) local window before arming, so only a
 	 * fully-replayed window ever reaches this point and serves.  Rollback is now a
 	 * frontend operation gated on old_dir integrity ("pg_upgrade
-	 * --wal-rollback"), not a recovery-time hold.
+	 * --wal-upgrade-rollback"), not a recovery-time hold.
 	 */
 
 	/*

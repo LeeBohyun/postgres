@@ -5,15 +5,15 @@
 #   --copy, --clone, --link : the old cluster's data SURVIVES the transfer, so the
 #         upgrade is REVERTABLE.  --copy/--clone duplicate the files; --link only
 #         READS them (hard links).  For all three, --wal-upgrade keeps the old
-#         cluster intact (its removal is a separate, explicit --wal-delete-old
-#         step), so --wal-rollback can restore it.
+#         cluster intact (its removal is a separate, explicit --wal-upgrade-delete-old
+#         step), so --wal-upgrade-rollback can restore it.
 #   --copy-file-range : same family as copy, but needs the copy_file_range syscall
 #         (Linux); skipped where unavailable.
 #   --swap  : MOVES the old cluster's data into the new cluster, so there is nothing
 #         to roll back to -- it must be REFUSED with --wal-upgrade.
 #
 # This test asserts, per mode:
-#   copy/clone/link -> old cluster stays intact after the upgrade; --wal-rollback
+#   copy/clone/link -> old cluster stays intact after the upgrade; --wal-upgrade-rollback
 #                      restores it (data intact); the new cluster auto-serves the
 #                      upgraded data.
 #   swap            -> pg_upgrade refuses the combination up front.
@@ -47,7 +47,7 @@ for MODE in copy clone link; do
   if [ $? -ne 0 ]; then echo "FAIL: --$MODE upgrade"; tail -8 "$W/${MODE}_up.log"; FAIL=1; cd /; continue; fi
 
   # old cluster must stay INTACT through the upgrade (nothing disables it now --
-  # only --wal-delete-old does, explicitly, later)
+  # only --wal-upgrade-delete-old does, explicitly, later)
   [ -f "$OLD/global/pg_control" ] || { echo "FAIL: --$MODE disabled old cluster during upgrade (not revertable)"; FAIL=1; }
 
   # After upgrade the new cluster is a normal "shut down" cluster (auto-serve),
@@ -61,7 +61,7 @@ for MODE in copy clone link; do
   # demolished; old-cluster deletion is a separate, deferred step).  copy and link
   # therefore both leave old_dir intact, so rollback SUCCEEDS and restores it.
   # (--swap is rejected at parse time, tested separately below.)
-  "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-rollback >"$W/${MODE}_rb.log" 2>&1 \
+  "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-upgrade-rollback >"$W/${MODE}_rb.log" 2>&1 \
     || { echo "FAIL: --$MODE rollback should succeed (old_dir intact on this branch)"; cat "$W/${MODE}_rb.log"; FAIL=1; }
   [ -d "$NEW" ] && { echo "FAIL: --$MODE rollback left new_dir"; FAIL=1; }
   "$BIN/pg_ctl" -D "$OLD" -l "$W/${MODE}_old2.log" -w -t 20 start >/dev/null 2>&1

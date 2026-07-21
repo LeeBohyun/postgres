@@ -110,15 +110,15 @@ log "  skeleton sysid=$SKEL_SYSID  primary sysid=$NEW_ID (intentionally DIFFEREN
 # wipe the skeleton's data so nothing masks a missing WAL image (keep runtime dirs)
 rm -f "$TGT"/base/*/[0-9]* 2>/dev/null
 rm -f "$TGT"/global/[0-9]* "$TGT"/global/pg_filenode.map 2>/dev/null
-# primary_conninfo in config (standard for any standby); --wal-prepare-standby reads it
+# primary_conninfo in config (standard for any standby); at first startup the
+# skeleton auto-fetches the window anchor over this replication connection.
 cat >> "$TGT/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
 hot_standby=on
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
-"$NEWBIN/pg_upgrade" -B "$NEWBIN" -D "$TGT" --wal-prepare-standby >"$W/prep.log" 2>&1 \
-  || { echo "FAIL: prepare-standby"; cat "$W/prep.log"; FAIL=1; }
+touch "$TGT/standby.signal"
 # A streamed standby does NOT hold/commit: it streams the window and becomes a hot
 # standby of the primary directly.
 "$NEWBIN/pg_ctl" -D "$TGT" -l "$W/tgt.log" -w -t 90 start >/dev/null 2>&1 || true

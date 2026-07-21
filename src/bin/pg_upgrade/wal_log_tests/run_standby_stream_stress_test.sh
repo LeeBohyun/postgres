@@ -147,8 +147,7 @@ unix_socket_directories='$W'
 hot_standby=on
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
-  "$BIN/pg_upgrade" -B "$BIN" -D "$SKEL" --wal-prepare-standby >"$W/prep.log" 2>&1 \
-    || { echo "FAIL: $shape prepare-standby"; cat "$W/prep.log"; GRC=1; cd /; continue; }
+  touch "$SKEL/standby.signal"
   "$BIN/pg_ctl" -D "$SKEL" -l "$W/skel.log" -w -t 120 start >/dev/null 2>&1 || true
   UP=0
   for i in $(seq 1 90); do

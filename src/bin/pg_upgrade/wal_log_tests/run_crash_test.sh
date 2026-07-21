@@ -55,7 +55,7 @@ log "partial cluster: COMPLETE marker absent (nothing to adopt)"
 
 log "rollback the half-upgraded cluster (discard it); old must be untouched"
 # old_dir is intact (--copy, never started), so rollback is allowed.
-"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" --wal-rollback >"$W/rollback.log" 2>&1 || { cat "$W/rollback.log"; echo "FAIL: rollback of half-upgraded cluster"; FAIL=1; }
+"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" --wal-upgrade-rollback >"$W/rollback.log" 2>&1 || { cat "$W/rollback.log"; echo "FAIL: rollback of half-upgraded cluster"; FAIL=1; }
 [ -d "$NEW" ] && { echo "FAIL: rollback did not remove the half-upgraded new cluster"; FAIL=1; }
 
 log "verify OLD cluster is still fully usable"

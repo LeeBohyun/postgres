@@ -4,7 +4,7 @@
 # fully usable.  Under the auto-serve model there is no commit step; the
 # new cluster simply comes up on first start.  If that start fails, the operator
 # must still have a good old cluster to fall back to (old_dir is frozen through
-# the whole upgrade) and --wal-rollback must still restore it.
+# the whole upgrade) and --wal-upgrade-rollback must still restore it.
 #
 # We force the new cluster's start to fail with an invalid GUC value.
 #
@@ -51,7 +51,7 @@ AFTER_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(v)
 
 log "rollback must still discard the (un-startable) new cluster; old stays intact"
 # Un-poison is not needed: rollback just removes new_dir.  old_dir is intact.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new" --wal-rollback >"$W/rollback.log" 2>&1 \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new" --wal-upgrade-rollback >"$W/rollback.log" 2>&1 \
     || { cat "$W/rollback.log"; fail "rollback after failed start"; }
 [ -d "$W/new" ] && fail "rollback did not remove the new cluster"
 

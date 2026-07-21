@@ -261,10 +261,6 @@ typedef enum
 								 * primary's WAL; it propagates to streaming
 								 * standbys (via safekeepers in Neon) which then
 								 * stand down before the upgrade */
-	REVERTABLE_OP_PREPARE_STANDBY,	/* stamp a fresh skeleton (-D) from the LIVE
-								 * primary (--primary-conninfo) so it can STREAM the
-								 * upgrade window (no cp): writes the streaming
-								 * anchor + standby.signal + primary_conninfo/slot */
 } RevertableOp;
 
 /*

@@ -17,7 +17,7 @@
 #   crash path:  old (vN)  --pg_upgrade with COMPLETE suppressed-->  a window
 #                with START but no COMPLETE on disk  --first start-->  FATAL
 #                (never serves a half-built catalog); the old cluster stays
-#                intact and startable, and --wal-rollback discards new.
+#                intact and startable, and --wal-upgrade-rollback discards new.
 #
 # Cross-version: when $ENV{oldinstall} is set the old cluster is built with an
 # older major's binaries (checksums are pre-18 so pass -k there); otherwise the
@@ -182,7 +182,7 @@ sub add_conn_conf
 # pg_upgrade emit the whole upgrade window but omit the COMPLETE marker,
 # simulating a crash after START.  The new cluster must FATAL on first start
 # (never serve a half-built catalog), the old cluster must stay intact, and
-# --wal-rollback must discard the dead-end new cluster.
+# --wal-upgrade-rollback must discard the dead-end new cluster.
 #
 {
 	my $old = setup_old('old_crash');
@@ -239,9 +239,9 @@ sub add_conn_conf
 			'--socketdir' => $new->host,
 			'--old-port' => $old->port,
 			'--new-port' => $new->port,
-			'--wal-rollback',
+			'--wal-upgrade-rollback',
 		],
-		'crash: --wal-rollback discards the half-upgraded new cluster');
+		'crash: --wal-upgrade-rollback discards the half-upgraded new cluster');
 	ok(!-d $new->data_dir,
 		'crash: rollback removed the half-upgraded new data directory');
 

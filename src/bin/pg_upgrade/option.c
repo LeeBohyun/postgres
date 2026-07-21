@@ -67,15 +67,11 @@ parseCommandLine(int argc, char *argv[])
 		/* LEE: capture the upgrade as WAL and reconstruct it on first startup */
 		{"wal-upgrade", no_argument, NULL, 9},
 		/* LEE: --wal-upgrade lifecycle subcommands (act on -D new / -d old).
-		 * Namespaced with the "wal-" prefix so they are clearly part of THIS
-		 * feature and never mistaken for stock pg_upgrade behavior. */
-		{"wal-rollback", no_argument, NULL, 11},
-		{"wal-delete-old", no_argument, NULL, 12},
-		{"wal-signal-handoff", no_argument, NULL, 14},
-		/* prepare a fresh skeleton to STREAM the upgrade window from the live
-		 * primary (stamps its control file; no cp).  Needs -D; reads the standard
-		 * primary_conninfo GUC from the skeleton's config (no dedicated flag). */
-		{"wal-prepare-standby", no_argument, NULL, 15},
+		 * Namespaced with the "wal-upgrade-" prefix so they are clearly part of
+		 * THIS feature and never mistaken for stock pg_upgrade behavior. */
+		{"wal-upgrade-rollback", no_argument, NULL, 11},
+		{"wal-upgrade-delete-old", no_argument, NULL, 12},
+		{"wal-upgrade-signal-handoff", no_argument, NULL, 14},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -266,9 +262,6 @@ parseCommandLine(int argc, char *argv[])
 			case 14:
 				user_opts.revertable_op = REVERTABLE_OP_SIGNAL_HANDOFF;
 				break;
-			case 15:
-				user_opts.revertable_op = REVERTABLE_OP_PREPARE_STANDBY;
-				break;
 
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
@@ -325,7 +318,7 @@ parseCommandLine(int argc, char *argv[])
 	if (user_opts.revertable_op == REVERTABLE_OP_DELETE_OLD)
 	{
 		if (old_cluster.pgdata == NULL)
-			pg_fatal("--wal-delete-old requires the old cluster data directory (-d/--old-datadir)");
+			pg_fatal("--wal-upgrade-delete-old requires the old cluster data directory (-d/--old-datadir)");
 		return;
 	}
 	else if (user_opts.revertable_op == REVERTABLE_OP_SIGNAL_HANDOFF)
@@ -336,19 +329,7 @@ parseCommandLine(int argc, char *argv[])
 		 * cluster's socket); unlike other ops the old cluster is RUNNING here.
 		 */
 		if (old_cluster.pgdata == NULL)
-			pg_fatal("--wal-signal-handoff requires the old cluster data directory (-d/--old-datadir)");
-		return;
-	}
-	else if (user_opts.revertable_op == REVERTABLE_OP_PREPARE_STANDBY)
-	{
-		/*
-		 * --prepare-standby stamps a fresh skeleton (-D) so it can STREAM the
-		 * upgrade window from the live primary.  The primary is named by the
-		 * standard primary_conninfo GUC in the skeleton's config (as for any
-		 * standby) -- no dedicated flag.  It needs only -D; no old cluster/bindir.
-		 */
-		if (new_cluster.pgdata == NULL)
-			pg_fatal("--wal-prepare-standby requires the new (skeleton) data directory (-D/--new-datadir)");
+			pg_fatal("--wal-upgrade-signal-handoff requires the old cluster data directory (-d/--old-datadir)");
 		return;
 	}
 	else if (user_opts.revertable_op != REVERTABLE_OP_NONE)

@@ -6,19 +6,19 @@
 # replication connection, using:
 #
 #   - the retention slot (UPGRADE_WINDOW_SLOT) that pins the window on the primary
-#     so it survives commit and is streamable, and
-#   - "pg_upgrade --wal-prepare-standby", which stamps the skeleton's control file
-#     with the primary's sysid + CN anchor + TLI so its walreceiver accepts the
-#     primary and recovery starts at CN.
+#     so it survives the upgrade and is streamable, and
+#   - AUTO-ANCHOR: with primary_conninfo set, the skeleton fetches the window
+#     anchor from the primary over the replication connection at first startup and
+#     arms its own control file (sysid + CN + TLI) so recovery starts at CN.  No
+#     operator prepare step and no cp.
 #
-# A streamed standby does NOT hold/commit: it streams the window from the
-# already-committed primary and continues as an ordinary hot standby following it.
+# A streamed standby continues as an ordinary hot standby following the primary.
 #
 # DECISIVE ASSERTIONS:
 #   * the operator NEVER cp's a WAL segment into the skeleton (this script copies
-#     nothing; it only runs --wal-prepare-standby + pg_ctl start), and
+#     nothing; it only sets primary_conninfo + standby.signal and pg_ctl start), and
 #   * the skeleton's log shows it STREAMED (walreceiver "started streaming" /
-#     "arming streaming standby from anchor"), came up as a hot standby
+#     "auto-armed streaming standby from primary"), came up as a hot standby
 #     (pg_is_in_recovery=t), and serves data byte-identical to the primary.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
@@ -84,24 +84,22 @@ log "3. fresh new-version SKELETON, prepared to STREAM (no cp of any WAL)"
 # STREAM, not cp).  Do NOT copy any [0-9A-F] WAL segment into it.
 rm -f "$SKEL"/base/*/[0-9]* 2>/dev/null
 rm -f "$SKEL"/global/[0-9]* "$SKEL"/global/pg_filenode.map 2>/dev/null
-# primary_conninfo is set in the skeleton config (standard for any standby);
-# --wal-prepare-standby reads it (no dedicated flag).
+# primary_conninfo is set in the skeleton config (standard for any standby); at
+# first startup the skeleton auto-fetches the window anchor from the primary over
+# this replication connection -- no operator prepare step, no anchor file.
 cat >> "$SKEL/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
 hot_standby=on
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
+touch "$SKEL/standby.signal"
 SKEL_ID_BEFORE=$("$BIN/pg_controldata" -D "$SKEL" | grep -i 'system identifier' | grep -oE '[0-9]+')
-log "skeleton sysid BEFORE prepare: $SKEL_ID_BEFORE (differs from primary $NEW_ID)"
+log "skeleton sysid BEFORE start: $SKEL_ID_BEFORE (differs from primary $NEW_ID)"
 
-"$BIN/pg_upgrade" -B "$BIN" -D "$SKEL" --wal-prepare-standby >"$W/prep.log" 2>&1 \
-    || { echo "FAIL prepare-standby"; cat "$W/prep.log"; FAIL=1; }
-# The prepare step must have created the anchor + standby.signal, but NO WAL cp.
-[ -f "$SKEL/pg_upgrade_stream.anchor" ] || { echo "FAIL: no streaming anchor written"; FAIL=1; }
+# Pure auto-fetch path: there must be NO pre-staged anchor file.
+[ -f "$SKEL/pg_upgrade_stream.anchor" ] && { echo "FAIL: unexpected pre-staged anchor file"; FAIL=1; }
 [ -f "$SKEL/standby.signal" ]           || { echo "FAIL: no standby.signal written"; FAIL=1; }
-grep -q "primary_slot_name" "$SKEL/postgresql.auto.conf" || { echo "FAIL: primary_slot_name not configured"; FAIL=1; }
-log "anchor file: $(cat "$SKEL/pg_upgrade_stream.anchor")"
 
 log "4. START the skeleton: it STREAMS the window from the live primary and becomes a hot standby"
 # A streamed standby does NOT hold or commit: it streams the window from the
@@ -115,7 +113,7 @@ for i in $(seq 1 60); do
   sleep 1
 done
 # Decisive assertions:
-grep -q "arming streaming standby from anchor" "$W/skel.log" \
+grep -q "auto-armed streaming standby from primary" "$W/skel.log" \
   && log "  skeleton armed from the streaming anchor (sysid+CN+TLI stamped)" \
   || { echo "  FAIL: skeleton did not arm from the streaming anchor"; tail -20 "$W/skel.log"; FAIL=1; }
 if grep -qiE "started streaming|streaming WAL" "$W/skel.log"; then

@@ -56,7 +56,7 @@ log "E1: rollback requires a real -D data directory (refuses a non-datadir)"
 # (no PG_VERSION) must be refused rather than rm'd.
 mkdir -p "$W/notadatadir"
 make_old "$W/rand" 100    # a valid old cluster to use as -d
-if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/rand" -D "$W/notadatadir" --wal-rollback >"$W/e1.log" 2>&1; then
+if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/rand" -D "$W/notadatadir" --wal-upgrade-rollback >"$W/e1.log" 2>&1; then
     fail "rollback succeeded with a non-datadir -D (should be refused)"
 fi
 grep -qi "not a PostgreSQL data directory\|PG_VERSION" "$W/e1.log" || { cat "$W/e1.log"; fail "E1 wrong error"; }
@@ -90,7 +90,7 @@ log "E3: rollback refuses when old_dir is not intact (damaged control file)"
 # Corrupt old2's control file so old_cluster_intact() rejects it.
 cp "$W/old2/global/pg_control" "$W/pg_control.bak"
 : > "$W/old2/global/pg_control"   # truncate -> bad CRC / unreadable
-if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old2" -D "$W/new2" --wal-rollback >"$W/e3.log" 2>&1; then
+if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old2" -D "$W/new2" --wal-upgrade-rollback >"$W/e3.log" 2>&1; then
     fail "rollback succeeded with a damaged old cluster (should refuse)"
 fi
 # Refusal may surface either as our "not intact / PITR" message or as the
@@ -105,7 +105,7 @@ log "PASS E3"
 
 # =========================================================== E5: big rollback
 log "E5: rollback of new2 -> old2 byte-identical + serves"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old2" -D "$W/new2" --wal-rollback >"$W/e5.log" 2>&1 || { cat "$W/e5.log"; fail "rollback new2"; }
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old2" -D "$W/new2" --wal-upgrade-rollback >"$W/e5.log" 2>&1 || { cat "$W/e5.log"; fail "rollback new2"; }
 [ -d "$W/new2" ] && fail "E5: rollback did not remove new2"
 AFTER_FP=$(fp "$W/old2")
 [ "$OLD2_FP" = "$AFTER_FP" ] || fail "E5: old2 changed after rollback (old=$OLD2_FP after=$AFTER_FP)"
@@ -123,12 +123,12 @@ log "PASS E6"
 # =========================================================== E7: delete-old gating
 log "E7: delete-old refuses without a completed new cluster, succeeds with one"
 # A random -D (no COMPLETE marker) must be refused.
-if "$BIN/pg_upgrade" -d "$W/old2" -D "$W/rand" --wal-delete-old >"$W/e7a.log" 2>&1; then
+if "$BIN/pg_upgrade" -d "$W/old2" -D "$W/rand" --wal-upgrade-delete-old >"$W/e7a.log" 2>&1; then
     fail "E7: delete-old succeeded with a non-completed new cluster"
 fi
 [ -d "$W/old2" ] || fail "E7: delete-old removed old2 despite refusing"
 # With the real completed new cluster (new2b), delete-old removes old2.
-"$BIN/pg_upgrade" -d "$W/old2" -D "$W/new2b" --wal-delete-old >"$W/e7b.log" 2>&1 || { cat "$W/e7b.log"; fail "E7 delete-old old2"; }
+"$BIN/pg_upgrade" -d "$W/old2" -D "$W/new2b" --wal-upgrade-delete-old >"$W/e7b.log" 2>&1 || { cat "$W/e7b.log"; fail "E7 delete-old old2"; }
 [ -d "$W/old2" ] && fail "E7: delete-old did not remove old2"
 log "PASS E7"
 

@@ -112,8 +112,8 @@ main(int argc, char **argv)
 	parseCommandLine(argc, argv);
 
 	/*
-	 * LEE: revertable-upgrade lifecycle subcommands (--commit / --rollback /
-	 * --delete-old / --signal-handoff / --prepare-standby) act on an existing
+	 * LEE: revertable-upgrade lifecycle subcommands (--wal-upgrade-rollback /
+	 * --wal-upgrade-delete-old / --wal-upgrade-signal-handoff) act on an existing
 	 * cluster and exit; they do not run an upgrade.  new_cluster.bindir locates
 	 * pg_ctl.
 	 */
@@ -257,7 +257,7 @@ main(int argc, char **argv)
 	 * LEE: but NOT for --wal-upgrade.  Revertability here means "the old
 	 * cluster stays intact and startable so it can be rolled back to"; disabling
 	 * it during the upgrade would defeat that.  The old cluster is retained and is
-	 * only removed later by the explicit "pg_upgrade --wal-delete-old" step.
+	 * only removed later by the explicit "pg_upgrade --wal-upgrade-delete-old" step.
 	 * (--swap is rejected for --wal-upgrade in option validation; it never
 	 * reaches here.  --link: note that new_dir hard-links old_dir's files, so the
 	 * usual upstream caveat -- do not run BOTH clusters -- still applies; commit
@@ -408,7 +408,7 @@ main(int argc, char **argv)
 		 * checkpoint lands past
 		 * COMPLETE, so PerformWalUpgradeIfNeeded()'s "already applied" guard makes
 		 * it skip the window and serve.  Rollback is a frontend operation gated on
-		 * old_dir integrity ("pg_upgrade --wal-rollback"), not a startup hold.
+		 * old_dir integrity ("pg_upgrade --wal-upgrade-rollback"), not a startup hold.
 		 */
 		PQfinish(conn);
 
@@ -431,7 +431,7 @@ main(int argc, char **argv)
 
 		/*
 		 * LEE: drop the durable "window reached COMPLETE" marker that the
-		 * --wal-rollback completeness gate consults.  On a STANDBY this marker
+		 * --wal-upgrade-rollback completeness gate consults.  On a STANDBY this marker
 		 * is written by the COMPLETE redo handler during window replay; the PRIMARY
 		 * does not replay, so we write it here -- the window definitionally reached
 		 * COMPLETE (we emitted pg_upgrade_wal_complete() above, unless the

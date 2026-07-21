@@ -12,7 +12,7 @@
 #
 # Proves: (a) the new cluster auto-serves like upstream (no hold, no commit),
 # (b) rollback is gated on old_dir integrity and restores the old cluster,
-# (c) data matches after auto-serve, (d) --wal-delete-old removes old_dir.
+# (c) data matches after auto-serve, (d) --wal-upgrade-delete-old removes old_dir.
 #
 set -u
 
@@ -86,7 +86,7 @@ log "PASS: new cluster auto-served on first start with data intact (no commit)"
 # It is allowed even though we already started (and could have written to) the
 # new cluster above -- discarding those changes with a warning.
 log "Scenario 2: rollback discards new (even after it served), old still serves"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-rollback > "$WORK/rollback.log" 2>&1 \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-upgrade-rollback > "$WORK/rollback.log" 2>&1 \
     || { cat "$WORK/rollback.log"; fail "rollback exited nonzero"; }
 grep -qi "WARNING" "$WORK/rollback.log" || fail "rollback did not warn about discarding new-cluster changes"
 [ -d "$NEW" ] && fail "rollback did not remove new cluster dir"
@@ -99,7 +99,7 @@ log "PASS: rollback (old_dir intact) restored the old cluster untouched"
 
 # ====================================================== Scenario 3: ADOPT + DELETE-OLD
 # Adopting the new cluster is just: upgrade, then start it (auto-serve).  Once
-# adopted, --wal-delete-old removes the now-unneeded old cluster.
+# adopted, --wal-upgrade-delete-old removes the now-unneeded old cluster.
 log "Scenario 3: upgrade again, auto-serve, then delete-old removes old_dir"
 NEW=$WORK/new3
 run_upgrade "$OLD" "$NEW" || { tail -30 "$WORK/upgrade.log"; fail "second upgrade exited nonzero"; }
@@ -115,8 +115,8 @@ log "PASS: second upgrade auto-served with data intact"
 log "Scenario 4: delete-old removes the old cluster"
 # delete-old now requires -D too, to confirm a completed new cluster exists
 # before removing the old one (there is no commit stamp anymore).
-"$BIN/pg_upgrade" -d "$OLD" -D "$NEW" --wal-delete-old > "$WORK/del.log" 2>&1 || { cat "$WORK/del.log"; fail "--wal-delete-old exited nonzero"; }
-[ -d "$OLD" ] && fail "--wal-delete-old did not remove old dir"
+"$BIN/pg_upgrade" -d "$OLD" -D "$NEW" --wal-upgrade-delete-old > "$WORK/del.log" 2>&1 || { cat "$WORK/del.log"; fail "--wal-upgrade-delete-old exited nonzero"; }
+[ -d "$OLD" ] && fail "--wal-upgrade-delete-old did not remove old dir"
 log "PASS: delete-old removed the old cluster"
 
 log "ALL SCENARIOS PASSED"
