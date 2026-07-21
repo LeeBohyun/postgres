@@ -393,6 +393,86 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--wal-upgrade</option></term>
+      <listitem>
+       <para>
+        Capture the entire upgrade as write-ahead log (WAL) so that it is
+        replayable, and leave the new cluster ready to start read-write on its
+        own.  The new cluster comes up on its first start with no separate
+        commit step, exactly as an ordinary upgraded cluster would.
+       </para>
+       <para>
+        Compared with a plain upgrade, <option>--wal-upgrade</option> keeps the
+        old cluster intact so the upgrade can be reverted (see
+        <option>--wal-upgrade-rollback</option>) until it is explicitly retired
+        (see <option>--wal-upgrade-delete-old</option>), and it makes the
+        upgraded state streamable so a standby can be re-provisioned by ordinary
+        replication from the upgraded primary rather than a fresh base backup.
+       </para>
+       <para>
+        It may be combined with <option>--copy</option>,
+        <option>--clone</option>, or <option>--link</option>, but not with
+        <option>--swap</option>, which consumes the old cluster and would leave
+        nothing to revert to.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--wal-upgrade-rollback</option></term>
+      <listitem>
+       <para>
+        Discard a cluster produced by <option>--wal-upgrade</option> and return
+        to the old cluster, which was never modified.  The new cluster data
+        directory given with <option>-D</option>/<option>--new-datadir</option>
+        is removed; the operator then simply restarts on the old data directory
+        with the old binaries.
+       </para>
+       <para>
+        Rollback is available whenever the old cluster is intact.  If the old
+        cluster is unusable &mdash; consumed by <option>--swap</option>, damaged,
+        or already started after the upgrade &mdash; there is nothing safe to
+        return to, so the command exits with an error.  If the new cluster has
+        already been started and taken writes, rolling back discards them; the
+        command warns rather than blocks, leaving that judgement to the
+        operator.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--wal-upgrade-delete-old</option></term>
+      <listitem>
+       <para>
+        Retire the old cluster once the operator is confident in the upgrade.
+        The old cluster data directory given with
+        <option>-d</option>/<option>--old-datadir</option> is removed.  This
+        requires a fully upgraded new cluster
+        (<option>-D</option>/<option>--new-datadir</option>), so the old cluster
+        is never removed unless a working replacement exists.
+       </para>
+       <para>
+        <application>pg_upgrade</application> does not distinguish a primary from
+        a standby: to clean up a replica set, run this command on each node
+        whose old cluster should be removed.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--wal-upgrade-signal-handoff</option></term>
+      <listitem>
+       <para>
+        Emit a handoff trigger into the live old cluster's WAL
+        (<option>-d</option>/<option>--old-datadir</option>) so that streaming
+        standbys following it stand down before the upgrade.  This is used
+        before a <option>--wal-upgrade</option> run in replicated deployments;
+        it does not itself upgrade anything.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-?</option></term>
       <term><option>--help</option></term>
       <listitem><para>show help, then exit</para></listitem>
