@@ -12,7 +12,7 @@
 # Flow: PG18 old primary + PG18 basebackup standby -> pg_upgrade 18->20
 # --wal-upgrade on the primary, commit, keep it live -> a fresh 20devel
 # skeleton STREAMS the upgrade window from the live primary (pg_upgrade
-# --wal-prepare-standby; NO cp) -> it replays from CN and becomes a v20 hot standby
+# auto-anchor; NO cp) -> it replays from CN and becomes a v20 hot standby
 # that matches the upgraded primary.
 #
 # Requires: OLDBIN (an 18.x bin dir) and NEWBIN (the 20devel wal_upgrade
@@ -95,18 +95,19 @@ log "3. build a fresh NEW-version SKELETON as the standby target and STREAM the 
 # A cross-version standby CANNOT reuse its old v18 data dir: the new binary's
 # PG_VERSION and pg_control version gates reject it BEFORE replay.  So the target
 # is a fresh new-version initdb skeleton (like a re-provisioned standby) that
-# STREAMS the window from the live upgraded primary via --wal-prepare-standby.
+# STREAMS the window from the live upgraded primary via auto-anchor over the replication connection.
 #
 # NOTE: we deliberately do NOT stamp the skeleton's system identifier.  The
 # skeleton keeps its OWN fresh initdb sysid (which differs from the primary's),
-# and --wal-prepare-standby stamps the primary's sysid + CN anchor + TLI so the
-# walreceiver accepts the primary and recovery starts at CN.  This proves the
+# and it auto-fetches the primary's sysid + CN anchor + TLI over the replication
+# connection so the walreceiver accepts the primary and recovery starts at CN.
+# This proves the
 # pg_resetwal --system-identifier flag is not needed: adoption is in-process.
 TGT=$W/target
 "$NEWBIN/initdb" -D "$TGT" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb-target; exit 1; }
 SKEL_SYSID=$("$NEWBIN/pg_controldata" -D "$TGT" | grep -i "system identifier" | grep -oE "[0-9]+")
 NEW_ID=$("$NEWBIN/pg_controldata" -D "$NEW" | grep -i "system identifier" | grep -oE "[0-9]+")
-log "  skeleton sysid=$SKEL_SYSID  primary sysid=$NEW_ID (intentionally DIFFERENT; stamped by --wal-prepare-standby)"
+log "  skeleton sysid=$SKEL_SYSID  primary sysid=$NEW_ID (intentionally DIFFERENT; auto-fetched from the primary)"
 # wipe the skeleton's data so nothing masks a missing WAL image (keep runtime dirs)
 rm -f "$TGT"/base/*/[0-9]* 2>/dev/null
 rm -f "$TGT"/global/[0-9]* "$TGT"/global/pg_filenode.map 2>/dev/null
@@ -127,8 +128,8 @@ for i in $(seq 1 60); do
   "$NEWBIN/psql" -h "$W" -p $SP -U postgres -tAc "SELECT 1" >/dev/null 2>&1 && { UP=1; break; }
   sleep 1
 done
-grep -q "arming streaming standby from anchor" "$W/tgt.log" \
-  && log "  target armed from the streaming anchor and STREAMED the $OLDVER->$NEWVER window (no cp)" \
+grep -q "auto-armed streaming standby from primary" "$W/tgt.log" \
+  && log "  target auto-armed from the primary and STREAMED the $OLDVER->$NEWVER window (no cp)" \
   || { echo "  FAIL: target did not arm+stream from the primary"; tail -20 "$W/tgt.log"; FAIL=1; }
 grep -qiE "started streaming|streaming WAL" "$W/tgt.log" \
   || { echo "  FAIL: no evidence the target streamed WAL"; tail -20 "$W/tgt.log"; FAIL=1; }

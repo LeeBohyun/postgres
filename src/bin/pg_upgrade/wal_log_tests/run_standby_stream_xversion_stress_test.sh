@@ -5,7 +5,7 @@
 #   - VERSION permutations: each available old major (v14..v18) -> 20devel
 #   - DATA shapes: manyrel (many relations/dbs), bigcat (large pg_attribute),
 #     bigdata (multi-segment relfiles)
-#   - DELIVERY: the standby STREAMS the upgrade window (no cp) via --wal-prepare-standby
+#   - DELIVERY: the standby STREAMS the upgrade window (no cp) via auto-anchor over the replication connection
 #
 # For each (old-major x shape): upgrade old->20devel --wal-upgrade on the
 # primary, commit -> live; a fresh 20devel skeleton streams the window and becomes
