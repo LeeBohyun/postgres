@@ -103,10 +103,6 @@ typedef struct CheckPoint
 												 * trigger, emitted in the OLD
 												 * cluster's own WAL just before
 												 * pg_upgrade shuts it down */
-#define XLOG_UPGRADE_DELETE_AUTHORIZE 0x70	/* set-wide "old cluster may now be
-												 * deleted" signal, emitted on the
-												 * live NEW primary by --delete-old
-												 * and replayed by NEW standbys */
 #define XLOG_CHECKPOINT_REDO			0xE0
 #define XLOG_LOGICAL_DECODING_STATUS_CHANGE	0xF0
 
@@ -162,30 +158,6 @@ typedef struct xl_pg_upgrade_handoff
 } xl_pg_upgrade_handoff;
 
 #define SizeOfXLPgUpgradeHandoff	sizeof(xl_pg_upgrade_handoff)
-
-/*
- * LEE: XLOG_UPGRADE_DELETE_AUTHORIZE — set-wide "the old cluster may now be
- * deleted" signal.
- *
- * Emitted on the LIVE, committed NEW primary by "pg_upgrade --delete-old" (in the
- * NEW WAL format, so NEW-version streaming standbys read it).  It carries NO
- * data; it is a control signal.  When a NEW standby replays it, the standby marks
- * its OWN superseded old cluster as "delete authorized" -- it does NOT rm
- * anything from the redo handler (an irreversible rm in WAL replay would also
- * re-run on crash recovery, and the primary does not know the standby's
- * host-specific old-dir path).  The physical removal stays a local
- * "pg_upgrade --delete-old" on the standby, which the authorization unblocks.
- *
- * A standby honors it only if its own old dir is already superseded (a commit ran
- * there), so a stray/replayed signal can never remove a still-live cluster.
- */
-typedef struct xl_pg_upgrade_delete_authorize
-{
-	uint32		new_major_version;	/* the committed new cluster's major version */
-	pg_time_t	authorize_time;		/* wall-clock time of this record */
-} xl_pg_upgrade_delete_authorize;
-
-#define SizeOfXLPgUpgradeDeleteAuthorize	sizeof(xl_pg_upgrade_delete_authorize)
 
 /*
  * LEE: XLOG_UPGRADE_SLRU_DATA — full page image of one SLRU segment, emitted

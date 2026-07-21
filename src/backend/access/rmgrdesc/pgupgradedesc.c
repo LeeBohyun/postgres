@@ -97,15 +97,6 @@ pg_upgrade_desc(StringInfo buf, XLogReaderState *record)
 						 xlrec.target_major_version,
 						 (long long) xlrec.handoff_time);
 	}
-	else if (info == XLOG_UPGRADE_DELETE_AUTHORIZE)
-	{
-		xl_pg_upgrade_delete_authorize xlrec;
-
-		memcpy(&xlrec, rec, SizeOfXLPgUpgradeDeleteAuthorize);
-		appendStringInfo(buf, "new_major_version %u; time %lld",
-						 xlrec.new_major_version,
-						 (long long) xlrec.authorize_time);
-	}
 }
 
 const char *
@@ -127,8 +118,6 @@ pg_upgrade_identify(uint8 info)
 			return "UPGRADE_DIRTREE";
 		case XLOG_UPGRADE_HANDOFF:
 			return "PG_UPGRADE_HANDOFF";
-		case XLOG_UPGRADE_DELETE_AUTHORIZE:
-			return "PG_UPGRADE_DELETE_AUTHORIZE";
 	}
 	return NULL;
 }

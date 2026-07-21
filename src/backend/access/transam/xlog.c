@@ -8899,40 +8899,6 @@ XLogWritePgUpgradeHandoff(uint32 old_major_version, uint32 target_major_version)
 }
 
 /*
- * LEE: XLogWritePgUpgradeDeleteAuthorize — emit the set-wide "old cluster may now
- * be deleted" signal.
- *
- * Called on the LIVE, committed NEW primary (via
- * pg_upgrade_wal_authorize_delete()) from "pg_upgrade --delete-old".  It streams
- * to NEW-version standbys
- * like any other NEW-format record; on replay each standby marks its own
- * superseded old cluster delete-authorized (see the redo handler).  Flushed so it
- * reaches the standbys promptly.
- */
-XLogRecPtr
-XLogWritePgUpgradeDeleteAuthorize(uint32 new_major_version)
-{
-	xl_pg_upgrade_delete_authorize xlrec;
-	XLogRecPtr	RecPtr;
-
-	xlrec.new_major_version = new_major_version;
-	xlrec.authorize_time = (pg_time_t) time(NULL);
-
-	XLogBeginInsert();
-	XLogRegisterData(&xlrec, SizeOfXLPgUpgradeDeleteAuthorize);
-	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_DELETE_AUTHORIZE);
-
-	XLogFlush(RecPtr);
-
-	ereport(LOG,
-			(errmsg("pg_upgrade delete-authorize signal recorded at %X/%X "
-					"(new major version %u)",
-					LSN_FORMAT_ARGS(RecPtr), new_major_version)));
-
-	return RecPtr;
-}
-
-/*
  * LEE: recursively collect PGDATA-relative subdirectory paths under "abspath"
  * (whose PGDATA-relative prefix is "relpath"), appending each as a
  * NUL-terminated string to "buf" and counting them in *ndirs.  Parent

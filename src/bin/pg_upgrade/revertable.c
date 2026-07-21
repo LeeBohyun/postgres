@@ -259,24 +259,6 @@ drop_upgrade_window_slot(void)
 		return;
 	}
 
-	/*
-	 * Emit the set-wide delete-authorize signal into the live new primary's WAL
-	 * FIRST (before dropping the slot): it streams to NEW standbys, which on
-	 * replay mark their own old cluster delete-authorized, so the operator can run
-	 * "pg_upgrade --wal-upgrade-delete-old" on each standby without extra ceremony.  This is a
-	 * no-op if there are no standbys.  Best-effort: a failure here must not fail
-	 * the primary's own old-cluster deletion (already done by the caller).
-	 */
-	prep_status("Signaling standbys that the old cluster may be deleted");
-	res = PQexec(conn, "SELECT pg_upgrade_wal_authorize_delete()");
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		pg_log(PG_WARNING,
-			   "could not emit the set-wide delete-authorize signal: %s"
-			   "standbys must be told to delete their old clusters manually",
-			   PQerrorMessage(conn));
-	PQclear(res);
-	check_ok();
-
 	prep_status("Dropping upgrade-window retention slot \"%s\"", UPGRADE_WINDOW_SLOT);
 	res = PQexec(conn,
 				 "SELECT pg_drop_replication_slot(slot_name) "
@@ -287,27 +269,14 @@ drop_upgrade_window_slot(void)
 	check_ok();
 }
 
-/* Did a replayed set-wide delete-authorize signal land in the new cluster? */
-static bool
-delete_authorized_by_signal(const char *new_datadir)
-{
-	char		path[MAXPGPATH];
-	struct stat st;
-
-	if (new_datadir == NULL || new_datadir[0] == '\0')
-		return false;
-	snprintf(path, sizeof(path), "%s/%s", new_datadir, "pg_upgrade_delete_authorized");
-	return stat(path, &st) == 0;
-}
-
 /*
- * --wal-upgrade-delete-old: delete an old cluster that a commit has superseded.
+ * --wal-upgrade-delete-old: delete this node's old cluster now that it has been
+ * superseded by a fully-upgraded new cluster.
  *
- * On a STANDBY, the new cluster may also carry a replayed set-wide
- * delete-authorize signal (pg_upgrade_delete_authorized), emitted by --wal-upgrade-delete-old
- * on the primary.  We report that as the authorizing reason, but still require
- * the old dir to be superseded (the real safety gate): the signal is a fleet-wide
- * "go", not a license to delete a still-live cluster.
+ * pg_upgrade does not distinguish primary from standby: the operator runs this
+ * on each node whose old cluster should be removed.  The only safety gate is
+ * that -D points at a completed --wal-upgrade cluster (COMPLETE marker present),
+ * so the old cluster is never removed unless a working replacement exists.
  */
 static void
 do_delete_old(void)
@@ -332,10 +301,6 @@ do_delete_old(void)
 		pg_fatal("new cluster \"%s\" is not a completed --wal-upgrade cluster "
 				 "(no \"%s\"); refusing to delete the old cluster",
 				 new_cluster.pgdata, UPGRADE_COMPLETE_MARKER);
-
-	if (delete_authorized_by_signal(new_cluster.pgdata))
-		pg_log(PG_REPORT,
-			   "set-wide delete-authorize signal present; proceeding to delete this node's old cluster");
 
 	prep_status("Deleting superseded old cluster \"%s\"", old_cluster.pgdata);
 	if (!rmtree(old_cluster.pgdata, true))

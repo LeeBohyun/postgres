@@ -426,16 +426,6 @@ static bool in_upgrade_bootstrap = false;
 #define UPGRADE_COMPLETE_MARKER	"pg_upgrade_complete.done"
 
 /*
- * LEE: durable "this node's old cluster is authorized for deletion" marker,
- * written+fsync'd by the XLOG_UPGRADE_DELETE_AUTHORIZE redo handler when a NEW
- * streaming standby replays the set-wide delete signal from the primary.  A local
- * "pg_upgrade --delete-old" on the standby treats this marker as authorization to
- * remove the (superseded) old cluster, so the operator need not hand-run
- * delete-old fleet-wide.  Written under DataDir (redo cwd == DataDir).
- */
-#define UPGRADE_DELETE_AUTHORIZED_MARKER	"pg_upgrade_delete_authorized"
-
-/*
  * LEE: true once PerformWalUpgradeIfNeeded() has armed the sanctioned upgrade
  * replay for this startup.  StartupXLOG() consults it at end-of-recovery.
  */
@@ -894,41 +884,6 @@ pg_upgrade_redo(XLogReaderState *record)
 							 "from the delivered upgrade WAL; it will replay the upgrade from "
 							 "the end-of-upgrade checkpoint.")));
 		}
-	}
-	else if (info == XLOG_UPGRADE_DELETE_AUTHORIZE)
-	{
-		/*
-		 * LEE: set-wide "the old cluster may now be deleted" signal, emitted by
-		 * "pg_upgrade --delete-old" on the live NEW primary and replayed here by a
-		 * NEW streaming standby.  We do NOT rm anything from redo (an irreversible
-		 * rm in WAL replay would re-run on crash recovery, and we do not know this
-		 * standby's old-dir path).  Instead drop a durable marker file; a local
-		 * "pg_upgrade --delete-old" on this standby checks for it and is thereby
-		 * authorized to remove the (already superseded) old cluster.  fsync so the
-		 * authorization survives a crash.
-		 *
-		 * On the primary itself the record is a harmless no-op on replay: the
-		 * primary already deleted its old dir before emitting this.
-		 */
-		int			afd;
-
-		afd = OpenTransientFile(UPGRADE_DELETE_AUTHORIZED_MARKER,
-								O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
-		if (afd < 0)
-			ereport(PANIC,
-					(errcode_for_file_access(),
-					 errmsg("pg_upgrade_redo: could not create \"%s\": %m",
-							UPGRADE_DELETE_AUTHORIZED_MARKER)));
-		if (pg_fsync(afd) != 0)
-			ereport(PANIC,
-					(errcode_for_file_access(),
-					 errmsg("pg_upgrade_redo: could not fsync \"%s\": %m",
-							UPGRADE_DELETE_AUTHORIZED_MARKER)));
-		CloseTransientFile(afd);
-
-		ereport(LOG,
-				(errmsg("pg_upgrade: delete-authorize signal replayed; old cluster "
-						"may now be removed with \"pg_upgrade --delete-old\" on this node")));
 	}
 	else if (info == XLOG_UPGRADE_DIRTREE)
 	{
