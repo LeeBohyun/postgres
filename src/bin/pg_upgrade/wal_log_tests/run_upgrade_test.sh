@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# End-to-end test harness for pg_upgrade --wal-log-upgrade.
+# End-to-end test harness for pg_upgrade --wal-upgrade.
 #
-# Creates an "old" cluster with real data, runs pg_upgrade --wal-log-upgrade
+# Creates an "old" cluster with real data, runs pg_upgrade --wal-upgrade
 # --initdb into a "new" cluster, then starts the new cluster and verifies the
 # data survived a pure WAL-replay recovery.
 #
@@ -57,13 +57,13 @@ log "OLD t1=$OLD_T1  t2=$OLD_T2  orders=$OLD_ORD"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
 # ------------------------------------------------------------------ pg_upgrade
-log "run pg_upgrade --wal-log-upgrade --initdb (mode=${MODE:---copy})"
+log "run pg_upgrade --wal-upgrade --initdb (mode=${MODE:---copy})"
 cd "$WORK"
 "$BIN/pg_upgrade" \
     -b "$BIN" -B "$BIN" \
     -d "$OLD" -D "$NEW" \
     -U postgres \
-    --initdb --wal-log-upgrade ${MODE:---copy} \
+    --initdb --wal-upgrade ${MODE:---copy} \
     > "$WORK/upgrade.log" 2>&1
 UPG_RC=$?
 log "pg_upgrade exit=$UPG_RC"
@@ -78,7 +78,7 @@ fi
 log "pg_waldump of upgrade WAL in pg_wal/ (RM_PG_UPGRADE records)"
 LOSEG=$(ls "$NEW/pg_wal/" | grep -E '^[0-9A-F]{24}$' | sort | head -1)
 LOLSN=$("$BIN/pg_waldump" -p "$NEW/pg_wal" "$LOSEG" -n 1 2>&1 | grep -oE 'lsn: [0-9A-F]+/[0-9A-F]+' | head -1 | awk '{print $2}')
-NPGU=$("$BIN/pg_waldump" -p "$NEW/pg_wal" -s "${LOLSN:-0/0}" 2>/dev/null | grep -icE "PG_UPGRADE_START|PG_UPGRADE_COMPLETE|UPGRADE_RELFILE|UPGRADE_SLRU|UPGRADE_DIRSKEL")
+NPGU=$("$BIN/pg_waldump" -p "$NEW/pg_wal" -s "${LOLSN:-0/0}" 2>/dev/null | grep -icE "PG_UPGRADE_START|PG_UPGRADE_COMPLETE|UPGRADE_RELFILE|UPGRADE_SLRU|UPGRADE_DIRTREE")
 log "RM_PG_UPGRADE record count in pg_wal/: $NPGU"
 [ "${NPGU:-0}" -ge 2 ] || { echo "FAIL: upgrade WAL not found in pg_wal/ (got $NPGU records)"; exit 1; }
 
@@ -98,14 +98,14 @@ echo "pg_xact bytes on disk after pg_upgrade (should be 0 = skipped): $XACT_BYTE
 [ "${XACT_BYTES:-0}" = "0" ] || { echo "FAIL: pg_xact not wiped ($XACT_BYTES bytes) — WAL-replay claim unproven"; exit 1; }
 
 # ------------------------------------------------------------------ new cluster
-# Auto-serve: --wal-log-upgrade now leaves the new cluster ready to come up
+# Auto-serve: --wal-upgrade now leaves the new cluster ready to come up
 # read-write on first start, exactly like upstream pg_upgrade -- there is NO
-# quarantine hold and NO --wal-log-commit step.  The pre-start assertions above
+# quarantine hold and no commit step.  The pre-start assertions above
 # (upgrade WAL present, disk wiped) inspect the on-disk state before first start.
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
 
-log "start new cluster (auto-serves; no --wal-log-commit)"
+log "start new cluster (auto-serves; no commit step)"
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1
 START_RC=$?
 log "new cluster start exit=$START_RC"

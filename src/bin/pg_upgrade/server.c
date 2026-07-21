@@ -204,13 +204,13 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	{
 		/*
 		 * Turn off durability requirements to improve object creation speed.
-		 * LEE: when --wal-log-upgrade is set, keep full_page_writes=on so
+		 * LEE: when --wal-upgrade is set, keep full_page_writes=on so
 		 * that the first write to each page after a checkpoint includes the
 		 * complete page image in WAL.  This ensures that after a smart
 		 * shutdown checkpoint, all catalog pages are correctly on disk even
 		 * with fsync=off — the checkpoint flushes complete page images.
 		 */
-		if (user_opts.wal_log_upgrade)
+		if (user_opts.wal_upgrade)
 		{
 			/* LEE: keep fsync=on and full_page_writes=on for durability */
 			appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off");
@@ -348,7 +348,7 @@ stop_postmaster(bool in_atexit)
  *
  * Stop the postmaster with -m immediate (SIGQUIT) so that no shutdown
  * checkpoint is written and no WAL segments are recycled.  Used by
- * --wal-log-upgrade after writing XLOG_PG_UPGRADE_COMPLETE so the upgrade
+ * --wal-upgrade after writing XLOG_UPGRADE_COMPLETE so the upgrade
  * WAL stream remains intact for preservation in pg_wal_upgrade/.
  */
 void

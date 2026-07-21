@@ -4,10 +4,10 @@
  * WAL redo and emit functions for RM_PG_UPGRADE_ID records.
  *
  * This file implements the redo path and pg_waldump support for the five
- * WAL record types written by pg_upgrade --wal-log-upgrade:
+ * WAL record types written by pg_upgrade --wal-upgrade:
  *
- *   XLOG_PG_UPGRADE_START    (0x00) — window open, write PG_VERSION
- *   XLOG_PG_UPGRADE_COMPLETE (0x10) — window close, informational
+ *   XLOG_UPGRADE_START    (0x00) — window open, write PG_VERSION
+ *   XLOG_UPGRADE_COMPLETE (0x10) — window close, informational
  *   XLOG_UPGRADE_SLRU_DATA   (0x20) — bulk SLRU segment image
  *   XLOG_UPGRADE_RELFILE_DATA(0x30) — bulk relation file segment image
  *   XLOG_UPGRADE_RAWFILE     (0x50) — verbatim non-relation file image
@@ -38,7 +38,7 @@
 #include "catalog/pg_tablespace_d.h"
 #include "common/file_perm.h"	/* pg_dir_create_mode */
 #include "common/relpath.h"		/* RelFileLocator, ForkNumber */
-#include "fmgr.h"				/* pg_upgrade_window_anchor SQL function */
+#include "fmgr.h"				/* pg_upgrade_wal_window_anchor SQL function */
 #include "miscadmin.h"
 #include "storage/bufmgr.h"		/* buffer-manager RELFILE_DATA redo */
 #include "storage/smgr.h"		/* smgr create for empty relfiles */
@@ -60,14 +60,14 @@
  * PerformWalUpgradeIfNeeded() — scan pg_wal/ for the pg_upgrade START/COMPLETE
  * markers and decide whether StartupXLOG() should crash-recover the upgrade.
  *
- * pg_upgrade --wal-log-upgrade uses the following protocol:
+ * pg_upgrade --wal-upgrade uses the following protocol:
  *
  *   1. Transplant the XID/OID/multixact counters into pg_control, then restart
  *      and CHECKPOINT (this is CN, the recovery anchor; it carries the counters)
- *   2. Write START, the full physical image (DIRSKEL/RELFILE/RAWFILE/SLRU),
+ *   2. Write START, the full physical image (DIRTREE/RELFILE/RAWFILE/SLRU),
  *      COMPLETE, pg_switch_wal()
  *   3. stop_postmaster_immediate() — no checkpoint, WAL intact in pg_wal/
- *   4. wipe the on-disk data image (files only; the skeleton is in DIRSKEL)
+ *   4. wipe the on-disk data image (files only; the skeleton is in DIRTREE)
  *   5. pg_resetwal --upgrade-recovery=CN,REDO sets pg_control:
  *        checkPoint = CN (end-of-upgrade checkpoint record LSN)
  *        state      = DB_IN_PRODUCTION   ← triggers crash recovery
@@ -81,7 +81,7 @@
  *      StartupXLOG() crash-recovers from CN through COMPLETE.  Replay applies
  *      only the end-of-upgrade images and reconstructs the entire cluster from
  *      WAL — the data directory need only contain the folder skeleton (rebuilt
- *      by DIRSKEL redo), pg_control, and the top-level PG_VERSION.
+ *      by DIRTREE redo), pg_control, and the top-level PG_VERSION.
  *   START but NO COMPLETE -> crash mid-upgrade: FATAL "re-run pg_upgrade"
  *      (the old cluster is intact).
  *   no START -> return false — normal startup, nothing to do.
@@ -156,7 +156,7 @@ UpgradeWalPageRead(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
  *               pg_upgrade right before the full-page-image burst; it carries
  *               the transplanted XID/OID/multixact counters.
  *   cn_lsn    — the record LSN of that checkpoint (goes to ControlFile.checkPoint).
- *   complete_lsn — the record LSN of XLOG_PG_UPGRADE_COMPLETE (InvalidXLogRecPtr
+ *   complete_lsn — the record LSN of XLOG_UPGRADE_COMPLETE (InvalidXLogRecPtr
  *               if not found).  The CALLER decides "already applied?" by
  *               comparing the control file's current checkpoint LSN against
  *               this: once first startup has replayed through COMPLETE and
@@ -336,14 +336,14 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 		}
 		else if (rmid == RM_PG_UPGRADE_ID)
 		{
-			if (info == XLOG_PG_UPGRADE_START)
+			if (info == XLOG_UPGRADE_START)
 			{
 				*found_start = true;
 				/* CN is the checkpoint immediately preceding START */
 				*cn = last_ckpt;
 				*cn_lsn = last_ckpt_lsn;
 			}
-			else if (info == XLOG_PG_UPGRADE_COMPLETE)
+			else if (info == XLOG_UPGRADE_COMPLETE)
 			{
 				*found_complete = true;
 				*complete_lsn = reader->ReadRecPtr;
@@ -357,11 +357,11 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 }
 
 /*
- * LEE: pg_upgrade_window_anchor() -> text
+ * LEE: pg_upgrade_wal_window_anchor() -> text
  *
  * Run ON THE LIVE (committed) PRIMARY that retains the upgrade window (pinned by
  * the UPGRADE_WINDOW_SLOT replication slot).  Scans the primary's own pg_wal for
- * the CN checkpoint that precedes XLOG_PG_UPGRADE_START and returns the anchor a
+ * the CN checkpoint that precedes XLOG_UPGRADE_START and returns the anchor a
  * streaming standby needs to stamp into its control file BEFORE it connects:
  *
  *     "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>"   (cn_lsn and redo_lsn, each an
@@ -373,12 +373,12 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
  * the LSNs are needed to point recovery at CN.  Returns NULL if no window is
  * present (not an upgrade primary, or the window was already released).
  */
-Datum		pg_upgrade_window_anchor(PG_FUNCTION_ARGS);
+Datum		pg_upgrade_wal_window_anchor(PG_FUNCTION_ARGS);
 
-PG_FUNCTION_INFO_V1(pg_upgrade_window_anchor);
+PG_FUNCTION_INFO_V1(pg_upgrade_wal_window_anchor);
 
 Datum
-pg_upgrade_window_anchor(PG_FUNCTION_ARGS)
+pg_upgrade_wal_window_anchor(PG_FUNCTION_ARGS)
 {
 	char		wal_dir[MAXPGPATH];
 	bool		found_start = false;
@@ -417,9 +417,9 @@ static bool in_upgrade_bootstrap = false;
 /*
  * LEE: durable "the upgrade window fully replayed to COMPLETE" marker.
  *
- * It is written+fsync'd by the XLOG_PG_UPGRADE_COMPLETE redo handler (below) the
+ * It is written+fsync'd by the XLOG_UPGRADE_COMPLETE redo handler (below) the
  * instant redo actually reaches COMPLETE, so its presence proves the window
- * replayed in full.  A frontend "pg_upgrade --wal-log-rollback" consults it, and
+ * replayed in full.  A frontend "pg_upgrade --wal-rollback" consults it, and
  * --status reports it.  Written with a relative path: redo runs with cwd ==
  * DataDir.
  */
@@ -438,7 +438,7 @@ static bool in_upgrade_bootstrap = false;
  *     <sysid> <cn_lsn> <cn_redo> <tli>
  *
  * sysid: decimal uint64 (primary's system identifier, from IDENTIFY_SYSTEM).
- * cn_lsn/cn_redo: %X/%08X LSNs (from pg_upgrade_window_anchor() on the primary).
+ * cn_lsn/cn_redo: %X/%08X LSNs (from pg_upgrade_wal_window_anchor() on the primary).
  * tli: decimal (primary's timeline, from IDENTIFY_SYSTEM; =1 for pg_upgrade).
  * Consumed (removed) once arming succeeds so a later restart re-reads pg_control.
  */
@@ -446,7 +446,7 @@ static bool in_upgrade_bootstrap = false;
 
 /*
  * LEE: durable "this node's old cluster is authorized for deletion" marker,
- * written+fsync'd by the XLOG_PG_UPGRADE_DELETE_AUTHORIZE redo handler when a NEW
+ * written+fsync'd by the XLOG_UPGRADE_DELETE_AUTHORIZE redo handler when a NEW
  * streaming standby replays the set-wide delete signal from the primary.  A local
  * "pg_upgrade --delete-old" on the standby treats this marker as authorization to
  * remove the (superseded) old cluster, so the operator need not hand-run
@@ -468,7 +468,7 @@ IsUpgradeBootstrap(void)
  * LEE: AUTOMATIC streaming-standby arming from the primary.
  *
  * This is the auto-fetch counterpart of ArmFromStreamingAnchorIfPresent(): rather
- * than requiring the operator to run "pg_upgrade --wal-log-prepare-standby" (which
+ * than requiring the operator to run "pg_upgrade --wal-prepare-standby" (which
  * pre-writes UPGRADE_STREAM_ANCHOR), a fresh vN+1 skeleton with primary_conninfo
  * set fetches the anchor itself over the SAME replication connection it is about
  * to stream on.  It:
@@ -528,8 +528,8 @@ ArmFromPrimaryAnchorIfConfigured(void)
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not connect to the primary to fetch the pg_upgrade window anchor: %s",
 						err ? err : "unknown error"),
-				 errhint("Set primary_conninfo to a live --wal-log-upgrade primary, "
-						 "or run \"pg_upgrade --wal-log-prepare-standby\" to stage the anchor.")));
+				 errhint("Set primary_conninfo to a live --wal-upgrade primary, "
+						 "or run \"pg_upgrade --wal-prepare-standby\" to stage the anchor.")));
 
 	/* sysid + primary timeline from the standard IDENTIFY_SYSTEM. */
 	primary_sysid = walrcv_identify_system(conn, &primary_tli);
@@ -549,7 +549,7 @@ ArmFromPrimaryAnchorIfConfigured(void)
 	 * know the command raises an ERROR inside walrcv_upgrade_window_anchor; we
 	 * catch nothing here, so that surfaces -- but since this path only runs for a
 	 * skeleton that a newer operator pointed at a newer primary, that is
-	 * acceptable (the explicit --wal-log-prepare-standby remains for mixed cases).
+	 * acceptable (the explicit --wal-prepare-standby remains for mixed cases).
 	 */
 	anchor_str = walrcv_upgrade_window_anchor(conn);
 	walrcv_disconnect(conn);
@@ -711,7 +711,7 @@ PerformWalUpgradeIfNeeded(void)
 	 * AUTO-FETCH STANDBY PATH.  No pre-staged anchor file, but if primary_conninfo
 	 * is set we try to fetch the anchor directly from the primary over the
 	 * replication connection (PG_UPGRADE_WINDOW_ANCHOR) and arm from it -- so a
-	 * fresh skeleton needs no "pg_upgrade --wal-log-prepare-standby" step.  Returns
+	 * fresh skeleton needs no "pg_upgrade --wal-prepare-standby" step.  Returns
 	 * false (fall through to the local path / normal startup) when there is no
 	 * primary configured or the primary retains no window.
 	 */
@@ -726,7 +726,7 @@ PerformWalUpgradeIfNeeded(void)
 	/*
 	 * Parse pg_wal/ with a real XLogReader and look for the pg_upgrade
 	 * START/COMPLETE markers plus the end-of-upgrade checkpoint (CN).  The
-	 * upgrade WAL lives in pg_wal/ (no rename): a completed --wal-log-upgrade
+	 * upgrade WAL lives in pg_wal/ (no rename): a completed --wal-upgrade
 	 * run leaves a START..COMPLETE window there.  Here we decide what to do:
 	 *
 	 *   pending (control file not yet past COMPLETE) -> DERIVE CN from the WAL,
@@ -742,7 +742,7 @@ PerformWalUpgradeIfNeeded(void)
 	 *                       the new cluster now auto-serves, replaying a partial
 	 *                       window would serve a corrupt half-built catalog.  The
 	 *                       partial new_dir is a dead end: it does NOT resume or
-	 *                       repair in place.  Recovery is --wal-log-rollback
+	 *                       repair in place.  Recovery is --wal-rollback
 	 *                       (discard new_dir) then re-run pg_upgrade -- which is
 	 *                       safe because the OLD cluster was never written during
 	 *                       the upgrade and is intact.
@@ -833,7 +833,7 @@ PerformWalUpgradeIfNeeded(void)
 	 * Arm the sanctioned bootstrap: the pg_upgrade redo handlers may now apply
 	 * the upgrade images.  Any pg_upgrade record reached WITHOUT this flag set
 	 * came in through an ordinary/standby WAL stream and must not be applied
-	 * live (see the XLOG_PG_UPGRADE_START handler in pg_upgrade_redo()).
+	 * live (see the XLOG_UPGRADE_START handler in pg_upgrade_redo()).
 	 */
 	in_upgrade_bootstrap = true;
 
@@ -851,7 +851,7 @@ pg_upgrade_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
-	if (info == XLOG_PG_UPGRADE_START)
+	if (info == XLOG_UPGRADE_START)
 	{
 		xl_pg_upgrade *xlrec = (xl_pg_upgrade *) XLogRecGetData(record);
 		int			fd;
@@ -859,7 +859,7 @@ pg_upgrade_redo(XLogReaderState *record)
 
 		/*
 		 * LEE: standby / ordinary-stream guard.  The upgrade image records
-		 * (DIRSKEL/RELFILE/SLRU/RAWFILE) carry the OLD cluster's page LSNs and
+		 * (DIRTREE/RELFILE/SLRU/RAWFILE) carry the OLD cluster's page LSNs and
 		 * are only safe to apply from the sanctioned bootstrap replay set up by
 		 * PerformWalUpgradeIfNeeded() (which anchors at CN into a non-serving
 		 * data directory).  A server that reaches START WITHOUT that bootstrap
@@ -885,7 +885,7 @@ pg_upgrade_redo(XLogReaderState *record)
 				ereport(FATAL,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("reached pg_upgrade boundary on standby; halting to apply the upgrade"),
-						 errdetail("A --wal-log-upgrade was performed on the primary; the standby cannot apply it while streaming."),
+						 errdetail("A --wal-upgrade was performed on the primary; the standby cannot apply it while streaming."),
 						 errhint("Install the new-version binaries and restart this standby; it will replay the upgrade from the end-of-upgrade checkpoint.")));
 			else
 				ereport(FATAL,
@@ -897,7 +897,7 @@ pg_upgrade_redo(XLogReaderState *record)
 
 		/*
 		 * LEE: the upgrade window is now open.  Suppress hot standby activation
-		 * until XLOG_PG_UPGRADE_COMPLETE replays, so no read-only connection can
+		 * until XLOG_UPGRADE_COMPLETE replays, so no read-only connection can
 		 * observe the half-upgraded cluster (new catalogs partially applied).
 		 */
 		pgUpgradeReplayInProgress = true;
@@ -937,7 +937,7 @@ pg_upgrade_redo(XLogReaderState *record)
 					 errmsg("pg_upgrade_redo: could not fsync PG_VERSION: %m")));
 		CloseTransientFile(fd);
 	}
-	else if (info == XLOG_PG_UPGRADE_COMPLETE)
+	else if (info == XLOG_UPGRADE_COMPLETE)
 	{
 		/*
 		 * LEE: the upgrade window is now closed and the cluster is fully
@@ -965,7 +965,7 @@ pg_upgrade_redo(XLogReaderState *record)
 		/*
 		 * Drop the durable COMPLETE marker.  This file -- written only when redo
 		 * actually reaches COMPLETE -- is what lets a frontend "pg_upgrade
-		 * --wal-log-rollback" tell a fully-upgraded cluster from a partial
+		 * --wal-rollback" tell a fully-upgraded cluster from a partial
 		 * (crash-truncated) one.  fsync it: a frontend command may run right after
 		 * this without a clean shutdown in between.
 		 */
@@ -987,7 +987,7 @@ pg_upgrade_redo(XLogReaderState *record)
 			CloseTransientFile(mfd);
 		}
 	}
-	else if (info == XLOG_PG_UPGRADE_HANDOFF)
+	else if (info == XLOG_UPGRADE_HANDOFF)
 	{
 		/*
 		 * LEE: the OLD-format streaming-handoff TRIGGER.  This record was emitted
@@ -1023,7 +1023,7 @@ pg_upgrade_redo(XLogReaderState *record)
 			ereport(FATAL,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("reached pg_upgrade handoff on standby; shutting down for pg_upgrade"),
-					 errdetail("The primary initiated a --wal-log-upgrade to major version %u; "
+					 errdetail("The primary initiated a --wal-upgrade to major version %u; "
 							   "this standby cannot follow the upgrade in the old WAL format.",
 							   xlrec->target_major_version),
 					 errhint("Install the new-version binaries and re-provision this standby "
@@ -1031,7 +1031,7 @@ pg_upgrade_redo(XLogReaderState *record)
 							 "the end-of-upgrade checkpoint.")));
 		}
 	}
-	else if (info == XLOG_PG_UPGRADE_DELETE_AUTHORIZE)
+	else if (info == XLOG_UPGRADE_DELETE_AUTHORIZE)
 	{
 		/*
 		 * LEE: set-wide "the old cluster may now be deleted" signal, emitted by
@@ -1066,7 +1066,7 @@ pg_upgrade_redo(XLogReaderState *record)
 				(errmsg("pg_upgrade: delete-authorize signal replayed; old cluster "
 						"may now be removed with \"pg_upgrade --delete-old\" on this node")));
 	}
-	else if (info == XLOG_UPGRADE_DIRSKEL)
+	else if (info == XLOG_UPGRADE_DIRTREE)
 	{
 		/*
 		 * Rebuild the new cluster's directory skeleton (the logged after-image
@@ -1077,9 +1077,9 @@ pg_upgrade_redo(XLogReaderState *record)
 		 * primary's wipe leaves a few behind; a re-provisioned standby starts
 		 * from a fresh initdb skeleton), so replay only fills in the rest.
 		 */
-		xl_upgrade_dirskel *xlrec =
-			(xl_upgrade_dirskel *) XLogRecGetData(record);
-		char	   *p = (char *) xlrec + SizeOfXLUpgradeDirskel;
+		xl_upgrade_dirtree *xlrec =
+			(xl_upgrade_dirtree *) XLogRecGetData(record);
+		char	   *p = (char *) xlrec + SizeOfXLUpgradeDirtree;
 		char	   *dir_end = p + xlrec->dir_bytes;
 		char	   *sym_end = dir_end + xlrec->sym_bytes;
 		uint32		done = 0;
@@ -1103,7 +1103,7 @@ pg_upgrade_redo(XLogReaderState *record)
 
 		if (done != xlrec->ndirs)
 			ereport(PANIC,
-					(errmsg("pg_upgrade_redo: dirskel record damaged: created %u of %u directories",
+					(errmsg("pg_upgrade_redo: dirtree record damaged: created %u of %u directories",
 							done, xlrec->ndirs)));
 
 		/*
@@ -1150,7 +1150,7 @@ pg_upgrade_redo(XLogReaderState *record)
 
 		if (done != xlrec->nsymlinks)
 			ereport(PANIC,
-					(errmsg("pg_upgrade_redo: dirskel record damaged: created %u of %u symlinks",
+					(errmsg("pg_upgrade_redo: dirtree record damaged: created %u of %u symlinks",
 							done, xlrec->nsymlinks)));
 	}
 	else if (info == XLOG_UPGRADE_SLRU_DATA)

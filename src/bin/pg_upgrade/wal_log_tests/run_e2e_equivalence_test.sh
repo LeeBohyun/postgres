@@ -5,7 +5,7 @@
 #
 #   1. Seed one old cluster with representative data.
 #   2. VANILLA: pg_upgrade --initdb (no WAL logging) into $vanilla/new.
-#   3. WAL:     pg_upgrade --initdb --wal-log-upgrade into $wal/new.  This leaves
+#   3. WAL:     pg_upgrade --initdb --wal-upgrade into $wal/new.  This leaves
 #      the new cluster as an empty skeleton + pg_control + PG_VERSION + the
 #      upgrade WAL in pg_wal/ (no user/catalog data on disk).
 #   4. Simulate a fresh target: build a BRAND-NEW empty skeleton with initdb
@@ -77,9 +77,9 @@ VAN_FP=$(fingerprint "$V/new" 55541)
 log "vanilla fingerprint:"; echo "$VAN_FP"
 
 # ---------------------------------------------------------------- wal-log
-log "WAL pg_upgrade --initdb --wal-log-upgrade (primary keeps its files + emits the window)"
+log "WAL pg_upgrade --initdb --wal-upgrade (primary keeps its files + emits the window)"
 L=$W/wal; mkdir -p "$L"; cp -a "$SEED" "$L/old"
-cd "$L"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$L/old" -D "$L/new" -U postgres --initdb --wal-log-upgrade --copy >"$L/up.log" 2>&1 \
+cd "$L"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$L/old" -D "$L/new" -U postgres --initdb --wal-upgrade --copy >"$L/up.log" 2>&1 \
   || { echo "WAL UPGRADE FAILED"; tail -15 "$L/up.log"; exit 1; }
 # In the primary model the primary is a NORMAL upgraded cluster: its files stay on
 # disk (no wipe) and it does NOT reconstruct from WAL.  The WAL-recoverability
@@ -112,7 +112,7 @@ log "feed the target ONLY the upgrade WAL + the old cluster's sysid (no pg_contr
 # fresh target needs NOTHING but its own initdb pg_control + the upgrade WAL --
 # no pg_resetwal --system-identifier stamping (that flag has been removed).
 #
-# PG_VERSION is NOT copied: the XLOG_PG_UPGRADE_START redo writes it from the
+# PG_VERSION is NOT copied: the XLOG_UPGRADE_START redo writes it from the
 # embedded version string.  (Same-build test, so the target's initdb PG_VERSION
 # already matches; a real cross-major target needs it set before the pre-replay
 # version gate -- see REPLICA_UPGRADE_DESIGN.md.)
@@ -125,7 +125,7 @@ cp "$L/new/pg_wal"/[0-9A-F]* "$T/pg_wal/" 2>/dev/null || true
 log "start target -> replay the upgrade purely from WAL, then auto-serve"
 # Give the target its socket/port config, then start it: the first start applies
 # the WAL window (reconstruct) and auto-serves the cluster read-write -- no
-# quarantine hold, no --wal-log-commit.
+# quarantine hold, no commit step.
 echo "port=55542">>"$T/postgresql.conf"; echo "unix_socket_directories='$W'">>"$T/postgresql.conf"
 
 log "start target -> serve the WAL-reconstructed cluster"

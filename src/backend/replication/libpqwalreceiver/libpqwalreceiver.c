@@ -461,7 +461,7 @@ libpqrcv_identify_system(WalReceiverConn *conn, TimeLineID *primary_tli)
 
 /*
  * LEE: Run PG_UPGRADE_WINDOW_ANCHOR on the primary and return the retained
- * --wal-log-upgrade window anchor ("<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>"), or
+ * --wal-upgrade window anchor ("<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>"), or
  * NULL if the primary retains no window (NULL column).  Like IDENTIFY_SYSTEM,
  * this is a replication-protocol command run directly on the replication
  * connection -- it needs no database connection, so it does NOT go through

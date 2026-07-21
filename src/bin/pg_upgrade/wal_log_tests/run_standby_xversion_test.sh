@@ -10,12 +10,12 @@
 # the upgrade WAL can turn it into a working v20 cluster (catalog 202607022).
 #
 # Flow: PG18 old primary + PG18 basebackup standby -> pg_upgrade 18->20
-# --wal-log-upgrade on the primary, commit, keep it live -> a fresh 20devel
+# --wal-upgrade on the primary, commit, keep it live -> a fresh 20devel
 # skeleton STREAMS the upgrade window from the live primary (pg_upgrade
-# --wal-log-prepare-standby; NO cp) -> it replays from CN and becomes a v20 hot standby
+# --wal-prepare-standby; NO cp) -> it replays from CN and becomes a v20 hot standby
 # that matches the upgraded primary.
 #
-# Requires: OLDBIN (an 18.x bin dir) and NEWBIN (the 20devel wal_log_upgrade
+# Requires: OLDBIN (an 18.x bin dir) and NEWBIN (the 20devel wal_upgrade
 # build).  Set them via env; defaults match the Arca layout used in development.
 set -u
 NEWBIN="${PGBIN:?set PGBIN to the 20devel bin dir}"
@@ -61,9 +61,9 @@ log "old data: $OLD_FP  old catalog version: $OLD_CATVER"
 STBY_CATVER_BEFORE=$("$NEWBIN/pg_controldata" -D "$STBY" 2>/dev/null | grep 'Catalog version' | grep -oE '[0-9]+')
 log "standby catalog version BEFORE upgrade: $STBY_CATVER_BEFORE (should equal old=$OLD_CATVER)"
 
-log "2. cross-version pg_upgrade ($OLDVER -> $NEWVER) --wal-log-upgrade on the primary, commit, keep it live"
+log "2. cross-version pg_upgrade ($OLDVER -> $NEWVER) --wal-upgrade on the primary, commit, keep it live"
 cd "$W"
-"$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1
+"$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --copy >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -20 "$W/up.log"; exit 1; }
 # Keep the upgraded primary LIVE with replication enabled so the standby can
 # STREAM the window from it (the retention slot pg_upgrade_window pins the window
@@ -77,12 +77,8 @@ listen_addresses='localhost'
 CONF
 echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
 echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
-# --wal-log-upgrade holds the primary's new cluster in quarantine.  Hold-start it
-# (applies the window, reconstructs, holds; pg_ctl exits non-zero by design),
-# then commit to adopt it and bring it live.
-"$NEWBIN/pg_ctl" -D "$NEW" -l "$W/new_hold.log" -w start >/dev/null 2>&1 || true
-"$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" --wal-log-commit >"$W/commit.log" 2>&1 \
-    || { echo "FAIL new commit"; tail -20 "$W/commit.log"; exit 1; }
+# Auto-serve: the upgraded primary comes up read-write on first start (no
+# commit step).  It stays live so the standby can stream the window below.
 "$NEWBIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/new.log"; exit 1; }
 NEW_FP=$("$NEWBIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t) FROM t")
 NEW_CATVER=$("$NEWBIN/pg_controldata" -D "$NEW" | grep 'Catalog version' | grep -oE '[0-9]+')
@@ -99,29 +95,29 @@ log "3. build a fresh NEW-version SKELETON as the standby target and STREAM the 
 # A cross-version standby CANNOT reuse its old v18 data dir: the new binary's
 # PG_VERSION and pg_control version gates reject it BEFORE replay.  So the target
 # is a fresh new-version initdb skeleton (like a re-provisioned standby) that
-# STREAMS the window from the live upgraded primary via --wal-log-prepare-standby.
+# STREAMS the window from the live upgraded primary via --wal-prepare-standby.
 #
 # NOTE: we deliberately do NOT stamp the skeleton's system identifier.  The
 # skeleton keeps its OWN fresh initdb sysid (which differs from the primary's),
-# and --wal-log-prepare-standby stamps the primary's sysid + CN anchor + TLI so the
+# and --wal-prepare-standby stamps the primary's sysid + CN anchor + TLI so the
 # walreceiver accepts the primary and recovery starts at CN.  This proves the
 # pg_resetwal --system-identifier flag is not needed: adoption is in-process.
 TGT=$W/target
 "$NEWBIN/initdb" -D "$TGT" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb-target; exit 1; }
 SKEL_SYSID=$("$NEWBIN/pg_controldata" -D "$TGT" | grep -i "system identifier" | grep -oE "[0-9]+")
 NEW_ID=$("$NEWBIN/pg_controldata" -D "$NEW" | grep -i "system identifier" | grep -oE "[0-9]+")
-log "  skeleton sysid=$SKEL_SYSID  primary sysid=$NEW_ID (intentionally DIFFERENT; stamped by --wal-log-prepare-standby)"
+log "  skeleton sysid=$SKEL_SYSID  primary sysid=$NEW_ID (intentionally DIFFERENT; stamped by --wal-prepare-standby)"
 # wipe the skeleton's data so nothing masks a missing WAL image (keep runtime dirs)
 rm -f "$TGT"/base/*/[0-9]* 2>/dev/null
 rm -f "$TGT"/global/[0-9]* "$TGT"/global/pg_filenode.map 2>/dev/null
-# primary_conninfo in config (standard for any standby); --wal-log-prepare-standby reads it
+# primary_conninfo in config (standard for any standby); --wal-prepare-standby reads it
 cat >> "$TGT/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
 hot_standby=on
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
-"$NEWBIN/pg_upgrade" -B "$NEWBIN" -D "$TGT" --wal-log-prepare-standby >"$W/prep.log" 2>&1 \
+"$NEWBIN/pg_upgrade" -B "$NEWBIN" -D "$TGT" --wal-prepare-standby >"$W/prep.log" 2>&1 \
   || { echo "FAIL: prepare-standby"; cat "$W/prep.log"; FAIL=1; }
 # A streamed standby does NOT hold/commit: it streams the window and becomes a hot
 # standby of the primary directly.

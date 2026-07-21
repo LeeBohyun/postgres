@@ -28,10 +28,10 @@ OLD_SUM=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*), sum(id)::big
 log "OLD big=$OLD_SUM"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-log "pg_upgrade --wal-log-upgrade --initdb --copy"
+log "pg_upgrade --wal-upgrade --initdb --copy"
 cd "$WORK"
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres \
-    --initdb --wal-log-upgrade --copy > "$WORK/upgrade.log" 2>&1
+    --initdb --wal-upgrade --copy > "$WORK/upgrade.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -30 "$WORK/upgrade.log"; exit 1; }
 
 # The upgrade WAL lives in pg_wal/ (there is no pg_wal_upgrade/ rename).  Assert
@@ -58,7 +58,7 @@ log "base/ data-file bytes on disk after pg_upgrade (should be 0 = wiped): $TOTA
 
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
-# --wal-log-upgrade auto-serves: the new cluster comes up read-write on the
+# --wal-upgrade auto-serves: the new cluster comes up read-write on the
 # first start (no quarantine hold, no commit).
 log "start new cluster (WAL replay)"
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1 || { echo FAIL start new; tail -40 "$WORK/new.log"; exit 1; }

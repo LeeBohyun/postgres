@@ -20,10 +20,10 @@ OLD_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*), sum(hashtext(b):
 log "old cluster fingerprint: $OLD_FP"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-log "run pg_upgrade --wal-log-upgrade with COMPLETE suppressed (simulated crash)"
+log "run pg_upgrade --wal-upgrade with COMPLETE suppressed (simulated crash)"
 cd "$W"
 PG_UPGRADE_TEST_SKIP_COMPLETE=1 "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" -U postgres \
-    --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1
+    --initdb --wal-upgrade --copy >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -20 "$W/up.log"; exit 1; }
 # The upgrade WAL stays in pg_wal/ (no rename); with COMPLETE suppressed it
 # holds a START but no COMPLETE.  Just confirm segments are present there.
@@ -55,7 +55,7 @@ log "partial cluster: COMPLETE marker absent (nothing to adopt)"
 
 log "rollback the half-upgraded cluster (discard it); old must be untouched"
 # old_dir is intact (--copy, never started), so rollback is allowed.
-"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" --wal-log-rollback >"$W/rollback.log" 2>&1 || { cat "$W/rollback.log"; echo "FAIL: rollback of half-upgraded cluster"; FAIL=1; }
+"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" --wal-rollback >"$W/rollback.log" 2>&1 || { cat "$W/rollback.log"; echo "FAIL: rollback of half-upgraded cluster"; FAIL=1; }
 [ -d "$NEW" ] && { echo "FAIL: rollback did not remove the half-upgraded new cluster"; FAIL=1; }
 
 log "verify OLD cluster is still fully usable"
@@ -71,7 +71,7 @@ log "old cluster after: $OLD_FP2"
 # clusters.
 log "control: same upgrade WITH COMPLETE must auto-serve and recover the data"
 rm -rf "$W/new2"
-cd "$W"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" -U postgres --initdb --wal-log-upgrade --copy >"$W/up2.log" 2>&1
+cd "$W"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" -U postgres --initdb --wal-upgrade --copy >"$W/up2.log" 2>&1
 echo "unix_socket_directories='$W'">>$W/new2/postgresql.conf; echo "port=$P">>$W/new2/postgresql.conf
 if "$BIN/pg_ctl" -D "$W/new2" -l "$W/new2.log" -w start >/dev/null 2>&1; then
     CTRL_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(b)::bigint) FROM t")

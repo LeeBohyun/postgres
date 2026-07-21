@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 #
-# ALL-VERSION permutation matrix for --wal-log-upgrade (TODO.md §3).
+# ALL-VERSION permutation matrix for --wal-upgrade (TODO.md §3).
 #
 # The single 18->20 pair proven by run_standby_xversion_test.sh cannot surface
 # version-specific regressions (catalog layout, SLRU format, control-version
 # gates) that only appear for a particular OLD major.  This test upgrades EVERY
-# available old major to the current NEW (20devel) via --wal-log-upgrade and
+# available old major to the current NEW (20devel) via --wal-upgrade and
 # asserts, for each pair, that:
 #   * pg_upgrade succeeds,
 #   * the new cluster auto-serves read-write on first start (no quarantine hold,
-#     no --wal-log-commit),
+#     no commit step),
 #   * the catalog version actually changed old->new (a real cross-version jump),
 #   * the data matches after the WAL-replay reconstruction, and
 #   * the served cluster is writable.
 #
 # Why every pair targets 20devel (not e.g. 16->18): this feature is developed for
 # upstream, i.e. against master (currently 20devel), and that is where it will
-# ship.  --wal-log-upgrade therefore lives ONLY in the patched NEW (master)
+# ship.  --wal-upgrade therefore lives ONLY in the patched NEW (master)
 # binary.  In real use an operator upgrades from a supported old release
 # (14..18) straight to the new major -- pg_upgrade skips intermediate majors, so
 # 14->20 is a single jump (proven below), never 14->15->...  The feature is only
@@ -85,17 +85,17 @@ SQL
     OLD_CATVER=$("$OLDBIN/pg_controldata" -D "$OLD" | grep 'Catalog version' | grep -oE '[0-9]+')
     "$OLDBIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-    # ---- pg_upgrade OLD -> NEW via --wal-log-upgrade ----
+    # ---- pg_upgrade OLD -> NEW via --wal-upgrade ----
     ( cd "$W" && "$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" \
-        -U postgres --initdb --wal-log-upgrade --copy >"$W/up_$P.log" 2>&1 )
+        -U postgres --initdb --wal-upgrade --copy >"$W/up_$P.log" 2>&1 )
     if [ $? -ne 0 ]; then echo "  FAIL: pg_upgrade $OLDVER->$NEWVER"; tail -15 "$W/up_$P.log"; FAIL_LIST="$FAIL_LIST $OLDVER(upgrade)"; FAILED=$((FAILED+1)); return; fi
 
     echo "unix_socket_directories='$W'">>"$NEW/postgresql.conf"; echo "port=$P">>"$NEW/postgresql.conf"
 
     # ---- start: auto-serve (reconstruct from WAL, then come up read-write) ----
-    # --wal-log-upgrade auto-serves: the first start applies the WAL window,
+    # --wal-upgrade auto-serves: the first start applies the WAL window,
     # reconstructs, and comes up read-write -- no quarantine hold, no
-    # --wal-log-commit.
+    # commit step.
     "$NEWBIN/pg_ctl" -D "$NEW" -l "$W/new_$P.log" -w start >/dev/null 2>&1 || { echo "  FAIL: $OLDVER new cluster did not auto-serve on first start"; tail -15 "$W/new_$P.log"; FAIL_LIST="$FAIL_LIST $OLDVER(newstart)"; FAILED=$((FAILED+1)); return; }
     NEW_FP=$("$NEWBIN/psql" -h "$W" -p $P -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t) FROM t" 2>&1)
     NEW_CATVER=$("$NEWBIN/pg_controldata" -D "$NEW" | grep 'Catalog version' | grep -oE '[0-9]+')

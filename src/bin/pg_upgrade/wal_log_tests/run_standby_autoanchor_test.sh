@@ -2,14 +2,14 @@
 #
 # AUTO-ANCHOR standby: a fresh vN+1 skeleton streams the upgrade window from the
 # live (auto-served) primary WITHOUT the operator running
-# "pg_upgrade --wal-log-prepare-standby" and WITHOUT any pg_upgrade_stream.anchor
+# "pg_upgrade --wal-prepare-standby" and WITHOUT any pg_upgrade_stream.anchor
 # file.  The skeleton, at first startup, auto-fetches the CN anchor from the
 # primary over the replication connection via the PG_UPGRADE_WINDOW_ANCHOR
 # command (chicken-and-egg bootstrap solved on the wire), arms its control file at
 # CN, and streams -- becoming a hot standby that serves the upgraded data.
 #
 # This is the automatic counterpart of run_standby_stream_e2e_test.sh (which uses
-# the explicit --wal-log-prepare-standby staging).
+# the explicit --wal-prepare-standby staging).
 #
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
@@ -38,9 +38,9 @@ printf 'host replication all 127.0.0.1/32 trust\nhost all all 127.0.0.1/32 trust
 WANT=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint) FROM t")
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-log "2. upgrade primary (--wal-log-upgrade) and auto-serve"
+log "2. upgrade primary (--wal-upgrade) and auto-serve"
 cd "$W"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1 \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --copy >"$W/up.log" 2>&1 \
     || { echo FAIL upgrade; tail -20 "$W/up.log"; exit 1; }
 cat >> "$NEW/postgresql.conf" <<CONF
 port=$PP
@@ -92,6 +92,6 @@ INREC=$("$BIN/psql" -h "$W" -p $SP -U postgres -tAc "SELECT pg_is_in_recovery()"
 "$BIN/pg_ctl" -D "$SKEL" -w stop >/dev/null 2>&1
 "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
 
-[ "$FAIL" = 0 ] && log "PASS: standby AUTO-FETCHED the anchor over replication and streamed (no --wal-log-prepare-standby)" \
+[ "$FAIL" = 0 ] && log "PASS: standby AUTO-FETCHED the anchor over replication and streamed (no --wal-prepare-standby)" \
                 || log "FAIL: auto-anchor standby not upheld"
 exit $FAIL

@@ -1,8 +1,8 @@
 # Copyright (c) 2025-2026, PostgreSQL Global Development Group
 
-# Tests for "pg_upgrade --wal-log-upgrade" on a single (primary-only) cluster.
+# Tests for "pg_upgrade --wal-upgrade" on a single (primary-only) cluster.
 #
-# --wal-log-upgrade captures the whole upgrade as WAL so the change is
+# --wal-upgrade captures the whole upgrade as WAL so the change is
 # revertable, then leaves the new cluster as a normal, fully-upgraded cluster
 # that AUTO-SERVES read-write on its first start (there is no "commit" step and
 # no not-serving hold).  This test drives the two primary-only paths and, at
@@ -17,7 +17,7 @@
 #   crash path:  old (vN)  --pg_upgrade with COMPLETE suppressed-->  a window
 #                with START but no COMPLETE on disk  --first start-->  FATAL
 #                (never serves a half-built catalog); the old cluster stays
-#                intact and startable, and --wal-log-rollback discards new.
+#                intact and startable, and --wal-rollback discards new.
 #
 # Cross-version: when $ENV{oldinstall} is set the old cluster is built with an
 # older major's binaries (checksums are pre-18 so pass -k there); otherwise the
@@ -79,7 +79,7 @@ sub setup_old
 	return $old;
 }
 
-# The arguments common to every pg_upgrade --wal-log-upgrade invocation here.
+# The arguments common to every pg_upgrade --wal-upgrade invocation here.
 sub upgrade_cmd
 {
 	my ($old, $new, @extra) = @_;
@@ -93,7 +93,7 @@ sub upgrade_cmd
 		'--old-port' => $old->port,
 		'--new-port' => $new->port,
 		'--initdb',
-		'--wal-log-upgrade',
+		'--wal-upgrade',
 		@extra,
 	];
 }
@@ -117,14 +117,14 @@ sub add_conn_conf
 #
 {
 	my $old = setup_old('old_happy');
-	# Do NOT init() the new node: --wal-log-upgrade --initdb creates it.
+	# Do NOT init() the new node: --wal-upgrade --initdb creates it.
 	my $new = PostgreSQL::Test::Cluster->new('new_happy');
 
 	ok(!-d $new->data_dir,
 		'happy: new data directory does not exist before --initdb');
 
 	command_ok(upgrade_cmd($old, $new),
-		'happy: pg_upgrade --wal-log-upgrade --initdb succeeds');
+		'happy: pg_upgrade --wal-upgrade --initdb succeeds');
 
 	# State oracle #1: pg_upgrade did a clean shutdown of the new cluster, so
 	# its control file must record a shut-down "in production" state -- NOT a
@@ -182,7 +182,7 @@ sub add_conn_conf
 # pg_upgrade emit the whole upgrade window but omit the COMPLETE marker,
 # simulating a crash after START.  The new cluster must FATAL on first start
 # (never serve a half-built catalog), the old cluster must stay intact, and
-# --wal-log-rollback must discard the dead-end new cluster.
+# --wal-rollback must discard the dead-end new cluster.
 #
 {
 	my $old = setup_old('old_crash');
@@ -239,9 +239,9 @@ sub add_conn_conf
 			'--socketdir' => $new->host,
 			'--old-port' => $old->port,
 			'--new-port' => $new->port,
-			'--wal-log-rollback',
+			'--wal-rollback',
 		],
-		'crash: --wal-log-rollback discards the half-upgraded new cluster');
+		'crash: --wal-rollback discards the half-upgraded new cluster');
 	ok(!-d $new->data_dir,
 		'crash: rollback removed the half-upgraded new data directory');
 

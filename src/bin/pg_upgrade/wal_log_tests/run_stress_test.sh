@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stress test for --wal-log-upgrade:
+# Stress test for --wal-upgrade:
 #   * a ~10GB user table (many multi-GB relfile segments -> lots of chunked
 #     RELFILE records spanning many WAL segments), AND
 #   * a bloated system catalog (pg_attribute) driven past 1GB by creating a huge
@@ -82,10 +82,10 @@ log "old big fingerprint: $OLD_FP ; wide tables: $OLD_NREL"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
 # ---- upgrade -------------------------------------------------------------
-log "pg_upgrade --wal-log-upgrade --initdb --copy"
+log "pg_upgrade --wal-upgrade --initdb --copy"
 cd "$WORK"
 t0=$SECONDS
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy >"$WORK/up.log" 2>&1
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --copy >"$WORK/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -30 "$WORK/up.log"; exit 1; }
 log "pg_upgrade wall time: $((SECONDS - t0))s"
 
@@ -107,9 +107,9 @@ cat >> "$NEW/postgresql.conf" <<CONF
 unix_socket_directories='$WORK'
 port=$PORT
 CONF
-# --wal-log-upgrade auto-serves the new cluster: the first start applies the WAL
+# --wal-upgrade auto-serves the new cluster: the first start applies the WAL
 # window, reconstructs, and comes up read-write -- no quarantine hold, no
-# --wal-log-commit.
+# commit step.
 log "start new cluster (triggers WAL-replay recovery of ~${GB}GB + >1GB catalog)"
 t0=$SECONDS
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w -t 900 start >/dev/null 2>&1 || { echo FAIL start new; tail -40 "$WORK/new.log"; exit 1; }

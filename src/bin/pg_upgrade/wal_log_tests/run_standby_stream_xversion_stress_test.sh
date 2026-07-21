@@ -5,9 +5,9 @@
 #   - VERSION permutations: each available old major (v14..v18) -> 20devel
 #   - DATA shapes: manyrel (many relations/dbs), bigcat (large pg_attribute),
 #     bigdata (multi-segment relfiles)
-#   - DELIVERY: the standby STREAMS the upgrade window (no cp) via --wal-log-prepare-standby
+#   - DELIVERY: the standby STREAMS the upgrade window (no cp) via --wal-prepare-standby
 #
-# For each (old-major x shape): upgrade old->20devel --wal-log-upgrade on the
+# For each (old-major x shape): upgrade old->20devel --wal-upgrade on the
 # primary, commit -> live; a fresh 20devel skeleton streams the window and becomes
 # a hot standby.  Assert the primary preserved the data (catalog version changed)
 # and the streamed standby converged.
@@ -103,7 +103,7 @@ for OLDBIN in $OLDBIN_DIRS; do
     "$OLDBIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
     cd "$W"
-    "$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1
+    "$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --copy >"$W/up.log" 2>&1
     if [ $? -ne 0 ]; then echo "FAIL: $OLDVER/$shape upgrade"; tail -12 "$W/up.log"; GRC=1; cd /; continue; fi
     cat >> "$NEW/postgresql.conf" <<CONF
 port=$PP
@@ -114,9 +114,8 @@ listen_addresses='localhost'
 CONF
     echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
     echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
-    "$NEWBIN/pg_ctl" -D "$NEW" -l "$W/new_hold.log" -w start >/dev/null 2>&1 || true
-    "$NEWBIN/pg_upgrade" -b "$OLDBIN" -B "$NEWBIN" -d "$OLD" -D "$NEW" -U postgres --wal-log-commit >"$W/commit.log" 2>&1 \
-      || { echo "FAIL: $OLDVER/$shape commit"; tail -12 "$W/commit.log"; GRC=1; cd /; continue; }
+    # Auto-serve: the upgraded primary comes up read-write on first start (no
+    # commit step).  It stays live so the standby can stream the window below.
     "$NEWBIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL: $OLDVER/$shape new start"; tail "$W/new.log"; GRC=1; cd /; continue; }
     NEW_CATVER=$("$NEWBIN/pg_controldata" -D "$NEW" | grep 'Catalog version' | grep -oE '[0-9]+')
     for d in $("$NEWBIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('template0','template1')" 2>/dev/null); do
@@ -138,7 +137,7 @@ unix_socket_directories='$W'
 hot_standby=on
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
-    "$NEWBIN/pg_upgrade" -B "$NEWBIN" -D "$SKEL" --wal-log-prepare-standby >"$W/prep.log" 2>&1 \
+    "$NEWBIN/pg_upgrade" -B "$NEWBIN" -D "$SKEL" --wal-prepare-standby >"$W/prep.log" 2>&1 \
       || { echo "FAIL: $OLDVER/$shape prepare-standby"; cat "$W/prep.log"; GRC=1; cd /; continue; }
     "$NEWBIN/pg_ctl" -D "$SKEL" -l "$W/skel.log" -w -t 120 start >/dev/null 2>&1 || true
     UP=0

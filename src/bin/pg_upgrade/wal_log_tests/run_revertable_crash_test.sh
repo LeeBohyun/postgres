@@ -8,11 +8,11 @@
 #   A1. Crash (SIGKILL) DURING the new cluster's first (auto-serve) start.
 #       A restart must converge: it serves with intact data (ordinary crash
 #       recovery) -- NEVER partial/corrupt.  old_dir untouched throughout.
-#   A2. --wal-log-rollback interrupted mid rm -rf (leave a partial new_dir), then
+#   A2. --wal-rollback interrupted mid rm -rf (leave a partial new_dir), then
 #       retried: new_dir fully discarded; old_dir untouched throughout.
 #   A3. Retirement ordering: after the new cluster serves, old_dir stays intact
 #       and startable (that IS the revert safety net -- no forced split-brain).
-#       --wal-log-delete-old is the explicit, final retire step; only after it is
+#       --wal-delete-old is the explicit, final retire step; only after it is
 #       old_dir gone.  No window where the data is unrecoverable.
 #
 set -u
@@ -37,7 +37,7 @@ SQL
 }
 do_upgrade(){ # $1=old $2=new
     ( cd "$W" && "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$1" -D "$2" -U postgres \
-        --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1 ) || { tail -20 "$W/up.log"; fail "upgrade"; }
+        --initdb --wal-upgrade --copy >"$W/up.log" 2>&1 ) || { tail -20 "$W/up.log"; fail "upgrade"; }
     echo "unix_socket_directories='$W'">>"$2/postgresql.conf"; echo "port=$PORT">>"$2/postgresql.conf"
 }
 kill_port(){ lsof -ti :$PORT 2>/dev/null | xargs kill -9 2>/dev/null; }
@@ -68,13 +68,13 @@ A1FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bi
 log "PASS A1: converged to serving with intact data ($A1FP); old cluster intact"
 
 # ================================================== A2: interrupted rollback retried
-log "A2: interrupted --wal-log-rollback (partial rm) retried -> fully discarded"
+log "A2: interrupted --wal-rollback (partial rm) retried -> fully discarded"
 do_upgrade "$W/old" "$W/new2"
 # Simulate an interrupted rollback: delete SOME of new_dir (as a killed rm -rf
-# would), then a retried --wal-log-rollback / operator cleanup must finish it.
+# would), then a retried --wal-rollback / operator cleanup must finish it.
 rm -rf "$W/new2/base" 2>/dev/null           # partial deletion
 [ -d "$W/new2" ] || fail "A2 setup: new2 already gone"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new2" --wal-log-rollback >"$W/a2.log" 2>&1
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new2" --wal-rollback >"$W/a2.log" 2>&1
 # rollback may error if the partial dir is no longer recognizable; the operator's
 # intent is "discard it", so ensure it is gone (finish the discard).
 rm -rf "$W/new2" 2>/dev/null
@@ -103,7 +103,7 @@ OFP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*),sum(hashtext(v)::big
 "$BIN/pg_ctl" -D "$W/old" -w stop >/dev/null 2>&1
 [ "$OFP" = "$FP" ] || fail "A3: old fallback data wrong (old=$FP got=$OFP)"
 # The explicit, final retire step removes old_dir (requires a completed new -D).
-"$BIN/pg_upgrade" -d "$W/old" -D "$W/new3" --wal-log-delete-old >"$W/a3del.log" 2>&1 || { cat "$W/a3del.log"; fail "A3: delete-old"; }
+"$BIN/pg_upgrade" -d "$W/old" -D "$W/new3" --wal-delete-old >"$W/a3del.log" 2>&1 || { cat "$W/a3del.log"; fail "A3: delete-old"; }
 [ -d "$W/old" ] && fail "A3: delete-old did not remove old_dir"
 log "PASS A3 (old was a valid fallback throughout; explicit delete-old retired it -- no dead end)"
 

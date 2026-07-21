@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compare the physical cluster produced by a NORMAL pg_upgrade vs a
-# --wal-log-upgrade + first-startup replay, of identical old-cluster data.
+# --wal-upgrade + first-startup replay, of identical old-cluster data.
 # Relation files are compared page-by-page, optionally ignoring the 8-byte
 # page LSN (pd_lsn), which replay legitimately rewrites.
 set -u
@@ -30,7 +30,7 @@ run_upgrade() { # $1=variant  $2=extraflag
   cd "$D"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$D/old" -D "$D/new" -U postgres --initdb $FLAG --copy >"$D/up.log" 2>&1 \
     || { echo "$V UPGRADE FAILED"; tail -8 "$D/up.log"; exit 1; }
   echo "unix_socket_directories='$W'">>$D/new/postgresql.conf; echo "port=$P">>$D/new/postgresql.conf; echo "autovacuum=off">>$D/new/postgresql.conf
-  # --wal-log-upgrade now auto-serves: the new cluster comes up read-write on the
+  # --wal-upgrade now auto-serves: the new cluster comes up read-write on the
   # first start, exactly like upstream pg_upgrade (no quarantine hold, no commit).
   # start + clean stop so both go through an identical startup/shutdown cycle
   PGPORT=$P "$BIN/pg_ctl" -D "$D/new" -l "$D/new.log" -w start >/dev/null 2>&1 || { echo "$V START FAILED"; tail -20 "$D/new.log"; exit 1; }
@@ -38,7 +38,7 @@ run_upgrade() { # $1=variant  $2=extraflag
 }
 
 log "normal pg_upgrade"; run_upgrade normal ""
-log "wal-log pg_upgrade (+ replay on first start)"; run_upgrade wal "--wal-log-upgrade"
+log "wal-log pg_upgrade (+ replay on first start)"; run_upgrade wal "--wal-upgrade"
 
 NA=$W/normal/new; WB=$W/wal/new
 log "compare relation files + SLRU + relmap page-by-page (LSN-aware)"
@@ -162,7 +162,7 @@ print(f"  vm/fsm derived-fork diff:  {cat['vmfsm']}")
 print(f"  size differs:              {cat['size_diff']}")
 print(f"  differ in real content:    {cat['other_diff']}")
 # A 0-byte relation file and a missing one are semantically identical to
-# Postgres (smgr creates/extends on demand).  The --wal-log-upgrade FPI capture
+# Postgres (smgr creates/extends on demand).  The --wal-upgrade FPI capture
 # deliberately skips empty files (nothing to image), so replay never recreates
 # them.  Only a NON-empty file present on one side but not the other is a real
 # divergence; empty-only files are expected and benign (same as run_e2e_equivalence).

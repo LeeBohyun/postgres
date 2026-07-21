@@ -91,19 +91,19 @@ typedef struct CheckPoint
  * the XLR_RMGR_INFO_MASK = 0xF0 constraint that limits RM_XLOG_ID to one
  * record type per 0x10 bucket.
  */
-#define XLOG_PG_UPGRADE_START			0x00	/* upgrade window start marker */
-#define XLOG_PG_UPGRADE_COMPLETE		0x10	/* upgrade window complete marker */
+#define XLOG_UPGRADE_START			0x00	/* upgrade window start marker */
+#define XLOG_UPGRADE_COMPLETE		0x10	/* upgrade window complete marker */
 #define XLOG_UPGRADE_SLRU_DATA			0x20	/* bulk SLRU segment image */
 #define XLOG_UPGRADE_RELFILE_DATA		0x30	/* bulk relation file segment image */
 #define XLOG_UPGRADE_RAWFILE			0x50	/* verbatim non-relation file image
 												 * (pg_filenode.map, PG_VERSION) */
-#define XLOG_UPGRADE_DIRSKEL			0x40	/* logged after-image of the initdb
+#define XLOG_UPGRADE_DIRTREE			0x40	/* logged after-image of the initdb
 												 * directory tree */
-#define XLOG_PG_UPGRADE_HANDOFF			0x60	/* OLD-format streaming-handoff
+#define XLOG_UPGRADE_HANDOFF			0x60	/* OLD-format streaming-handoff
 												 * trigger, emitted in the OLD
 												 * cluster's own WAL just before
 												 * pg_upgrade shuts it down */
-#define XLOG_PG_UPGRADE_DELETE_AUTHORIZE 0x70	/* set-wide "old cluster may now be
+#define XLOG_UPGRADE_DELETE_AUTHORIZE 0x70	/* set-wide "old cluster may now be
 												 * deleted" signal, emitted on the
 												 * live NEW primary by --delete-old
 												 * and replayed by NEW standbys */
@@ -133,7 +133,7 @@ typedef struct xl_pg_upgrade
 #define SizeOfXLPgUpgrade	sizeof(xl_pg_upgrade)
 
 /*
- * LEE: XLOG_PG_UPGRADE_HANDOFF — the streaming-standby handoff TRIGGER.
+ * LEE: XLOG_UPGRADE_HANDOFF — the streaming-standby handoff TRIGGER.
  *
  * Unlike every other pg_upgrade WAL record (which is written by the NEW cluster
  * in the NEW WAL page format and is only readable by the new binary), this
@@ -164,7 +164,7 @@ typedef struct xl_pg_upgrade_handoff
 #define SizeOfXLPgUpgradeHandoff	sizeof(xl_pg_upgrade_handoff)
 
 /*
- * LEE: XLOG_PG_UPGRADE_DELETE_AUTHORIZE — set-wide "the old cluster may now be
+ * LEE: XLOG_UPGRADE_DELETE_AUTHORIZE — set-wide "the old cluster may now be
  * deleted" signal.
  *
  * Emitted on the LIVE, committed NEW primary by "pg_upgrade --delete-old" (in the
@@ -271,7 +271,7 @@ typedef struct xl_upgrade_rawfile
 #define SizeOfXLUpgradeRawfile	offsetof(xl_upgrade_rawfile, data_len) + sizeof(uint32)
 
 /*
- * LEE: XLOG_UPGRADE_DIRSKEL — the logged "after-image" of the new cluster's
+ * LEE: XLOG_UPGRADE_DIRTREE — the logged "after-image" of the new cluster's
  * directory tree as it exists once pg_upgrade --initdb has finished all its
  * work (schema restore, file transfer, counter transplant).  initdb creates
  * this tree outside the server, so it is not otherwise WAL-logged; capturing it
@@ -296,16 +296,16 @@ typedef struct xl_upgrade_rawfile
  * Redo mkdir()s each directory, then symlink()s each entry (creating the target
  * directory too), all idempotently (EEXIST is fine).
  */
-typedef struct xl_upgrade_dirskel
+typedef struct xl_upgrade_dirtree
 {
 	uint32		ndirs;			/* number of directory paths */
 	uint32		dir_bytes;		/* total bytes of directory-path data */
 	uint32		nsymlinks;		/* number of symlink entries */
 	uint32		sym_bytes;		/* total bytes of symlink-entry data */
 	/* followed by dir_bytes of dir paths, then sym_bytes of symlink entries */
-} xl_upgrade_dirskel;
+} xl_upgrade_dirtree;
 
-#define SizeOfXLUpgradeDirskel	(offsetof(xl_upgrade_dirskel, sym_bytes) + sizeof(uint32))
+#define SizeOfXLUpgradeDirtree	(offsetof(xl_upgrade_dirtree, sym_bytes) + sizeof(uint32))
 
 
 /*
@@ -323,8 +323,8 @@ typedef enum DBState
 	DB_IN_PRODUCTION,
 
 	/*
-	 * INFORMATIONAL: a --wal-log-upgrade cluster that is CURRENTLY replaying its
-	 * upgrade window (between XLOG_PG_UPGRADE_START and _COMPLETE).  The arm still
+	 * INFORMATIONAL: a --wal-upgrade cluster that is CURRENTLY replaying its
+	 * upgrade window (between XLOG_UPGRADE_START and _COMPLETE).  The arm still
 	 * uses DB_IN_PRODUCTION to trigger crash recovery; the redo path flips to this
 	 * state while the window is being applied and back to DB_IN_PRODUCTION when it
 	 * finishes, purely so pg_controldata / diagnostics show "in pg_upgrade" rather

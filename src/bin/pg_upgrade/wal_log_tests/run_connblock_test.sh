@@ -5,12 +5,12 @@
 # The upgrade replay is crash recovery (DB_IN_PRODUCTION), during which the
 # postmaster rejects connections until a consistent state is reached; and the
 # pgUpgradeReplayInProgress guard additionally suppresses hot standby activation
-# between XLOG_PG_UPGRADE_START and XLOG_PG_UPGRADE_COMPLETE.  So even with
+# between XLOG_UPGRADE_START and XLOG_UPGRADE_COMPLETE.  So even with
 # hot_standby=on, no connection may succeed until the whole upgrade window has
 # replayed.
 #
 # Test: build a sizable cluster (so replay takes long enough to race against),
-# upgrade with --wal-log-upgrade, then start the new cluster with hot_standby=on
+# upgrade with --wal-upgrade, then start the new cluster with hot_standby=on
 # while hammering connection attempts.  A connection must NEVER observe a row
 # count other than the final, complete value -- any partial/empty read, or any
 # successful connect before COMPLETE, is a failure.
@@ -41,9 +41,9 @@ EXPECT=$("$BIN/psql" -h "$W" -p $P -U postgres -tAc "SELECT count(*) FROM big")
 log "expected final row count: $EXPECT"
 "$BIN/pg_ctl" -D "$O" -w stop >/dev/null 2>&1
 
-log "pg_upgrade --wal-log-upgrade --initdb"
+log "pg_upgrade --wal-upgrade --initdb"
 cd "$W"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" -U postgres --initdb --wal-log-upgrade --copy > "$W/up.log" 2>&1
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$O" -D "$N" -U postgres --initdb --wal-upgrade --copy > "$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo "FAIL upgrade"; tail -15 "$W/up.log"; exit 1; }
 
 cat >> "$N/postgresql.conf" <<CONF
@@ -52,9 +52,9 @@ unix_socket_directories='$W'
 hot_standby=on
 CONF
 
-# The upgrade replay happens on the FIRST start: --wal-log-upgrade now auto-serves,
+# The upgrade replay happens on the FIRST start: --wal-upgrade now auto-serves,
 # so the single start reconstructs the cluster from WAL and comes up read-write --
-# no quarantine hold, no --wal-log-commit.  During that reconstruction the cluster
+# no quarantine hold, no commit step.  During that reconstruction the cluster
 # is in crash recovery (dark), so no connection may observe a half-upgraded
 # cluster.  Hammer connections THROUGH the auto-serving start -- every probe must
 # either be cleanly rejected (recovering / not accepting) or return the correct

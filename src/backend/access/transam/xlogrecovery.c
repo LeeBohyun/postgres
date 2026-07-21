@@ -303,9 +303,9 @@ static bool backupEndRequired = false;
 bool		reachedConsistency = false;
 
 /*
- * LEE: true while replaying a pg_upgrade --wal-log-upgrade window, i.e. after
- * an XLOG_PG_UPGRADE_START record and before its matching
- * XLOG_PG_UPGRADE_COMPLETE.  While set, hot standby must NOT go active: the
+ * LEE: true while replaying a pg_upgrade --wal-upgrade window, i.e. after
+ * an XLOG_UPGRADE_START record and before its matching
+ * XLOG_UPGRADE_COMPLETE.  While set, hot standby must NOT go active: the
  * cluster is only half-upgraded (new catalogs partially applied), so no
  * read-only connection may observe it.  Set/cleared by pg_upgrade_redo().
  */

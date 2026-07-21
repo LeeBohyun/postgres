@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Many-relations + concurrent-clients test for --wal-log-upgrade.
+# Many-relations + concurrent-clients test for --wal-upgrade.
 #
 #   * MANY relations: hundreds of tables (heap + toast + several index AMs) plus
 #     multiple databases, so the RELFILE capture batches thousands of small
@@ -97,16 +97,16 @@ OLD_NREL=$(for d in $(seq 1 $NDBS); do "$BIN/psql" -h "$W" -p $P -U postgres -d 
 log "old: relation-ish count=$OLD_NREL"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-log "pg_upgrade --wal-log-upgrade --initdb --copy -j 4"
+log "pg_upgrade --wal-upgrade --initdb --copy -j 4"
 cd "$W"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy -j 4 >"$W/up.log" 2>&1
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --copy -j 4 >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -30 "$W/up.log"; exit 1; }
 
 TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
 log "base/ data-file bytes on disk after pg_upgrade (should be 0 = wiped): $TOTAL_BASE"
 [ "${TOTAL_BASE:-0}" = "0" ] || { echo "FAIL: data not wiped ($TOTAL_BASE) -- replay unproven"; exit 1; }
 
-# --wal-log-upgrade auto-serves: the new cluster comes up read-write on the
+# --wal-upgrade auto-serves: the new cluster comes up read-write on the
 # first start (no quarantine hold, no commit).  The disk-wiped assertion above
 # ran before first start, so it still reflects the wipe.
 cat >> "$NEW/postgresql.conf" <<CONF

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Regression test: a relation in a USER-DEFINED TABLESPACE must survive
-# --wal-log-upgrade WAL replay.
+# --wal-upgrade WAL replay.
 #
-# KNOWN BUG (this test currently FAILS and documents it): the --wal-log-upgrade
+# KNOWN BUG (this test currently FAILS and documents it): the --wal-upgrade
 # machinery ignores pg_tblspc/ in THREE places, so user-tablespace relations are
 # not WAL-logged and would be lost on a real fresh-target/standby replay:
-#   1. capture  (pg_write_upgrade_relfile_data) walks only global/ + base/,
+#   1. capture  (pg_upgrade_wal_log_relfile) walks only global/ + base/,
 #      never pg_tblspc/<spcoid>/PG_*/<dboid>/  -> no FPI emitted.
-#   2. dirskel   (collect_upgrade_dirs) skips symlinks -> the pg_tblspc/<spcoid>
+#   2. dirtree   (collect_upgrade_dirs) skips symlinks -> the pg_tblspc/<spcoid>
 #      symlink and its subtree are never recreated on replay.
 #   3. wipe      (revert_wal_logged_disk_writes) skips pg_tblspc/ -> the data is
 #      left on disk, which is why a SAME-NODE upgrade appears to work (the table
@@ -15,7 +15,7 @@
 # This test's disk-wipe assertion is what exposes (3), proving the data is not
 # actually WAL-recoverable.  See REPLICA_UPGRADE_DESIGN.md.
 #
-# When the bug is fixed (capture + dirskel + wipe all handle pg_tblspc/), this
+# When the bug is fixed (capture + dirtree + wipe all handle pg_tblspc/), this
 # test should PASS end to end.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"; BIN="${PGBIN:-$ROOT/pginst/bin}"
@@ -61,10 +61,10 @@ log "old: ts_t=$TS_FP base_t=$BASE_FP ts_idx=$TS_IDX"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
 cd "$W"
-log "pg_upgrade --wal-log-upgrade $MODE"
+log "pg_upgrade --wal-upgrade $MODE"
 # -O passes the in-place-tablespaces GUC to the new cluster's server so the
 # restore can recreate the in-place tablespace.
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade $MODE \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade $MODE \
     -O "-c allow_in_place_tablespaces=on" >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -25 "$W/up.log"; exit 1; }
 
@@ -77,7 +77,7 @@ IP_BYTES=$(tsbytes "$NEW/pg_tblspc")
 log "tablespace data on disk after pg_upgrade (should be 0=wiped): $IP_BYTES"
 [ "${IP_BYTES:-0}" = "0" ]  || { echo "FAIL: tablespace data not wiped ($IP_BYTES) -- replay unproven"; exit 1; }
 
-# --wal-log-upgrade auto-serves: the new cluster comes up read-write on the
+# --wal-upgrade auto-serves: the new cluster comes up read-write on the
 # first start (no quarantine hold, no commit).  The wiped-on-disk assertion
 # above ran before first start, so it still reflects the wipe.
 echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
@@ -94,5 +94,5 @@ FAIL=0
 [ "$TS_IDX"  = "$NTS_IDX" ]  || { echo "FAIL: in-place tablespace INDEX lost/corrupt (old '$TS_IDX' new '$NTS_IDX')"; FAIL=1; }
 [ "$BASE_FP" = "$NBASE_FP" ] || { echo "FAIL: base/ table regressed (old '$BASE_FP' new '$NBASE_FP')"; FAIL=1; }
 [ "$FAIL" = 0 ] && log "PASS: user-tablespace relation survived WAL replay" \
-                || log "FAIL: user-tablespace data did not survive --wal-log-upgrade"
+                || log "FAIL: user-tablespace data did not survive --wal-upgrade"
 exit $FAIL

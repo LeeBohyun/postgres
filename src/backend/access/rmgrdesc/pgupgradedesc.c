@@ -17,7 +17,7 @@ pg_upgrade_desc(StringInfo buf, XLogReaderState *record)
 	char	   *rec = XLogRecGetData(record);
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
-	if (info == XLOG_PG_UPGRADE_START || info == XLOG_PG_UPGRADE_COMPLETE)
+	if (info == XLOG_UPGRADE_START || info == XLOG_UPGRADE_COMPLETE)
 	{
 		xl_pg_upgrade xlrec;
 
@@ -76,18 +76,18 @@ pg_upgrade_desc(StringInfo buf, XLogReaderState *record)
 		appendStringInfo(buf, "rawfile \"%.*s\"; bytes %u",
 						 (int) xlrec.path_len, path, xlrec.data_len);
 	}
-	else if (info == XLOG_UPGRADE_DIRSKEL)
+	else if (info == XLOG_UPGRADE_DIRTREE)
 	{
-		xl_upgrade_dirskel xlrec;
-		char	   *first = rec + SizeOfXLUpgradeDirskel;
+		xl_upgrade_dirtree xlrec;
+		char	   *first = rec + SizeOfXLUpgradeDirtree;
 
-		memcpy(&xlrec, rec, SizeOfXLUpgradeDirskel);
+		memcpy(&xlrec, rec, SizeOfXLUpgradeDirtree);
 		appendStringInfo(buf, "dirs %u (%u bytes); symlinks %u (%u bytes); first \"%s\"",
 						 xlrec.ndirs, xlrec.dir_bytes,
 						 xlrec.nsymlinks, xlrec.sym_bytes,
 						 xlrec.ndirs > 0 ? first : "");
 	}
-	else if (info == XLOG_PG_UPGRADE_HANDOFF)
+	else if (info == XLOG_UPGRADE_HANDOFF)
 	{
 		xl_pg_upgrade_handoff xlrec;
 
@@ -97,7 +97,7 @@ pg_upgrade_desc(StringInfo buf, XLogReaderState *record)
 						 xlrec.target_major_version,
 						 (long long) xlrec.handoff_time);
 	}
-	else if (info == XLOG_PG_UPGRADE_DELETE_AUTHORIZE)
+	else if (info == XLOG_UPGRADE_DELETE_AUTHORIZE)
 	{
 		xl_pg_upgrade_delete_authorize xlrec;
 
@@ -113,9 +113,9 @@ pg_upgrade_identify(uint8 info)
 {
 	switch (info & ~XLR_INFO_MASK)
 	{
-		case XLOG_PG_UPGRADE_START:
+		case XLOG_UPGRADE_START:
 			return "PG_UPGRADE_START";
-		case XLOG_PG_UPGRADE_COMPLETE:
+		case XLOG_UPGRADE_COMPLETE:
 			return "PG_UPGRADE_COMPLETE";
 		case XLOG_UPGRADE_SLRU_DATA:
 			return "UPGRADE_SLRU_DATA";
@@ -123,11 +123,11 @@ pg_upgrade_identify(uint8 info)
 			return "UPGRADE_RELFILE_DATA";
 		case XLOG_UPGRADE_RAWFILE:
 			return "UPGRADE_RAWFILE";
-		case XLOG_UPGRADE_DIRSKEL:
-			return "UPGRADE_DIRSKEL";
-		case XLOG_PG_UPGRADE_HANDOFF:
+		case XLOG_UPGRADE_DIRTREE:
+			return "UPGRADE_DIRTREE";
+		case XLOG_UPGRADE_HANDOFF:
 			return "PG_UPGRADE_HANDOFF";
-		case XLOG_PG_UPGRADE_DELETE_AUTHORIZE:
+		case XLOG_UPGRADE_DELETE_AUTHORIZE:
 			return "PG_UPGRADE_DELETE_AUTHORIZE";
 	}
 	return NULL;

@@ -305,7 +305,7 @@ pg_create_restore_point(PG_FUNCTION_ARGS)
  */
 
 /*
- * LEE: pg_write_pg_upgrade_start / pg_write_pg_upgrade_complete
+ * LEE: pg_upgrade_wal_start / pg_upgrade_wal_complete
  *
  * SQL-callable wrappers that write the pg_upgrade start/complete WAL markers.
  * Called by pg_upgrade via psql just before and after the pg_restore phase.
@@ -315,7 +315,7 @@ pg_create_restore_point(PG_FUNCTION_ARGS)
  * Returns: LSN of the inserted WAL record.
  */
 Datum
-pg_write_pg_upgrade_start(PG_FUNCTION_ARGS)
+pg_upgrade_wal_start(PG_FUNCTION_ARGS)
 {
 	uint32		old_major = PG_GETARG_UINT32(0);
 	uint32		new_major = PG_GETARG_UINT32(1);
@@ -338,7 +338,7 @@ pg_write_pg_upgrade_start(PG_FUNCTION_ARGS)
 }
 
 Datum
-pg_write_pg_upgrade_complete(PG_FUNCTION_ARGS)
+pg_upgrade_wal_complete(PG_FUNCTION_ARGS)
 {
 	uint32		old_major = PG_GETARG_UINT32(0);
 	uint32		new_major = PG_GETARG_UINT32(1);
@@ -361,11 +361,11 @@ pg_write_pg_upgrade_complete(PG_FUNCTION_ARGS)
 }
 
 /*
- * LEE: pg_write_pg_upgrade_handoff(target_major_version integer) → pg_lsn
+ * LEE: pg_upgrade_wal_handoff(target_major_version integer) → pg_lsn
  *
  * Emit the OLD-format streaming-handoff TRIGGER into THIS (old) cluster's WAL.
  * Called by an operator/orchestrator on the LIVE OLD PRIMARY just before it is
- * shut down for a --wal-log-upgrade, so a physical standby still streaming the
+ * shut down for a --wal-upgrade, so a physical standby still streaming the
  * old primary receives the trigger and halts cleanly for the upgrade handoff.
  *
  * This is emitted by the OLD binary on the OLD primary -- NOT by pg_upgrade's
@@ -377,7 +377,7 @@ pg_write_pg_upgrade_complete(PG_FUNCTION_ARGS)
  * is about to be upgraded).
  */
 Datum
-pg_write_pg_upgrade_handoff(PG_FUNCTION_ARGS)
+pg_upgrade_wal_handoff(PG_FUNCTION_ARGS)
 {
 	uint32		target_major = PG_GETARG_UINT32(0);
 	XLogRecPtr	lsn;
@@ -398,7 +398,7 @@ pg_write_pg_upgrade_handoff(PG_FUNCTION_ARGS)
 }
 
 /*
- * LEE: pg_write_pg_upgrade_delete_authorize() → pg_lsn
+ * LEE: pg_upgrade_wal_authorize_delete() → pg_lsn
  *
  * Emit the set-wide "old cluster may now be deleted" signal into THIS (new,
  * committed) cluster's WAL.  Called by "pg_upgrade --delete-old" on the LIVE NEW
@@ -407,7 +407,7 @@ pg_write_pg_upgrade_handoff(PG_FUNCTION_ARGS)
  * emitted by the live primary).
  */
 Datum
-pg_write_pg_upgrade_delete_authorize(PG_FUNCTION_ARGS)
+pg_upgrade_wal_authorize_delete(PG_FUNCTION_ARGS)
 {
 	XLogRecPtr	lsn;
 
@@ -427,7 +427,7 @@ pg_write_pg_upgrade_delete_authorize(PG_FUNCTION_ARGS)
 }
 
 /*
- * LEE: pg_write_upgrade_slru_data(slru_type integer) → pg_lsn
+ * LEE: pg_upgrade_wal_log_slru(slru_type integer) → pg_lsn
  *
  * Emit XLOG_UPGRADE_SLRU_DATA records for all segment files in the given SLRU
  * directory.  slru_type: 0=pg_xact, 1=pg_multixact/offsets, 2=pg_multixact/members.
@@ -435,7 +435,7 @@ pg_write_pg_upgrade_delete_authorize(PG_FUNCTION_ARGS)
  * Restricted to superusers.
  */
 Datum
-pg_write_upgrade_slru_data(PG_FUNCTION_ARGS)
+pg_upgrade_wal_log_slru(PG_FUNCTION_ARGS)
 {
 	uint8		slru_type = (uint8) PG_GETARG_INT32(0);
 	XLogRecPtr	lsn;
@@ -466,15 +466,15 @@ pg_write_upgrade_slru_data(PG_FUNCTION_ARGS)
 }
 
 /*
- * LEE: pg_write_upgrade_dirskel() → pg_lsn
+ * LEE: pg_upgrade_wal_log_dirtree() → pg_lsn
  *
- * Emit one XLOG_UPGRADE_DIRSKEL record capturing the after-image of the new
+ * Emit one XLOG_UPGRADE_DIRTREE record capturing the after-image of the new
  * cluster's directory tree.  Called by pg_upgrade right after the START marker
  * and before the file-image records, so replay recreates the directory skeleton
  * from WAL before any relfile/SLRU image lands in it.  Restricted to superusers.
  */
 Datum
-pg_write_upgrade_dirskel(PG_FUNCTION_ARGS)
+pg_upgrade_wal_log_dirtree(PG_FUNCTION_ARGS)
 {
 	XLogRecPtr	lsn;
 
@@ -662,7 +662,7 @@ capture_dir_files(UpgradeRelfileBatch *batch, const char *reldir,
 }
 
 /*
- * LEE: pg_write_upgrade_relfile_data() → void
+ * LEE: pg_upgrade_wal_log_relfile() → void
  *
  * Capture the FULL physical image of the cluster as WAL: every relation file
  * under base/<dboid>/ and global/, plus the raw pg_filenode.map / PG_VERSION
@@ -675,7 +675,7 @@ capture_dir_files(UpgradeRelfileBatch *batch, const char *reldir,
  * on-disk files we read are the authoritative, fully-flushed final state.
  */
 Datum
-pg_write_upgrade_relfile_data(PG_FUNCTION_ARGS)
+pg_upgrade_wal_log_relfile(PG_FUNCTION_ARGS)
 {
 	UpgradeRelfileBatch batch;
 	DIR		   *basedir;
@@ -793,15 +793,15 @@ pg_write_upgrade_relfile_data(PG_FUNCTION_ARGS)
 }
 
 /*
- * LEE: pg_flush_upgrade_slru() → void
+ * LEE: pg_upgrade_wal_flush_slru() → void
  *
  * Force all dirty SLRU (CLOG, multixact) pages to disk, bypassing enableFsync.
- * Required for --wal-log-upgrade when the server runs with fsync=off: SLRU
+ * Required for --wal-upgrade when the server runs with fsync=off: SLRU
  * dirty pages would otherwise not be synced to disk before
  * stop_postmaster_immediate(), leaving pg_xact with stale data.
  */
 Datum
-pg_flush_upgrade_slru(PG_FUNCTION_ARGS)
+pg_upgrade_wal_flush_slru(PG_FUNCTION_ARGS)
 {
 	if (!superuser())
 		ereport(ERROR,

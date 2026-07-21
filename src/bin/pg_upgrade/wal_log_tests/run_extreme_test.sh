@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Extreme-case coverage for --wal-log-upgrade: exercise many object types and
+# Extreme-case coverage for --wal-upgrade: exercise many object types and
 # verify they all survive reconstruction from WAL (data files wiped on disk).
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"; BIN="${PGBIN:-$ROOT/pginst/bin}"
@@ -88,13 +88,13 @@ setv OLDV lo "$(fp -tAc "SELECT length(lo_get(obj)) FROM lo_ref WHERE id=1")"
 setv OLDV db2 "$(fp -d db2 -tAc "SET enable_seqscan=off; SELECT count(*), sum(qty)::bigint FROM inv WHERE tags @> ARRAY['t3']")"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-log "pg_upgrade --wal-log-upgrade --initdb $MODE"
-cd "$WORK"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade $MODE >"$WORK/up.log" 2>&1
+log "pg_upgrade --wal-upgrade --initdb $MODE"
+cd "$WORK"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade $MODE >"$WORK/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL-UPGRADE; tail -25 "$WORK/up.log"; exit 1; }
 BASE_BYTES=$(find "$NEW/base" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
 log "on-disk base/ bytes after pg_upgrade (should be ~0): $BASE_BYTES"
 
-# --wal-log-upgrade auto-serves: the new cluster comes up read-write on the
+# --wal-upgrade auto-serves: the new cluster comes up read-write on the
 # first start (no quarantine hold, no commit).  The on-disk base/ measurement
 # above ran before first start, so it still reflects the wipe.
 echo "unix_socket_directories='$WORK'">>$NEW/postgresql.conf; echo "port=$PORT">>$NEW/postgresql.conf

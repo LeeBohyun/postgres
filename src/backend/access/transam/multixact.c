@@ -2997,7 +2997,7 @@ multixact_redo(XLogReaderState *record)
 
 /*
  * LEE: restore captured pg_multixact/offsets and pg_multixact/members segments
- * during --wal-log-upgrade replay.  Thin wrappers exposing the static SLRU
+ * during --wal-upgrade replay.  Thin wrappers exposing the static SLRU
  * ctls to the RM_PG_UPGRADE_ID redo handler.
  */
 void

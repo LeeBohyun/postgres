@@ -16,7 +16,7 @@
 extern bool PerformWalUpgradeIfNeeded(void);
 
 /*
- * LEE: scan a pg_wal directory for the --wal-log-upgrade markers (START/COMPLETE)
+ * LEE: scan a pg_wal directory for the --wal-upgrade markers (START/COMPLETE)
  * and the end-of-upgrade checkpoint (CN) that precedes START.  Exposed so the
  * walsender's PG_UPGRADE_WINDOW_ANCHOR command can compute the anchor a streaming
  * standby needs, reusing the exact same scan the startup path uses.  Returns

@@ -162,7 +162,7 @@ main(int argc, char **argv)
 	check_cluster_compatibility();
 
 	/*
-	 * LEE: the --wal-log-upgrade recovery anchor (CN) is captured later, at the
+	 * LEE: the --wal-upgrade recovery anchor (CN) is captured later, at the
 	 * end of the upgrade, from the checkpoint we take just before the full-page
 	 * image burst — not from the initdb checkpoint.  See the end-of-upgrade
 	 * block below.
@@ -205,14 +205,14 @@ main(int argc, char **argv)
 	 * full-page images at the very end -- and because the server runs at
 	 * replica, those images (and the persisted pg_control) are at a level a
 	 * standby can recover from.  Verified: pg_controldata on a completed
-	 * --wal-log-upgrade cluster shows wal_level=replica.
+	 * --wal-upgrade cluster shows wal_level=replica.
 	 */
 	start_postmaster(&new_cluster, true);
 
 	prepare_new_globals();
 
 	/*
-	 * LEE: for --wal-log-upgrade we no longer emit any WAL markers here.  The
+	 * LEE: for --wal-upgrade we no longer emit any WAL markers here.  The
 	 * entire upgrade image (SLRU segments, relation files, and the
 	 * START/COMPLETE markers) is captured as full-page images at the very end,
 	 * after everything is on disk and a CHECKPOINT has
@@ -222,12 +222,12 @@ main(int argc, char **argv)
 	create_new_objects();
 
 	/*
-	 * LEE: write the matching XLOG_PG_UPGRADE_COMPLETE marker when
-	 * --wal-log-upgrade is set.
+	 * LEE: write the matching XLOG_UPGRADE_COMPLETE marker when
+	 * --wal-upgrade is set.
 	 */
 	/*
 	 * LEE: always stop the server before transferring relation files, exactly
-	 * as stock pg_upgrade does.  (The earlier --wal-log-upgrade variant kept
+	 * as stock pg_upgrade does.  (The earlier --wal-upgrade variant kept
 	 * the server running through the transfer; that was wrong.  The transfer
 	 * overwrites the pg_restore-built relation files -- e.g. freshly-built
 	 * indexes -- with the old cluster's files by a raw copy/clone/link that
@@ -235,7 +235,7 @@ main(int argc, char **argv)
 	 * index pages would linger dirty in shared buffers and the capture-time
 	 * CHECKPOINT would flush them back over the transferred files, corrupting
 	 * the captured images -- GIN indexes were the visible symptom.  For
-	 * --wal-log-upgrade we restart with a clean buffer pool afterward, so the
+	 * --wal-upgrade we restart with a clean buffer pool afterward, so the
 	 * capture reads exactly the transferred files.)
 	 */
 	stop_postmaster(false);
@@ -254,17 +254,17 @@ main(int argc, char **argv)
 	 * new cluster is started, and for --swap will make it unsafe to start the
 	 * old cluster at all.
 	 *
-	 * LEE: but NOT for --wal-log-upgrade.  Revertability here means "the old
-	 * cluster stays intact and startable until the operator commits"; disabling it
-	 * during the upgrade would defeat that.  We DEFER the disable to the switch
-	 * (--wal-log-commit stamps old_dir superseded once the operator adopts new_dir).
-	 * (--swap is rejected for --wal-log-upgrade in option validation; it never
+	 * LEE: but NOT for --wal-upgrade.  Revertability here means "the old
+	 * cluster stays intact and startable so it can be rolled back to"; disabling
+	 * it during the upgrade would defeat that.  The old cluster is retained and is
+	 * only removed later by the explicit "pg_upgrade --wal-delete-old" step.
+	 * (--swap is rejected for --wal-upgrade in option validation; it never
 	 * reaches here.  --link: note that new_dir hard-links old_dir's files, so the
 	 * usual upstream caveat -- do not run BOTH clusters -- still applies; commit
 	 * disables old_dir before new_dir is meant to be used, and rollback discards
 	 * new_dir without ever having started it.)
 	 */
-	if (!user_opts.wal_log_upgrade &&
+	if (!user_opts.wal_upgrade &&
 		(user_opts.transfer_mode == TRANSFER_MODE_LINK ||
 		 user_opts.transfer_mode == TRANSFER_MODE_SWAP))
 		disable_old_cluster(user_opts.transfer_mode);
@@ -275,7 +275,7 @@ main(int argc, char **argv)
 	/*
 	 * Set the new cluster's next OID.  This is the stock upstream step, run
 	 * with the server down.  pg_restore consumes OIDs, so it must happen after
-	 * the restore.  For --wal-log-upgrade it MUST also happen HERE, before the
+	 * the restore.  For --wal-upgrade it MUST also happen HERE, before the
 	 * end-of-upgrade checkpoint below, so that checkpoint (CN) records the
 	 * transplanted OID counter; recovery replays from CN and reproduces every
 	 * counter for free.
@@ -289,7 +289,7 @@ main(int argc, char **argv)
 
 	migrate_logical_slots = count_old_cluster_logical_slots();
 
-	if (user_opts.wal_log_upgrade)
+	if (user_opts.wal_upgrade)
 	{
 		PGconn	   *conn;
 
@@ -308,7 +308,7 @@ main(int argc, char **argv)
 		 *
 		 * First force every dirty buffer and SLRU page to disk so the on-disk
 		 * images we are about to capture are the authoritative final state.
-		 * The CHECKPOINT flushes shared buffers; pg_flush_upgrade_slru() then
+		 * The CHECKPOINT flushes shared buffers; pg_upgrade_wal_flush_slru() then
 		 * runs a forced checkpoint and fsyncs the SLRU segment files so the
 		 * committed transaction statuses are durable before we read them.
 		 */
@@ -335,7 +335,7 @@ main(int argc, char **argv)
 								 UPGRADE_WINDOW_SLOT));
 
 		PQclear(executeQueryOrDie(conn, "CHECKPOINT"));
-		PQclear(executeQueryOrDie(conn, "SELECT pg_flush_upgrade_slru()"));
+		PQclear(executeQueryOrDie(conn, "SELECT pg_upgrade_wal_flush_slru()"));
 
 		/*
 		 * LEE: the CHECKPOINT above is CN — the recovery anchor.  This, not the
@@ -347,7 +347,7 @@ main(int argc, char **argv)
 		 *
 		 * We no longer capture CN's LSN here: the new cluster's first startup
 		 * (PerformWalUpgradeIfNeeded) derives it directly from the WAL — it is
-		 * "the last checkpoint preceding XLOG_PG_UPGRADE_START" — and arms
+		 * "the last checkpoint preceding XLOG_UPGRADE_START" — and arms
 		 * pg_control at CN in-process.  Deriving it from the WAL is what lets a
 		 * physical standby recover the same anchor from the streamed WAL.
 		 */
@@ -367,7 +367,7 @@ main(int argc, char **argv)
 		 * them.
 		 */
 		PQclear(executeQueryOrDie(conn,
-								 "SELECT pg_write_pg_upgrade_start(%u, %u)",
+								 "SELECT pg_upgrade_wal_start(%u, %u)",
 								 old_cluster.major_version,
 								 new_cluster.major_version));
 		/*
@@ -379,15 +379,15 @@ main(int argc, char **argv)
 		 * recovering server must find already on disk.
 		 */
 		PQclear(executeQueryOrDie(conn,
-								 "SELECT pg_write_upgrade_dirskel()"));
+								 "SELECT pg_upgrade_wal_log_dirtree()"));
 		PQclear(executeQueryOrDie(conn,
-								 "SELECT pg_write_upgrade_relfile_data()"));
+								 "SELECT pg_upgrade_wal_log_relfile()"));
 		PQclear(executeQueryOrDie(conn,
-								 "SELECT pg_write_upgrade_slru_data(0)"));	/* pg_xact */
+								 "SELECT pg_upgrade_wal_log_slru(0)"));	/* pg_xact */
 		PQclear(executeQueryOrDie(conn,
-								 "SELECT pg_write_upgrade_slru_data(1)"));	/* pg_multixact/offsets */
+								 "SELECT pg_upgrade_wal_log_slru(1)"));	/* pg_multixact/offsets */
 		PQclear(executeQueryOrDie(conn,
-								 "SELECT pg_write_upgrade_slru_data(2)"));	/* pg_multixact/members */
+								 "SELECT pg_upgrade_wal_log_slru(2)"));	/* pg_multixact/members */
 		/*
 		 * LEE: test-only hook.  When PG_UPGRADE_TEST_SKIP_COMPLETE is set we omit
 		 * the COMPLETE marker to simulate a crash mid-upgrade; first startup must
@@ -395,26 +395,26 @@ main(int argc, char **argv)
 		 */
 		if (getenv("PG_UPGRADE_TEST_SKIP_COMPLETE") == NULL)
 			PQclear(executeQueryOrDie(conn,
-									 "SELECT pg_write_pg_upgrade_complete(%u, %u)",
+									 "SELECT pg_upgrade_wal_complete(%u, %u)",
 									 old_cluster.major_version,
 									 new_cluster.major_version));
 		PQclear(executeQueryOrDie(conn, "SELECT pg_switch_wal()"));
 
 		/*
 		 * LEE (2026-07-20, auto-serve): the quarantine hold is REMOVED.  We used
-		 * to call pg_arm_upgrade_quarantine() here so the shutdown checkpoint
-		 * recorded DB_UPGRADE_QUARANTINED and the primary refused to serve until
-		 * "pg_upgrade --wal-log-commit".  The primary now comes up read-write on
-		 * first start, like upstream pg_upgrade: its control checkpoint lands past
+		 * to arm a quarantine state on the shutdown checkpoint so the primary
+		 * refused to serve until an explicit commit step.  The primary now comes up
+		 * read-write on first start, like upstream pg_upgrade: its control
+		 * checkpoint lands past
 		 * COMPLETE, so PerformWalUpgradeIfNeeded()'s "already applied" guard makes
 		 * it skip the window and serve.  Rollback is a frontend operation gated on
-		 * old_dir integrity ("pg_upgrade --wal-log-rollback"), not a startup hold.
+		 * old_dir integrity ("pg_upgrade --wal-rollback"), not a startup hold.
 		 */
 		PQfinish(conn);
 
 		/*
 		 * LEE: CLEAN shutdown (-m smart) so the shutdown checkpoint lands PAST
-		 * XLOG_PG_UPGRADE_COMPLETE.  The primary is now a NORMAL, fully-upgraded
+		 * XLOG_UPGRADE_COMPLETE.  The primary is now a NORMAL, fully-upgraded
 		 * cluster whose files are on disk -- we do NOT wipe them and we do NOT
 		 * reconstruct from WAL.  Because the control-file checkpoint ends up past
 		 * COMPLETE, first startup's PerformWalUpgradeIfNeeded() "already applied"
@@ -430,14 +430,14 @@ main(int argc, char **argv)
 		stop_postmaster(false);
 
 		/*
-		 * LEE: drop the durable "window reached COMPLETE" marker that
-		 * --wal-log-commit's completeness gate requires.  On a STANDBY this marker
+		 * LEE: drop the durable "window reached COMPLETE" marker that the
+		 * --wal-rollback completeness gate consults.  On a STANDBY this marker
 		 * is written by the COMPLETE redo handler during window replay; the PRIMARY
 		 * does not replay, so we write it here -- the window definitionally reached
-		 * COMPLETE (we emitted pg_write_pg_upgrade_complete() above, unless the
+		 * COMPLETE (we emitted pg_upgrade_wal_complete() above, unless the
 		 * test-only PG_UPGRADE_TEST_SKIP_COMPLETE suppressed it, in which case we
-		 * intentionally do NOT write it so a "crash mid-window" primary is refused
-		 * by --wal-log-commit exactly like a partial standby).
+		 * intentionally do NOT write it so a "crash mid-window" primary is treated
+		 * as a partial upgrade).
 		 */
 		if (getenv("PG_UPGRADE_TEST_SKIP_COMPLETE") == NULL)
 		{
@@ -515,7 +515,7 @@ main(int argc, char **argv)
 	create_script_for_old_cluster_deletion(&deletion_script_file_name);
 
 	/*
-	 * LEE: for --wal-log-upgrade, the upgrade WAL in pg_wal/ must not be
+	 * LEE: for --wal-upgrade, the upgrade WAL in pg_wal/ must not be
 	 * recycled by a server restart.  issue_warnings_and_set_wal_level()
 	 * unconditionally starts/stops the server, which would checkpoint and
 	 * recycle that WAL — so we skip it here and leave the WAL intact.
@@ -531,7 +531,7 @@ main(int argc, char **argv)
 	 * commit point: the whole upgrade is applied at once on next startup, with
 	 * no midway rollback.
 	 */
-	if (!user_opts.wal_log_upgrade)
+	if (!user_opts.wal_upgrade)
 		issue_warnings_and_set_wal_level();
 
 	/*
@@ -543,7 +543,7 @@ main(int argc, char **argv)
 	 * as delete_old_cluster.sh) so the operator adopts or discards the upgrade
 	 * without re-typing -b/-B/-d/-D.
 	 */
-	if (user_opts.wal_log_upgrade)
+	if (user_opts.wal_upgrade)
 		create_revertable_scripts();
 
 	pg_log(PG_REPORT,
@@ -1057,11 +1057,11 @@ create_new_objects(void)
 
 	/*
 	 * LEE: snapshot the WAL position before pg_restore so we can measure how
-	 * many bytes the schema restore generates.  Only for --wal-log-upgrade;
+	 * many bytes the schema restore generates.  Only for --wal-upgrade;
 	 * without it this whole measurement is skipped so the flow matches stock
 	 * pg_upgrade exactly.
 	 */
-	if (user_opts.wal_log_upgrade)
+	if (user_opts.wal_upgrade)
 	{
 		lsn_res = executeQueryOrDie(conn_new_template1,
 									"SELECT pg_current_wal_lsn() - '0/0'");
@@ -1177,10 +1177,10 @@ create_new_objects(void)
 	/*
 	 * LEE: measure WAL bytes generated by pg_restore for debugging.  We
 	 * reconnect briefly to read the current WAL position and compute the
-	 * delta since lsn_before.  Only for --wal-log-upgrade; skipped otherwise so
+	 * delta since lsn_before.  Only for --wal-upgrade; skipped otherwise so
 	 * the flow matches stock pg_upgrade exactly.
 	 */
-	if (user_opts.wal_log_upgrade)
+	if (user_opts.wal_upgrade)
 	{
 		conn_new_template1 = connectToServer(&new_cluster, "template1");
 		lsn_res = executeQueryOrDie(conn_new_template1,
@@ -1350,7 +1350,7 @@ copy_xact_xlog_xid(void)
 	 * Now reset the WAL archives in the new cluster.  This positions the new
 	 * cluster's WAL at the old cluster's next segment.
 	 *
-	 * LEE: for --wal-log-upgrade this call also (re)assigns the new cluster's
+	 * LEE: for --wal-upgrade this call also (re)assigns the new cluster's
 	 * system identifier.  We do NOT force it to the old cluster's value: this
 	 * reset rewrites the control file AND the fresh WAL segment header from the
 	 * same ControlFile.system_identifier, so pg_control and the WAL that the

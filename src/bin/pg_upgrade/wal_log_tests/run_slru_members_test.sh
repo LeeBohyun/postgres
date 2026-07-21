@@ -9,7 +9,7 @@
 #
 # Generate MANY distinct 2-member multixacts (one long-lived holder holding
 # KEY SHARE on all rows + pgbench firing per-row KEY SHARE txns) to push members
-# past segment 0 into 15-digit long-name segments.  Then --wal-log-upgrade and:
+# past segment 0 into 15-digit long-name segments.  Then --wal-upgrade and:
 #   (a) assert via pg_waldump the upgrade WAL captured a NON-ZERO members segno
 #       (pre-fix that segment would have been mis-numbered 0), and
 #   (b) start the new cluster, confirm it replays from CN, the non-zero members
@@ -66,9 +66,9 @@ log "highest non-zero members segment on disk: '${NONZERO:-none}'"
 
 "$BIN/pg_ctl" -D "$W/o" -w stop >/dev/null 2>&1
 
-log "3. --wal-log-upgrade"
+log "3. --wal-upgrade"
 cd "$W"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/o" -D "$W/n" -U postgres --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/o" -D "$W/n" -U postgres --initdb --wal-upgrade --copy >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -20 "$W/up.log"; exit 1; }
 
 log "4. DETERMINISTIC parse check: upgrade WAL must capture a NON-ZERO members segno"
@@ -97,7 +97,7 @@ unix_socket_directories='$W'
 port=$PP
 CONF
 # Primary model: the upgraded new cluster keeps its files on disk (no
-# reconstruct-from-WAL on the primary).  --wal-log-upgrade auto-serves: it
+# reconstruct-from-WAL on the primary).  --wal-upgrade auto-serves: it
 # comes up read-write on the first start, exactly like upstream pg_upgrade
 # (no quarantine hold, no commit).  Post-upgrade control state is "shut down".
 "$BIN/pg_controldata" -D "$W/n" | grep -i 'cluster state' | grep -qi 'shut down' \

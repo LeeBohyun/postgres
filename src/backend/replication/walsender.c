@@ -511,14 +511,14 @@ IdentifySystem(void)
 /*
  * Handle the PG_UPGRADE_WINDOW_ANCHOR command.
  *
- * LEE: reply with the --wal-log-upgrade window anchor retained on this live
+ * LEE: reply with the --wal-upgrade window anchor retained on this live
  * upgraded primary, so a fresh vN+1 standby skeleton can arm its control file at
  * CN and stream the window -- without the operator running "pg_upgrade
- * --wal-log-prepare-standby".  One row, one text column "anchor" =
- * "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>" (the same string pg_upgrade_window_anchor()
+ * --wal-prepare-standby".  One row, one text column "anchor" =
+ * "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>" (the same string pg_upgrade_wal_window_anchor()
  * returns).  The standby learns sysid + TLI from IDENTIFY_SYSTEM separately.  The
  * column is NULL if this primary retains no upgrade window (not an upgrade
- * primary, or the window was already released by --wal-log-delete-old).
+ * primary, or the window was already released by --wal-delete-old).
  */
 static void
 PgUpgradeWindowAnchor(void)

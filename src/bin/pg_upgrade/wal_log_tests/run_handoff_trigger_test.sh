@@ -3,7 +3,7 @@
 #
 # This tests the TRIGGER mechanism (item 1 in TODO.md), NOT cross-version replay:
 # a caught-up physical standby is streaming the primary; the primary emits
-# pg_write_pg_upgrade_handoff() into its OWN (old-format) WAL; the standby streams
+# pg_upgrade_wal_handoff() into its OWN (old-format) WAL; the standby streams
 # that record and MUST halt cleanly with the handoff FATAL -- reaching it (unlike
 # the new-format START burst, which a streaming standby can never read).
 set -u
@@ -26,8 +26,8 @@ wal_keep_size=256MB
 CONF
 echo "local replication all trust" >> "$W/p/pg_hba.conf"
 "$BIN/pg_ctl" -D "$W/p" -l "$W/p.log" -w start >/dev/null 2>&1 || { echo FAIL start; exit 1; }
-HAVE=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*) FROM pg_proc WHERE proname='pg_write_pg_upgrade_handoff'")
-log "pg_write_pg_upgrade_handoff present: $HAVE (want 1)"
+HAVE=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*) FROM pg_proc WHERE proname='pg_upgrade_wal_handoff'")
+log "pg_upgrade_wal_handoff present: $HAVE (want 1)"
 [ "$HAVE" = 1 ] || FAIL=1
 
 log "1. create data + a caught-up streaming standby"
@@ -50,7 +50,7 @@ SPID=$(head -1 "$W/s/postmaster.pid" 2>/dev/null)
 log "standby postmaster pid=$SPID"
 
 log "2. primary emits the handoff trigger into its OWN wal, then a bit more WAL"
-HLSN=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT pg_write_pg_upgrade_handoff(20)")
+HLSN=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT pg_upgrade_wal_handoff(20)")
 log "handoff trigger written at $HLSN"
 "$BIN/psql" -h "$W" -p $PP -U postgres -qc "SELECT pg_switch_wal()" >/dev/null
 
@@ -62,7 +62,7 @@ for i in $(seq 1 20); do
 done
 if grep -qiE "reached pg_upgrade handoff on standby" "$W/s.log"; then
   log "  HALTED at the handoff trigger (as designed):"
-  grep -iE "reached pg_upgrade handoff|initiated a --wal-log-upgrade|re-provision" "$W/s.log" | tail -3
+  grep -iE "reached pg_upgrade handoff|initiated a --wal-upgrade|re-provision" "$W/s.log" | tail -3
 else
   echo "  FAIL: standby did not halt at the handoff trigger; log tail:"
   tail -12 "$W/s.log"; FAIL=1

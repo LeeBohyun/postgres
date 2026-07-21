@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# Lifecycle test for the revertable --wal-log-upgrade feature (AUTO-SERVE model).
+# Lifecycle test for the revertable --wal-upgrade feature (AUTO-SERVE model).
 #
 # Exercises the primary lifecycle after the commit/quarantine gate was removed:
 #
 #   upgrade   -> new cluster is a normal "shut down" cluster (NOT quarantined)
-#   start     -> AUTO-SERVES read-write on first start, no --wal-log-commit
+#   start     -> AUTO-SERVES read-write on first start, no commit step
 #   ROLLBACK  -> new discarded, old cluster still starts and serves (untouched),
 #                allowed even after the new cluster was started (with a warning)
 #   delete-old -> removes the old cluster once the operator has adopted new
 #
 # Proves: (a) the new cluster auto-serves like upstream (no hold, no commit),
 # (b) rollback is gated on old_dir integrity and restores the old cluster,
-# (c) data matches after auto-serve, (d) --wal-log-delete-old removes old_dir.
+# (c) data matches after auto-serve, (d) --wal-delete-old removes old_dir.
 #
 set -u
 
@@ -47,7 +47,7 @@ SQL
 run_upgrade() {
     local OLD=$1 NEW=$2
     ( cd "$WORK" && "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" \
-        -U postgres --initdb --wal-log-upgrade --copy > "$WORK/upgrade.log" 2>&1 )
+        -U postgres --initdb --wal-upgrade --copy > "$WORK/upgrade.log" 2>&1 )
     return $?
 }
 
@@ -71,7 +71,7 @@ log "new cluster state after upgrade: '$STATE'"
 echo "$STATE" | grep -qi "quarantine" && fail "new cluster is quarantined; auto-serve expected (got '$STATE')"
 echo "$STATE" | grep -qi "shut down" || fail "new cluster not cleanly shut down (got '$STATE')"
 
-# First start must SUCCEED and serve (no --wal-log-commit).
+# First start must SUCCEED and serve (no commit step).
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new_live.log" -w start >/dev/null 2>&1 \
     || { tail -30 "$WORK/new_live.log"; fail "new cluster did not auto-serve on first start"; }
 "$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT 1" >/dev/null 2>&1 \
@@ -86,7 +86,7 @@ log "PASS: new cluster auto-served on first start with data intact (no commit)"
 # It is allowed even though we already started (and could have written to) the
 # new cluster above -- discarding those changes with a warning.
 log "Scenario 2: rollback discards new (even after it served), old still serves"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-log-rollback > "$WORK/rollback.log" 2>&1 \
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-rollback > "$WORK/rollback.log" 2>&1 \
     || { cat "$WORK/rollback.log"; fail "rollback exited nonzero"; }
 grep -qi "WARNING" "$WORK/rollback.log" || fail "rollback did not warn about discarding new-cluster changes"
 [ -d "$NEW" ] && fail "rollback did not remove new cluster dir"
@@ -99,7 +99,7 @@ log "PASS: rollback (old_dir intact) restored the old cluster untouched"
 
 # ====================================================== Scenario 3: ADOPT + DELETE-OLD
 # Adopting the new cluster is just: upgrade, then start it (auto-serve).  Once
-# adopted, --wal-log-delete-old removes the now-unneeded old cluster.
+# adopted, --wal-delete-old removes the now-unneeded old cluster.
 log "Scenario 3: upgrade again, auto-serve, then delete-old removes old_dir"
 NEW=$WORK/new3
 run_upgrade "$OLD" "$NEW" || { tail -30 "$WORK/upgrade.log"; fail "second upgrade exited nonzero"; }
@@ -115,8 +115,8 @@ log "PASS: second upgrade auto-served with data intact"
 log "Scenario 4: delete-old removes the old cluster"
 # delete-old now requires -D too, to confirm a completed new cluster exists
 # before removing the old one (there is no commit stamp anymore).
-"$BIN/pg_upgrade" -d "$OLD" -D "$NEW" --wal-log-delete-old > "$WORK/del.log" 2>&1 || { cat "$WORK/del.log"; fail "--wal-log-delete-old exited nonzero"; }
-[ -d "$OLD" ] && fail "--wal-log-delete-old did not remove old dir"
+"$BIN/pg_upgrade" -d "$OLD" -D "$NEW" --wal-delete-old > "$WORK/del.log" 2>&1 || { cat "$WORK/del.log"; fail "--wal-delete-old exited nonzero"; }
+[ -d "$OLD" ] && fail "--wal-delete-old did not remove old dir"
 log "PASS: delete-old removed the old cluster"
 
 log "ALL SCENARIOS PASSED"

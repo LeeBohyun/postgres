@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Data-shape extremes for --wal-log-upgrade capture/replay, targeting edges the
+# Data-shape extremes for --wal-upgrade capture/replay, targeting edges the
 # existing tests skip:
 #
 #   B1. MULTI-SEGMENT single relation: one table > 2GB so its relfilenode is
@@ -77,9 +77,9 @@ TINY_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*), sum(a::bigint) 
 
 "$BIN/pg_ctl" -D "$W/old" -w stop >/dev/null 2>&1
 
-log "pg_upgrade --wal-log-upgrade (--copy)"
+log "pg_upgrade --wal-upgrade (--copy)"
 ( cd "$W" && "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$W/old" -D "$W/new" -U postgres \
-    --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1 ) || { tail -25 "$W/up.log"; fail "upgrade"; }
+    --initdb --wal-upgrade --copy >"$W/up.log" 2>&1 ) || { tail -25 "$W/up.log"; fail "upgrade"; }
 
 # disk must be wiped (proves reconstruction from WAL, not leftover files)
 TOTAL_BASE=$(find "$W/new/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
@@ -88,8 +88,8 @@ log "base/ bytes on disk after upgrade (should be 0): $TOTAL_BASE"
 
 echo "unix_socket_directories='$W'">>"$W/new/postgresql.conf"; echo "port=$PORT">>"$W/new/postgresql.conf"
 log "start (auto-serves: reconstruct from WAL, then come up read-write)"
-# --wal-log-upgrade auto-serves: the first start applies the WAL window,
-# reconstructs, and comes up read-write -- no quarantine hold, no --wal-log-commit.
+# --wal-upgrade auto-serves: the first start applies the WAL window,
+# reconstructs, and comes up read-write -- no quarantine hold, no commit step.
 "$BIN/pg_ctl" -D "$W/new" -l "$W/new.log" -w -t 600 start >/dev/null 2>&1 || { tail -30 "$W/new.log"; fail "start"; }
 
 log "verify each data shape survived"

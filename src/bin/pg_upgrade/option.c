@@ -65,18 +65,17 @@ parseCommandLine(int argc, char *argv[])
 		{"swap", no_argument, NULL, 7},
 		{"initdb", no_argument, NULL, 8},
 		/* LEE: capture the upgrade as WAL and reconstruct it on first startup */
-		{"wal-log-upgrade", no_argument, NULL, 9},
-		/* LEE: --wal-log-upgrade lifecycle subcommands (act on -D new / -d old).
-		 * Namespaced with the "wal-log-" prefix so they are clearly part of THIS
+		{"wal-upgrade", no_argument, NULL, 9},
+		/* LEE: --wal-upgrade lifecycle subcommands (act on -D new / -d old).
+		 * Namespaced with the "wal-" prefix so they are clearly part of THIS
 		 * feature and never mistaken for stock pg_upgrade behavior. */
-		{"wal-log-commit", no_argument, NULL, 10},
-		{"wal-log-rollback", no_argument, NULL, 11},
-		{"wal-log-delete-old", no_argument, NULL, 12},
-		{"wal-log-signal-handoff", no_argument, NULL, 14},
+		{"wal-rollback", no_argument, NULL, 11},
+		{"wal-delete-old", no_argument, NULL, 12},
+		{"wal-signal-handoff", no_argument, NULL, 14},
 		/* prepare a fresh skeleton to STREAM the upgrade window from the live
 		 * primary (stamps its control file; no cp).  Needs -D; reads the standard
 		 * primary_conninfo GUC from the skeleton's config (no dedicated flag). */
-		{"wal-log-prepare-standby", no_argument, NULL, 15},
+		{"wal-prepare-standby", no_argument, NULL, 15},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -252,15 +251,12 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.initdb_new_cluster = true;
 				break;
 
-			/* LEE: --wal-log-upgrade */
+			/* LEE: --wal-upgrade */
 			case 9:
-				user_opts.wal_log_upgrade = true;
+				user_opts.wal_upgrade = true;
 				break;
 
 			/* LEE: revertable-upgrade lifecycle subcommands */
-			case 10:
-				user_opts.revertable_op = REVERTABLE_OP_COMMIT;
-				break;
 			case 11:
 				user_opts.revertable_op = REVERTABLE_OP_ROLLBACK;
 				break;
@@ -285,7 +281,7 @@ parseCommandLine(int argc, char *argv[])
 		pg_fatal("too many command-line arguments (first is \"%s\")", argv[optind]);
 
 	/*
-	 * LEE: --swap is incompatible with --wal-log-upgrade.  Revertability requires
+	 * LEE: --swap is incompatible with --wal-upgrade.  Revertability requires
 	 * the old cluster to stay intact until --commit, but --swap MOVES the old
 	 * cluster's data directories into the new cluster (prepare_for_swap), and the
 	 * subsequent revert-wipe then deletes them from the new cluster -- so there is
@@ -294,9 +290,9 @@ parseCommandLine(int argc, char *argv[])
 	 * is destructive by construction.  Refuse it up front rather than silently
 	 * producing a non-revertable upgrade.
 	 */
-	if (user_opts.wal_log_upgrade &&
+	if (user_opts.wal_upgrade &&
 		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
-		pg_fatal("--swap cannot be used with --wal-log-upgrade\n"
+		pg_fatal("--swap cannot be used with --wal-upgrade\n"
 				 "--swap moves the old cluster's data into the new cluster, which "
 				 "makes the upgrade non-revertable; use --copy, --clone, or --link.");
 
@@ -329,7 +325,7 @@ parseCommandLine(int argc, char *argv[])
 	if (user_opts.revertable_op == REVERTABLE_OP_DELETE_OLD)
 	{
 		if (old_cluster.pgdata == NULL)
-			pg_fatal("--wal-log-delete-old requires the old cluster data directory (-d/--old-datadir)");
+			pg_fatal("--wal-delete-old requires the old cluster data directory (-d/--old-datadir)");
 		return;
 	}
 	else if (user_opts.revertable_op == REVERTABLE_OP_SIGNAL_HANDOFF)
@@ -340,7 +336,7 @@ parseCommandLine(int argc, char *argv[])
 		 * cluster's socket); unlike other ops the old cluster is RUNNING here.
 		 */
 		if (old_cluster.pgdata == NULL)
-			pg_fatal("--wal-log-signal-handoff requires the old cluster data directory (-d/--old-datadir)");
+			pg_fatal("--wal-signal-handoff requires the old cluster data directory (-d/--old-datadir)");
 		return;
 	}
 	else if (user_opts.revertable_op == REVERTABLE_OP_PREPARE_STANDBY)
@@ -352,7 +348,7 @@ parseCommandLine(int argc, char *argv[])
 		 * standby) -- no dedicated flag.  It needs only -D; no old cluster/bindir.
 		 */
 		if (new_cluster.pgdata == NULL)
-			pg_fatal("--wal-log-prepare-standby requires the new (skeleton) data directory (-D/--new-datadir)");
+			pg_fatal("--wal-prepare-standby requires the new (skeleton) data directory (-D/--new-datadir)");
 		return;
 	}
 	else if (user_opts.revertable_op != REVERTABLE_OP_NONE)
@@ -427,8 +423,8 @@ usage(void)
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
 	printf(_("  --copy                        copy files to new cluster (default)\n"));
 	printf(_("  --copy-file-range             copy files to new cluster with copy_file_range\n"));
-	/* LEE: --wal-log-upgrade usage */
-	printf(_("  --wal-log-upgrade             capture the whole upgrade as WAL and reconstruct\n"
+	/* LEE: --wal-upgrade usage */
+	printf(_("  --wal-upgrade             capture the whole upgrade as WAL and reconstruct\n"
 			 "                                the cluster from it on first startup (atomic,\n"
 			 "                                crash-safe, WAL-replayable)\n"));
 	printf(_("  --initdb                      create the new cluster with initdb before\n"

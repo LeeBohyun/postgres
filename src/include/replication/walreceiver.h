@@ -288,7 +288,7 @@ typedef char *(*walrcv_identify_system_fn) (WalReceiverConn *conn,
  * walrcv_upgrade_window_anchor_fn
  *
  * LEE: run the PG_UPGRADE_WINDOW_ANCHOR replication command on the primary and
- * return the retained --wal-log-upgrade window anchor as a palloc'd string
+ * return the retained --wal-upgrade window anchor as a palloc'd string
  * "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>", or NULL if the primary retains no window.
  * Like IDENTIFY_SYSTEM, this is a replication-protocol command (no database
  * connection required), so it must NOT go through walrcv_exec.

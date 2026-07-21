@@ -1445,7 +1445,7 @@ SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied)
 
 /*
  * LEE: Restore one SLRU segment's worth of pages from a captured image during
- * pg_upgrade --wal-log-upgrade WAL replay (XLOG_UPGRADE_SLRU_DATA redo).
+ * pg_upgrade --wal-upgrade WAL replay (XLOG_UPGRADE_SLRU_DATA redo).
  *
  * "segno" is the SLRU segment number; "data" is the raw segment image and
  * "datalen" its length (a whole number of BLCKSZ pages, padded to a full
@@ -1459,7 +1459,7 @@ SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied)
  * unlinked as part of "skipping the disk writes".
  *
  * The SLRU directory (ctl->Dir) is recreated earlier in replay by the
- * XLOG_UPGRADE_DIRSKEL record (the logged after-image of the initdb directory
+ * XLOG_UPGRADE_DIRTREE record (the logged after-image of the initdb directory
  * tree), so it is guaranteed to exist by the time we write a segment here.
  */
 void

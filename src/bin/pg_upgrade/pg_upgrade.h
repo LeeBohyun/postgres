@@ -255,8 +255,7 @@ typedef enum
 typedef enum
 {
 	REVERTABLE_OP_NONE = 0,		/* normal pg_upgrade run */
-	REVERTABLE_OP_COMMIT,		/* finalize a quarantined new_dir, stamp old */
-	REVERTABLE_OP_ROLLBACK,		/* discard a quarantined new_dir */
+	REVERTABLE_OP_ROLLBACK,		/* discard the new_dir, return to old_dir */
 	REVERTABLE_OP_DELETE_OLD,	/* delete a superseded old_dir */
 	REVERTABLE_OP_SIGNAL_HANDOFF,	/* emit the handoff trigger into the LIVE old
 								 * primary's WAL; it propagates to streaming
@@ -270,7 +269,7 @@ typedef enum
 
 /*
  * LEE: name of the internal physical replication slot pg_upgrade creates during
- * --wal-log-upgrade capture to RETAIN the upgrade window in pg_wal/ (pinned at
+ * --wal-upgrade capture to RETAIN the upgrade window in pg_wal/ (pinned at
  * CN) so a streaming standby can pull it from the committed/live primary.  Kept
  * across --commit; dropped on --rollback and once the standby has caught up.
  */
@@ -362,7 +361,7 @@ typedef struct
 	 * end and skip the on-disk data writes, so first startup reconstructs the
 	 * cluster purely from WAL (atomic, crash-safe, recoverable from an empty
 	 * data directory) */
-	bool		wal_log_upgrade;
+	bool		wal_upgrade;
 	/* LEE: revertable-upgrade lifecycle subcommand, if any (see enum below) */
 	RevertableOp revertable_op;
 } UserOpts;
@@ -501,7 +500,7 @@ char	   *cluster_conn_opts(ClusterInfo *cluster);
 
 bool		start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error);
 void		stop_postmaster(bool in_atexit);
-/* LEE: immediate stop (no checkpoint) for --wal-log-upgrade WAL preservation */
+/* LEE: immediate stop (no checkpoint) for --wal-upgrade WAL preservation */
 void		stop_postmaster_immediate(void);
 uint32		get_major_server_version(ClusterInfo *cluster);
 void		check_pghost_envvar(void);

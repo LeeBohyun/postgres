@@ -7,7 +7,7 @@
 #
 #   - the retention slot (UPGRADE_WINDOW_SLOT) that pins the window on the primary
 #     so it survives commit and is streamable, and
-#   - "pg_upgrade --wal-log-prepare-standby", which stamps the skeleton's control file
+#   - "pg_upgrade --wal-prepare-standby", which stamps the skeleton's control file
 #     with the primary's sysid + CN anchor + TLI so its walreceiver accepts the
 #     primary and recovery starts at CN.
 #
@@ -16,7 +16,7 @@
 #
 # DECISIVE ASSERTIONS:
 #   * the operator NEVER cp's a WAL segment into the skeleton (this script copies
-#     nothing; it only runs --wal-log-prepare-standby + pg_ctl start), and
+#     nothing; it only runs --wal-prepare-standby + pg_ctl start), and
 #   * the skeleton's log shows it STREAMED (walreceiver "started streaming" /
 #     "arming streaming standby from anchor"), came up as a hot standby
 #     (pg_is_in_recovery=t), and serves data byte-identical to the primary.
@@ -47,9 +47,9 @@ SQL
 OLD_FP=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t) FROM t")
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-log "2. upgrade the primary (--wal-log-upgrade), auto-serve -> live; slot retains the window"
+log "2. upgrade the primary (--wal-upgrade), auto-serve -> live; slot retains the window"
 cd "$W"
-"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1
+"$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --copy >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -20 "$W/up.log"; exit 1; }
 cat >> "$NEW/postgresql.conf" <<CONF
 port=$PP
@@ -60,7 +60,7 @@ listen_addresses='localhost'
 CONF
 echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
 echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
-# Auto-serve: the primary comes up read-write on first start (no --wal-log-commit).
+# Auto-serve: the primary comes up read-write on first start (no commit step).
 # The retention slot keeps the upgrade window streamable for the standby.
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/new.log"; exit 1; }
 NEW_FP=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t) FROM t")
@@ -73,7 +73,7 @@ log "committed primary: fp=$NEW_FP sysid=$NEW_ID"
 log "primary upgrade verified: data preserved from old cluster ($OLD_FP)"
 # confirm the retention slot is present + the anchor is reportable
 SLOT=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT slot_name FROM pg_replication_slots WHERE slot_name='pg_upgrade_window'")
-ANCHOR=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT pg_upgrade_window_anchor()")
+ANCHOR=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT pg_upgrade_wal_window_anchor()")
 log "retention slot='$SLOT'  window anchor='$ANCHOR'"
 [ "$SLOT" = "pg_upgrade_window" ] || { echo "FAIL: retention slot missing on committed primary"; FAIL=1; }
 [ -n "$ANCHOR" ] || { echo "FAIL: primary reports no window anchor"; FAIL=1; }
@@ -85,7 +85,7 @@ log "3. fresh new-version SKELETON, prepared to STREAM (no cp of any WAL)"
 rm -f "$SKEL"/base/*/[0-9]* 2>/dev/null
 rm -f "$SKEL"/global/[0-9]* "$SKEL"/global/pg_filenode.map 2>/dev/null
 # primary_conninfo is set in the skeleton config (standard for any standby);
-# --wal-log-prepare-standby reads it (no dedicated flag).
+# --wal-prepare-standby reads it (no dedicated flag).
 cat >> "$SKEL/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
@@ -95,7 +95,7 @@ CONF
 SKEL_ID_BEFORE=$("$BIN/pg_controldata" -D "$SKEL" | grep -i 'system identifier' | grep -oE '[0-9]+')
 log "skeleton sysid BEFORE prepare: $SKEL_ID_BEFORE (differs from primary $NEW_ID)"
 
-"$BIN/pg_upgrade" -B "$BIN" -D "$SKEL" --wal-log-prepare-standby >"$W/prep.log" 2>&1 \
+"$BIN/pg_upgrade" -B "$BIN" -D "$SKEL" --wal-prepare-standby >"$W/prep.log" 2>&1 \
     || { echo "FAIL prepare-standby"; cat "$W/prep.log"; FAIL=1; }
 # The prepare step must have created the anchor + standby.signal, but NO WAL cp.
 [ -f "$SKEL/pg_upgrade_stream.anchor" ] || { echo "FAIL: no streaming anchor written"; FAIL=1; }

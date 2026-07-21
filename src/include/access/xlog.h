@@ -279,7 +279,7 @@ extern XLogRecPtr XLogWritePgUpgrade(bool is_start,
 									 uint32 new_major_version);
 /* LEE: SLRU bulk image for pg_upgrade WAL replay */
 extern XLogRecPtr XLogWriteUpgradeSlruData(uint8 slru_type);
-/* LEE: arm pg_control at CN for in-process --wal-log-upgrade recovery */
+/* LEE: arm pg_control at CN for in-process --wal-upgrade recovery */
 struct CheckPoint;
 extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
 											  XLogRecPtr cn_lsn,

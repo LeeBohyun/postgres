@@ -1,16 +1,16 @@
 # Copyright (c) 2025-2026, PostgreSQL Global Development Group
 
-# Tests for "pg_upgrade --wal-log-upgrade" delivering the upgrade to a physical
+# Tests for "pg_upgrade --wal-upgrade" delivering the upgrade to a physical
 # standby by STREAMING the upgrade window from the live, upgraded primary.
 #
-# Under --wal-log-upgrade the whole upgrade is captured as WAL (the CN..COMPLETE
+# Under --wal-upgrade the whole upgrade is captured as WAL (the CN..COMPLETE
 # "window"), and a physical replication slot (the retention slot) pins that
 # window in the primary's pg_wal/ so it survives the upgrade and stays
 # streamable.  A fresh new-version skeleton that points primary_conninfo at the
 # upgraded primary AUTO-FETCHES the window anchor over the replication
 # connection (the PG_UPGRADE_WINDOW_ANCHOR command), arms its control file at
 # CN, and streams the window forward -- becoming a hot standby that serves the
-# upgraded data.  No operator "pg_upgrade --wal-log-prepare-standby" step and no
+# upgraded data.  No operator "pg_upgrade --wal-prepare-standby" step and no
 # hand-copied WAL are required.
 #
 # This test drives that path and, at each step, asserts the state transitions
@@ -95,9 +95,9 @@ command_ok(
 		'--old-port' => $old->port,
 		'--new-port' => $new->port,
 		'--initdb',
-		'--wal-log-upgrade',
+		'--wal-upgrade',
 	],
-	'primary: pg_upgrade --wal-log-upgrade --initdb succeeds');
+	'primary: pg_upgrade --wal-upgrade --initdb succeeds');
 
 # The --initdb-created new cluster skipped init(); append the settings the test
 # harness needs to start and stream from it.
@@ -136,7 +136,7 @@ ok($nslots >= 1, "primary: retention slot present ($nslots physical slot(s))");
 # Build a skeleton with the *new* binaries, then reduce it to a bare skeleton
 # (as the real feature does on the standby) so it has nothing but a control file
 # and must obtain everything by streaming.  It is given ONLY primary_conninfo:
-# no pre-staged anchor file, no --wal-log-prepare-standby.
+# no pre-staged anchor file, no --wal-prepare-standby.
 my $standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init;    # always the new/in-tree version
 

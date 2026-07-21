@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Priority edge-case variants for --wal-log-upgrade, each a self-contained case:
+# Priority edge-case variants for --wal-upgrade, each a self-contained case:
 #
 #   checksums-off   : cluster built with --no-data-checksums.  The RELFILE FPI
 #                     path and page validation differ when checksums are off
@@ -47,7 +47,7 @@ SQL
     "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
     cd "$W"
-    "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1
+    "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --copy >"$W/up.log" 2>&1
     [ $? -eq 0 ] || { echo "[$name] FAIL upgrade"; tail -20 "$W/up.log"; return 1; }
     # confirm the new cluster inherited the variant setting
     "$BIN/pg_controldata" -D "$NEW" | grep -iE "checksum version|Bytes per WAL segment" | sed "s/^/[$name] /"
@@ -55,9 +55,9 @@ SQL
     local TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
     [ "${TOTAL_BASE:-0}" = "0" ] || { echo "[$name] FAIL: base/ not wiped ($TOTAL_BASE)"; return 1; }
 
-    # --wal-log-upgrade auto-serves the new cluster (after the disk-wiped
+    # --wal-upgrade auto-serves the new cluster (after the disk-wiped
     # assertion above): the first start applies the WAL window, reconstructs, and
-    # comes up read-write -- no quarantine hold, no --wal-log-commit.
+    # comes up read-write -- no quarantine hold, no commit step.
     echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$port">>$NEW/postgresql.conf
     "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "[$name] FAIL start new"; tail -20 "$W/new.log"; return 1; }
     local NEW_FP=$("$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint), (SELECT count(*) FROM toast_t) FROM t")
@@ -88,7 +88,7 @@ SQL
     OLD_FP=$("$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint) FROM t")
     "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
     cd "$W"
-    "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-log-upgrade --copy >"$W/up.log" 2>&1
+    "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --copy >"$W/up.log" 2>&1
     [ $? -eq 0 ] || { echo "[$name] FAIL upgrade"; tail -15 "$W/up.log"; RC=1; }
     echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$port">>$NEW/postgresql.conf
 
@@ -107,7 +107,7 @@ SQL
     sleep 1
     # After a mid-replay crash, a restart must re-arm and converge idempotently,
     # then auto-serve read-write with the data intact (no re-hold, no
-    # --wal-log-commit).  This proves crash-idempotency: a half-applied window
+    # commit step).  This proves crash-idempotency: a half-applied window
     # converges on restart and comes up live without double-applying or refusing.
     log "[$name] restart after crash -- must re-arm, converge, and auto-serve (idempotent)"
     "$BIN/pg_ctl" -D "$NEW" -l "$W/new2.log" -w -t 120 start >/dev/null 2>&1

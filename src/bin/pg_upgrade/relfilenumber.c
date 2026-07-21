@@ -19,7 +19,7 @@
 
 static void transfer_single_new_db(FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace);
 static void transfer_relfile(FileNameMap *map, const char *type_suffix);
-/* LEE: record transferred user relation files for --wal-log-upgrade manifest */
+/* LEE: record transferred user relation files for --wal-upgrade manifest */
 static void record_transferred_relfile(Oid db_oid, RelFileNumber relfilenumber,
 									   const char *type_suffix, int segno);
 
@@ -131,10 +131,10 @@ transfer_all_new_tablespaces(DbInfoArr *old_db_arr, DbInfoArr *new_db_arr,
 	}
 
 	/*
-	 * LEE: start the --wal-log-upgrade transferred-files manifest fresh.
+	 * LEE: start the --wal-upgrade transferred-files manifest fresh.
 	 * transfer_relfile() appends to it; the WAL emit phase reads it.
 	 */
-	if (user_opts.wal_log_upgrade)
+	if (user_opts.wal_upgrade)
 	{
 		char		manifest_path[MAXPGPATH];
 
@@ -449,14 +449,14 @@ swap_catalog_files(FileNameMap *maps, int size, const char *old_catalog_dir,
 		pg_fatal("could not synchronize parent directory of \"%s\": %m", new_db_dir);
 
 	/*
-	 * LEE: for --wal-log-upgrade, --swap does NOT go through transfer_relfile(),
+	 * LEE: for --wal-upgrade, --swap does NOT go through transfer_relfile(),
 	 * so record the user relation files here into the transferred-files
 	 * manifest.  After the swap, new_db_dir holds the old cluster's user
 	 * relation files (every file whose relfilenumber IS in maps); catalog files
 	 * were moved out to old_catalog_dir.  We record exactly those user files
-	 * (all forks and segments) so pg_write_upgrade_relfile_data() captures them.
+	 * (all forks and segments) so pg_upgrade_wal_log_relfile() captures them.
 	 */
-	if (user_opts.wal_log_upgrade && size > 0)
+	if (user_opts.wal_upgrade && size > 0)
 	{
 		Oid			db_oid = maps[0].db_oid;
 
@@ -690,13 +690,13 @@ transfer_relfile(FileNameMap *map, const char *type_suffix)
 		}
 
 		/*
-		 * LEE: when --wal-log-upgrade is set, record each transferred user
-		 * relation file in a manifest so pg_write_upgrade_relfile_data() emits
+		 * LEE: when --wal-upgrade is set, record each transferred user
+		 * relation file in a manifest so pg_upgrade_wal_log_relfile() emits
 		 * WAL only for exactly these files (never system catalogs, which are
 		 * rebuilt by pg_restore).  We store db_oid, relfilenumber, forknum, and
 		 * segno — the emit reconstructs the path from these.
 		 */
-		if (user_opts.wal_log_upgrade)
+		if (user_opts.wal_upgrade)
 			record_transferred_relfile(map->db_oid, map->relfilenumber,
 									   type_suffix, segno);
 	}
@@ -705,7 +705,7 @@ transfer_relfile(FileNameMap *map, const char *type_suffix)
 /*
  * LEE: append one transferred user relation file segment to the
  * pg_upgrade_transferred_files manifest in the new cluster's PGDATA.
- * pg_write_upgrade_relfile_data() reads this manifest during the WAL emit
+ * pg_upgrade_wal_log_relfile() reads this manifest during the WAL emit
  * phase so that only genuinely-transferred user relation files are captured.
  *
  * Each line is: <db_oid> <relfilenumber> <forknum> <segno>

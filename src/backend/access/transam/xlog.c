@@ -4639,11 +4639,11 @@ UpdateControlFile(void)
 }
 
 /*
- * LEE: Arm the control file for pg_upgrade --wal-log-upgrade recovery.
+ * LEE: Arm the control file for pg_upgrade --wal-upgrade recovery.
  *
  * Sets checkPoint = CN (the end-of-upgrade checkpoint record LSN), its redo and
  * embedded counters from the CN CheckPoint struct, and state = DB_IN_PRODUCTION
- * so StartupXLOG() crash-recovers from CN through XLOG_PG_UPGRADE_COMPLETE.
+ * so StartupXLOG() crash-recovers from CN through XLOG_UPGRADE_COMPLETE.
  * wal_level is forced to replica so recovery can apply the records (and so a
  * physical standby doing archive recovery is not rejected).
  *
@@ -4714,8 +4714,8 @@ ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn,
 /*
  * LEE: INFORMATIONAL state flips for the "currently replaying the upgrade window"
  * period.  The arm sets DB_IN_PRODUCTION (a crash-recovery trigger); the redo
- * path calls SetControlFileInUpgrade() at XLOG_PG_UPGRADE_START and
- * ClearControlFileInUpgrade() at XLOG_PG_UPGRADE_COMPLETE, purely so a crash
+ * path calls SetControlFileInUpgrade() at XLOG_UPGRADE_START and
+ * ClearControlFileInUpgrade() at XLOG_UPGRADE_COMPLETE, purely so a crash
  * mid-window or pg_controldata shows "in pg_upgrade" instead of "in production".
  * These do NOT affect the recovery-mode decision (that already happened from the
  * armed DB_IN_PRODUCTION); Clear restores DB_IN_PRODUCTION so the end-of-recovery
@@ -4748,7 +4748,7 @@ ClearControlFileInUpgrade(void)
  * LEE: the checkpoint LSN currently recorded in the control file (the position
  * recovery would start from).  Used by PerformWalUpgradeIfNeeded() to decide
  * whether a pg_upgrade window has ALREADY been applied: after first startup
- * replays through XLOG_PG_UPGRADE_COMPLETE and finalizes, this advances PAST
+ * replays through XLOG_UPGRADE_COMPLETE and finalizes, this advances PAST
  * COMPLETE's LSN (on whatever timeline, since LSNs keep increasing across a
  * timeline switch).  A pending upgrade, by contrast, still points at/before the
  * end-of-upgrade checkpoint (CN), which precedes COMPLETE.  This is the
@@ -6702,7 +6702,7 @@ StartupXLOG(void)
 		promoted = PerformRecoveryXLogAction();
 
 	/*
-	 * LEE (2026-07-20, auto-serve): the --wal-log-upgrade new cluster now comes
+	 * LEE (2026-07-20, auto-serve): the --wal-upgrade new cluster now comes
 	 * up read-write on first start, exactly like upstream pg_upgrade -- there is
 	 * NO hold and NO explicit "pg_upgrade --commit" step.  The old revertable
 	 * design held here (recorded a quarantine state and proc_exit(3)) so an
@@ -6711,7 +6711,7 @@ StartupXLOG(void)
 	 * on a START-without-COMPLETE (partial) local window before arming, so only a
 	 * fully-replayed window ever reaches this point and serves.  Rollback is now a
 	 * frontend operation gated on old_dir integrity ("pg_upgrade
-	 * --wal-log-rollback"), not a recovery-time hold.
+	 * --wal-rollback"), not a recovery-time hold.
 	 */
 
 	/*
@@ -8827,8 +8827,8 @@ XLogAssignLSN(void)
  * pg_waldump, and replication tooling can identify the upgrade and verify
  * that both markers are present (i.e. the upgrade completed atomically).
  *
- * is_start=true  → XLOG_PG_UPGRADE_START
- * is_start=false → XLOG_PG_UPGRADE_COMPLETE
+ * is_start=true  → XLOG_UPGRADE_START
+ * is_start=false → XLOG_UPGRADE_COMPLETE
  */
 XLogRecPtr
 XLogWritePgUpgrade(bool is_start, uint32 old_major_version,
@@ -8847,8 +8847,8 @@ XLogWritePgUpgrade(bool is_start, uint32 old_major_version,
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfXLPgUpgrade);
 	RecPtr = XLogInsert(RM_PG_UPGRADE_ID,
-						is_start ? XLOG_PG_UPGRADE_START
-								 : XLOG_PG_UPGRADE_COMPLETE);
+						is_start ? XLOG_UPGRADE_START
+								 : XLOG_UPGRADE_COMPLETE);
 
 	ereport(LOG,
 			(errmsg("pg_upgrade %s recorded at %X/%X "
@@ -8863,11 +8863,11 @@ XLogWritePgUpgrade(bool is_start, uint32 old_major_version,
 /*
  * LEE: XLogWritePgUpgradeHandoff — emit the OLD-format streaming-handoff trigger.
  *
- * Called on the LIVE OLD primary (via pg_write_pg_upgrade_handoff()) just before
+ * Called on the LIVE OLD primary (via pg_upgrade_wal_handoff()) just before
  * pg_upgrade shuts it down.  This runs under the OLD binary, so the record is
  * written in the OLD WAL page format and streamed to a physical standby that is
  * still following the old primary.  See xl_pg_upgrade_handoff for why this is a
- * separate record from the new-format XLOG_PG_UPGRADE_START burst.
+ * separate record from the new-format XLOG_UPGRADE_START burst.
  */
 XLogRecPtr
 XLogWritePgUpgradeHandoff(uint32 old_major_version, uint32 target_major_version)
@@ -8881,7 +8881,7 @@ XLogWritePgUpgradeHandoff(uint32 old_major_version, uint32 target_major_version)
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfXLPgUpgradeHandoff);
-	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_PG_UPGRADE_HANDOFF);
+	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_HANDOFF);
 
 	/*
 	 * Flush it: the whole point is that a streaming standby receives this record
@@ -8902,8 +8902,9 @@ XLogWritePgUpgradeHandoff(uint32 old_major_version, uint32 target_major_version)
  * LEE: XLogWritePgUpgradeDeleteAuthorize — emit the set-wide "old cluster may now
  * be deleted" signal.
  *
- * Called on the LIVE, committed NEW primary (via pg_write_pg_upgrade_delete_
- * authorize()) from "pg_upgrade --delete-old".  It streams to NEW-version standbys
+ * Called on the LIVE, committed NEW primary (via
+ * pg_upgrade_wal_authorize_delete()) from "pg_upgrade --delete-old".  It streams
+ * to NEW-version standbys
  * like any other NEW-format record; on replay each standby marks its own
  * superseded old cluster delete-authorized (see the redo handler).  Flushed so it
  * reaches the standbys promptly.
@@ -8919,7 +8920,7 @@ XLogWritePgUpgradeDeleteAuthorize(uint32 new_major_version)
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfXLPgUpgradeDeleteAuthorize);
-	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_PG_UPGRADE_DELETE_AUTHORIZE);
+	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_DELETE_AUTHORIZE);
 
 	XLogFlush(RecPtr);
 
@@ -9021,19 +9022,19 @@ collect_upgrade_dirs(const char *abspath, const char *relpath,
 }
 
 /*
- * LEE: Emit one XLOG_UPGRADE_DIRSKEL record capturing the after-image of the
+ * LEE: Emit one XLOG_UPGRADE_DIRTREE record capturing the after-image of the
  * new cluster's directory tree (every subdirectory under PGDATA except pg_wal).
  * initdb creates this tree outside the server, so it is not otherwise
  * WAL-logged; this record lets recovery rebuild the whole skeleton from WAL,
  * and lets a standby upgrade itself without ever running initdb.
  *
- * Emitted right after XLOG_PG_UPGRADE_START and before the file-image records,
+ * Emitted right after XLOG_UPGRADE_START and before the file-image records,
  * so the directories exist before any relfile/SLRU image is replayed into them.
  */
 XLogRecPtr
 XLogWriteUpgradeDirSkel(void)
 {
-	xl_upgrade_dirskel xlrec;
+	xl_upgrade_dirtree xlrec;
 	StringInfoData dbuf;			/* directory paths */
 	StringInfoData sbuf;			/* symlink entries */
 	XLogRecPtr	RecPtr;
@@ -9048,12 +9049,12 @@ XLogWriteUpgradeDirSkel(void)
 	xlrec.sym_bytes = (uint32) sbuf.len;
 
 	XLogBeginInsert();
-	XLogRegisterData(&xlrec, SizeOfXLUpgradeDirskel);
+	XLogRegisterData(&xlrec, SizeOfXLUpgradeDirtree);
 	if (dbuf.len > 0)
 		XLogRegisterData(dbuf.data, dbuf.len);
 	if (sbuf.len > 0)
 		XLogRegisterData(sbuf.data, sbuf.len);
-	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_DIRSKEL);
+	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_DIRTREE);
 
 	ereport(LOG,
 			(errmsg("pg_upgrade directory after-image recorded at %X/%X (%u directories, %u symlinks)",
@@ -9066,7 +9067,7 @@ XLogWriteUpgradeDirSkel(void)
 
 /*
  * LEE: Emit XLOG_UPGRADE_SLRU_DATA records for all existing segment files in
- * one SLRU directory.  Called by pg_write_upgrade_slru_data() for each of the
+ * one SLRU directory.  Called by pg_upgrade_wal_log_slru() for each of the
  * three SLRU types (pg_xact, pg_multixact/offsets, pg_multixact/members).
  *
  * LEE: segments are sorted by number and packed into WAL-segment-sized chunks
