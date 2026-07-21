@@ -274,20 +274,16 @@ parseCommandLine(int argc, char *argv[])
 		pg_fatal("too many command-line arguments (first is \"%s\")", argv[optind]);
 
 	/*
-	 * LEE: --swap is incompatible with --wal-upgrade.  Revertability requires
-	 * the old cluster to stay intact until --commit, but --swap MOVES the old
-	 * cluster's data directories into the new cluster (prepare_for_swap), and the
-	 * subsequent revert-wipe then deletes them from the new cluster -- so there is
-	 * nothing to roll back to.  Unlike --link (which only reads the old files and
-	 * is revertable once its old-cluster disable is deferred to --commit), --swap
-	 * is destructive by construction.  Refuse it up front rather than silently
-	 * producing a non-revertable upgrade.
+	 * LEE: --swap IS allowed with --wal-upgrade.  The upgrade still runs and the
+	 * WAL window is still generated, so standbys can be reconstructed from it as
+	 * usual -- that value does not depend on the transfer mode.  What --swap gives
+	 * up is *local rollback*: it MOVES the old cluster's data directories into the
+	 * new cluster (do_swap), so old_dir is consumed and there is nothing intact to
+	 * return to.  We therefore do NOT reject --swap here; instead rollback refuses
+	 * at run time when old_dir is not an intact, cleanly-shut-down cluster (see
+	 * old_cluster_intact() in revertable.c).  So a --swap upgrade is a fully valid,
+	 * forward-only upgrade whose only lost capability is --wal-upgrade-rollback.
 	 */
-	if (user_opts.wal_upgrade &&
-		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
-		pg_fatal("--swap cannot be used with --wal-upgrade\n"
-				 "--swap moves the old cluster's data into the new cluster, which "
-				 "makes the upgrade non-revertable; use --copy, --clone, or --link.");
 
 	if (!user_opts.sync_method)
 		user_opts.sync_method = pg_strdup("fsync");

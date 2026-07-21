@@ -254,18 +254,23 @@ main(int argc, char **argv)
 	 * new cluster is started, and for --swap will make it unsafe to start the
 	 * old cluster at all.
 	 *
-	 * LEE: but NOT for --wal-upgrade.  Revertability here means "the old
-	 * cluster stays intact and startable so it can be rolled back to"; disabling
-	 * it during the upgrade would defeat that.  The old cluster is retained and is
-	 * only removed later by the explicit "pg_upgrade --wal-upgrade-delete-old" step.
-	 * (--swap is rejected for --wal-upgrade in option validation; it never
-	 * reaches here.  --link: note that new_dir hard-links old_dir's files, so the
-	 * usual upstream caveat -- do not run BOTH clusters -- still applies; commit
-	 * disables old_dir before new_dir is meant to be used, and rollback discards
-	 * new_dir without ever having started it.)
+	 * LEE: for --wal-upgrade we KEEP the old cluster intact where the transfer
+	 * mode allows it, so it can be rolled back to -- and let the explicit
+	 * "pg_upgrade --wal-upgrade-delete-old" step remove it later.  This applies to
+	 * --copy/--clone/--link (which only read the old files).  --swap is different:
+	 * it MOVES the old cluster's files into the new one, so disabling/consuming
+	 * old_dir is intrinsic to how swap transfers -- we cannot skip it.  A --swap
+	 * upgrade is therefore forward-only: it still runs and still generates the WAL
+	 * window (standbys reconstruct as usual), but --wal-upgrade-rollback will
+	 * refuse at run time because old_dir is no longer intact.
+	 * (--link: new_dir hard-links old_dir's files, so the usual upstream caveat --
+	 * do not run BOTH clusters -- still applies; rollback discards new_dir without
+	 * ever having started it.)
 	 */
-	if (!user_opts.wal_upgrade &&
-		(user_opts.transfer_mode == TRANSFER_MODE_LINK ||
+	if ((!user_opts.wal_upgrade &&
+		 (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
+		  user_opts.transfer_mode == TRANSFER_MODE_SWAP)) ||
+		(user_opts.wal_upgrade &&
 		 user_opts.transfer_mode == TRANSFER_MODE_SWAP))
 		disable_old_cluster(user_opts.transfer_mode);
 
