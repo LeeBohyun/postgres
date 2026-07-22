@@ -104,22 +104,25 @@ log "3. build a fresh NEW-version SKELETON as the standby target and STREAM the 
 # This proves the
 # pg_resetwal --system-identifier flag is not needed: adoption is in-process.
 TGT=$W/target
-"$NEWBIN/initdb" -D "$TGT" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb-target; exit 1; }
-SKEL_SYSID=$("$NEWBIN/pg_controldata" -D "$TGT" | grep -i "system identifier" | grep -oE "[0-9]+")
 NEW_ID=$("$NEWBIN/pg_controldata" -D "$NEW" | grep -i "system identifier" | grep -oE "[0-9]+")
-log "  skeleton sysid=$SKEL_SYSID  primary sysid=$NEW_ID (intentionally DIFFERENT; auto-fetched from the primary)"
-# wipe the skeleton's data so nothing masks a missing WAL image (keep runtime dirs)
-rm -f "$TGT"/base/*/[0-9]* 2>/dev/null
-rm -f "$TGT"/global/[0-9]* "$TGT"/global/pg_filenode.map 2>/dev/null
+# BARE new-version skeleton (NO initdb): the postmaster synthesizes pg_control +
+# PG_VERSION from the pg_upgrade_stream.signal sentinel on start, then auto-fetches
+# the primary's sysid + CN anchor + TLI over the replication connection and streams
+# the window.  This proves neither initdb nor pg_resetwal --system-identifier is
+# needed: the whole skeleton (including sysid adoption) is produced in-process.
+mkdir -p "$TGT"; chmod 700 "$TGT"
+log "  bare skeleton (no initdb); primary sysid=$NEW_ID will be auto-fetched from the primary"
 # primary_conninfo in config (standard for any standby); at first startup the
 # skeleton auto-fetches the window anchor over this replication connection.
-cat >> "$TGT/postgresql.conf" <<CONF
+cat > "$TGT/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
 hot_standby=on
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
+printf 'host all all 127.0.0.1/32 trust\nlocal all all trust\n' > "$TGT/pg_hba.conf"
 touch "$TGT/standby.signal"
+touch "$TGT/pg_upgrade_stream.signal"
 # A streamed standby does NOT hold/commit: it streams the window and becomes a hot
 # standby of the primary directly.
 "$NEWBIN/pg_ctl" -D "$TGT" -l "$W/tgt.log" -w -t 90 start >/dev/null 2>&1 || true

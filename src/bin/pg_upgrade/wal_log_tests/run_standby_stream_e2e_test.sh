@@ -78,26 +78,26 @@ log "retention slot='$SLOT'  window anchor='$ANCHOR'"
 [ "$SLOT" = "pg_upgrade_window" ] || { echo "FAIL: retention slot missing on committed primary"; FAIL=1; }
 [ -n "$ANCHOR" ] || { echo "FAIL: primary reports no window anchor"; FAIL=1; }
 
-log "3. fresh new-version SKELETON, prepared to STREAM (no cp of any WAL)"
-"$BIN/initdb" -D "$SKEL" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb-skel; exit 1; }
-# Wipe the skeleton's data like a re-provision (only WAL is delivered -- here by
-# STREAM, not cp).  Do NOT copy any [0-9A-F] WAL segment into it.
-rm -f "$SKEL"/base/*/[0-9]* 2>/dev/null
-rm -f "$SKEL"/global/[0-9]* "$SKEL"/global/pg_filenode.map 2>/dev/null
-# primary_conninfo is set in the skeleton config (standard for any standby); at
-# first startup the skeleton auto-fetches the window anchor from the primary over
-# this replication connection -- no operator prepare step, no anchor file.
-cat >> "$SKEL/postgresql.conf" <<CONF
+log "3. BARE new-version SKELETON, prepared to STREAM (NO initdb, no cp of any WAL)"
+# No initdb, no pg_control, no data.  The postmaster synthesizes pg_control +
+# PG_VERSION from the pg_upgrade_stream.signal sentinel on start; the only WAL is
+# delivered by STREAM (never cp).  primary_conninfo is set in config (standard for
+# any standby); at first startup the skeleton auto-fetches the window anchor over
+# that replication connection -- no operator prepare step, no anchor file.
+mkdir -p "$SKEL"; chmod 700 "$SKEL"
+cat > "$SKEL/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
 hot_standby=on
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
+printf 'host all all 127.0.0.1/32 trust\nlocal all all trust\n' > "$SKEL/pg_hba.conf"
 touch "$SKEL/standby.signal"
-SKEL_ID_BEFORE=$("$BIN/pg_controldata" -D "$SKEL" | grep -i 'system identifier' | grep -oE '[0-9]+')
-log "skeleton sysid BEFORE start: $SKEL_ID_BEFORE (differs from primary $NEW_ID)"
+touch "$SKEL/pg_upgrade_stream.signal"
+log "skeleton is BARE: no pg_control/PG_VERSION until the postmaster synthesizes them"
 
-# Pure auto-fetch path: there must be NO pre-staged anchor file.
+# No pg_control exists yet (bare skeleton) and no pre-staged anchor file.
+[ -e "$SKEL/global/pg_control" ]        && { echo "FAIL: skeleton has pg_control before start (not bare)"; FAIL=1; }
 [ -f "$SKEL/pg_upgrade_stream.anchor" ] && { echo "FAIL: unexpected pre-staged anchor file"; FAIL=1; }
 [ -f "$SKEL/standby.signal" ]           || { echo "FAIL: no standby.signal written"; FAIL=1; }
 

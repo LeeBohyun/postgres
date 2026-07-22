@@ -4404,6 +4404,188 @@ WriteControlFile(void)
 						XLOG_CONTROL_FILE)));
 }
 
+/*
+ * LEE: Synthesize a minimal, valid global/pg_control (and PG_VERSION) for a
+ * fresh --wal-upgrade STREAMING standby, WITHOUT initdb.
+ *
+ * Called from the postmaster's checkControlFile() when pg_control is absent AND
+ * the operator has staged an upgrade-stream standby (the pg_upgrade_stream.signal
+ * sentinel is present).  Rationale: a streaming standby reconstructs ALL of its
+ * data by replaying the upgrade window from the primary; the ONLY things it needs
+ * on disk before the postmaster will start are PG_VERSION and a pg_control that
+ * passes ReadControlFile()'s compatibility checks.  Every one of those checked
+ * fields is a compile-time constant of THIS binary (PG_CONTROL_VERSION,
+ * CATALOG_VERSION_NO, MAXALIGN, BLCKSZ, NAMEDATALEN, ...), and the run-time fields
+ * (system_identifier, checkPoint, minRecoveryPoint, state, ...) are all
+ * overwritten in-process by ArmControlFileForUpgradeRecovery(for_streaming=true)
+ * once the CN anchor is fetched from the primary.  So a control file built purely
+ * from this binary's constants is sufficient to clear the pre-start gate; the arm
+ * fixes up the rest.
+ *
+ * This runs in the POSTMASTER, BEFORE CreateSharedMemoryAndSemaphores(), so the
+ * shared ControlFile does not exist yet.  We therefore build a LOCAL buffer and
+ * write it directly, rather than going through the global ControlFile pointer.
+ */
+void
+SynthesizeUpgradeStreamControlFile(void)
+{
+	ControlFileData *cf;
+	char		buffer[PG_CONTROL_FILE_SIZE];	/* need not be aligned */
+	char		verpath[MAXPGPATH];
+	char		globaldir[MAXPGPATH];
+	char		ctlpath[MAXPGPATH];
+	int			fd;
+	char		mock_auth_nonce[MOCK_AUTH_NONCE_LEN];
+
+	/*
+	 * This runs from checkDataDir(), BEFORE ChangeToDataDir(), so the CWD is not
+	 * yet the data directory.  Build absolute paths from DataDir rather than
+	 * relying on relative names like "global/pg_control".
+	 */
+	snprintf(globaldir, sizeof(globaldir), "%s/global", DataDir);
+	snprintf(ctlpath, sizeof(ctlpath), "%s/%s", DataDir, XLOG_CONTROL_FILE);
+
+	cf = (ControlFileData *) palloc0(sizeof(ControlFileData));
+
+	if (!pg_strong_random(mock_auth_nonce, MOCK_AUTH_NONCE_LEN))
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not generate secret authorization token")));
+
+	/*
+	 * Status fields.  system_identifier is a placeholder (0): the streaming arm
+	 * (ArmControlFileForUpgradeRecovery, for_streaming) overwrites it with the
+	 * primary's sysid fetched from the anchor before the walreceiver connects, so
+	 * the value here only has to be well-formed, not correct.  DB_SHUTDOWNED is
+	 * what the arm expects to hand to InitWalRecovery to enter standby mode.
+	 */
+	cf->system_identifier = 0;
+	memcpy(cf->mock_authentication_nonce, mock_auth_nonce, MOCK_AUTH_NONCE_LEN);
+	cf->state = DB_SHUTDOWNED;
+	cf->unloggedLSN = FirstNormalUnloggedLSN;
+
+	/* Parameter values used when replaying WAL (from this node's GUCs). */
+	cf->MaxConnections = MaxConnections;
+	cf->max_worker_processes = max_worker_processes;
+	cf->max_wal_senders = max_wal_senders;
+	cf->max_prepared_xacts = max_prepared_xacts;
+	cf->max_locks_per_xact = max_locks_per_xact;
+	cf->wal_level = wal_level;
+	cf->wal_log_hints = wal_log_hints;
+	cf->track_commit_timestamp = track_commit_timestamp;
+	cf->data_checksum_version = 0;
+
+	/* Version and compatibility-check fields (all compile-time constants). */
+	cf->pg_control_version = PG_CONTROL_VERSION;
+	cf->catalog_version_no = CATALOG_VERSION_NO;
+	cf->maxAlign = MAXIMUM_ALIGNOF;
+	cf->floatFormat = FLOATFORMAT_VALUE;
+	cf->blcksz = BLCKSZ;
+	cf->relseg_size = RELSEG_SIZE;
+	cf->slru_pages_per_segment = SLRU_PAGES_PER_SEGMENT;
+	cf->xlog_blcksz = XLOG_BLCKSZ;
+	cf->xlog_seg_size = wal_segment_size;
+	cf->nameDataLen = NAMEDATALEN;
+	cf->indexMaxKeys = INDEX_MAX_KEYS;
+	cf->toast_max_chunk_size = TOAST_MAX_CHUNK_SIZE;
+	cf->loblksize = LOBLKSIZE;
+	cf->float8ByVal = true;		/* vestigial */
+	cf->default_char_signedness = true;
+
+	/* CRC over the struct, exactly as WriteControlFile() does. */
+	INIT_CRC32C(cf->crc);
+	COMP_CRC32C(cf->crc, cf, offsetof(ControlFileData, crc));
+	FIN_CRC32C(cf->crc);
+
+	memset(buffer, 0, PG_CONTROL_FILE_SIZE);
+	memcpy(buffer, cf, sizeof(ControlFileData));
+
+	/*
+	 * A bare skeleton has no global/ directory yet; create it before writing
+	 * global/pg_control into it.  (Idempotent: EEXIST is fine.)
+	 */
+	/*
+	 * Create the standard cluster subdirectories initdb would make.  Startup
+	 * opens some of these (e.g. pg_notify, pg_subtrans) BEFORE it replays the
+	 * window's DIRTREE record, so they must exist now.  Mirrors initdb.c's
+	 * subdirs[]; MakePGDirectory tolerates EEXIST.  base/ and global/ hold the
+	 * data the window rebuilds; the rest are the transient runtime dirs.
+	 */
+	{
+		static const char *const subdirs[] = {
+			"global", "base", "pg_wal", "pg_wal/archive_status", "pg_wal/summaries",
+			"pg_commit_ts", "pg_dynshmem", "pg_notify", "pg_serial",
+			"pg_snapshots", "pg_subtrans", "pg_twophase",
+			"pg_multixact", "pg_multixact/members", "pg_multixact/offsets",
+			"pg_replslot", "pg_tblspc", "pg_stat", "pg_stat_tmp", "pg_xact",
+			"pg_logical", "pg_logical/snapshots", "pg_logical/mappings"
+		};
+
+		for (int s = 0; s < (int) lengthof(subdirs); s++)
+		{
+			char		dpath[MAXPGPATH];
+
+			snprintf(dpath, sizeof(dpath), "%s/%s", DataDir, subdirs[s]);
+			if (MakePGDirectory(dpath) != 0 && errno != EEXIST)
+				ereport(FATAL,
+						(errcode_for_file_access(),
+						 errmsg("could not create directory \"%s\": %m", dpath)));
+		}
+	}
+
+	/* Write global/pg_control (O_EXCL: never clobber an existing one). */
+	fd = BasicOpenFile(ctlpath,
+					   O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
+	if (fd < 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", ctlpath)));
+	errno = 0;
+	if (write(fd, buffer, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE)
+	{
+		if (errno == 0)
+			errno = ENOSPC;
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not write to file \"%s\": %m", ctlpath)));
+	}
+	if (pg_fsync(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync file \"%s\": %m", ctlpath)));
+	if (close(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", ctlpath)));
+
+	/* Write a matching PG_VERSION (major-version stamp checkDataDir requires). */
+	snprintf(verpath, sizeof(verpath), "%s/PG_VERSION", DataDir);
+	fd = BasicOpenFile(verpath, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", verpath)));
+	if (write(fd, PG_MAJORVERSION "\n", strlen(PG_MAJORVERSION) + 1) !=
+		(int) (strlen(PG_MAJORVERSION) + 1))
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not write to file \"%s\": %m", verpath)));
+	if (pg_fsync(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync file \"%s\": %m", verpath)));
+	if (close(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", verpath)));
+
+	pfree(cf);
+
+	ereport(LOG,
+			(errmsg("pg_upgrade: synthesized a fresh pg_control and PG_VERSION for an upgrade-stream standby"),
+			 errdetail("The standby will stream and replay the upgrade window from its primary; no initdb was required.")));
+}
+
 static void
 ReadControlFile(void)
 {

@@ -1537,6 +1537,12 @@ checkControlFile(void)
 	fp = AllocateFile(path, PG_BINARY_R);
 	if (fp == NULL)
 	{
+		/*
+		 * LEE: for a --wal-upgrade streaming standby staged without initdb, the
+		 * pg_control was already synthesized earlier by checkDataDir() (before
+		 * its PG_VERSION gate), so it exists by now.  If it is still missing here
+		 * this is a genuinely broken data directory -- fail loudly as usual.
+		 */
 		write_stderr("%s: could not find the database system\n"
 					 "Expected to find it in the directory \"%s\",\n"
 					 "but could not open file \"%s\": %m\n",

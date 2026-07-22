@@ -54,17 +54,19 @@ printf 'host replication all 127.0.0.1/32 trust\nhost all all 127.0.0.1/32 trust
 GOT=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint) FROM t")
 [ "$GOT" = "$WANT" ] || { echo "FAIL: primary data mismatch (want $WANT got $GOT)"; FAIL=1; }
 
-log "3. fresh SKELETON with ONLY primary_conninfo -- NO prepare-standby, NO anchor file"
-"$BIN/initdb" -D "$SKEL" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb-skel; exit 1; }
-# surgical re-provision wipe (keep pg_control); deliver nothing by cp
-rm -f "$SKEL"/base/*/[0-9]* 2>/dev/null
-rm -f "$SKEL"/global/[0-9]* "$SKEL"/global/pg_filenode.map 2>/dev/null
-cat >> "$SKEL/postgresql.conf" <<CONF
+log "3. BARE SKELETON -- NO initdb; only config + standby.signal + pg_upgrade_stream.signal"
+# No initdb, no pg_control, no data.  The postmaster synthesizes pg_control +
+# PG_VERSION from the sentinel on start, then streams the window from the primary.
+mkdir -p "$SKEL"; chmod 700 "$SKEL"
+cat > "$SKEL/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
+printf 'host all all 127.0.0.1/32 trust\nlocal all all trust\n' > "$SKEL/pg_hba.conf"
 touch "$SKEL/standby.signal"
+touch "$SKEL/pg_upgrade_stream.signal"
+[ -e "$SKEL/global/pg_control" ] && { echo "FAIL: skeleton has pg_control before start (not bare)"; FAIL=1; }
 [ -f "$SKEL/pg_upgrade_stream.anchor" ] && { echo "FAIL: unexpected pre-staged anchor file"; FAIL=1; }
 
 log "4. START skeleton: must AUTO-FETCH the anchor + stream (no operator prep)"

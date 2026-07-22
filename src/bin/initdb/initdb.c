@@ -229,6 +229,12 @@ static const char *const backend_options = "--single -F -O -j -c search_path=pg_
 /* Additional switches to pass to backend (either boot or standalone) */
 static char *extra_options = "";
 
+/*
+ * The cluster subdirectories created here are mirrored by
+ * SynthesizeUpgradeStreamControlFile() in xlog.c, which builds a bare skeleton
+ * for a --wal-upgrade streaming standby without running initdb.  Keep the two
+ * lists in sync: a new required subdir added here must be added there too.
+ */
 static const char *const subdirs[] = {
 	"global",
 	"pg_wal/archive_status",

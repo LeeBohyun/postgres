@@ -378,6 +378,28 @@ checkDataDir(void)
 	data_directory_mode = pg_dir_create_mode;
 #endif
 
+	/*
+	 * LEE: --wal-upgrade streaming standby without initdb.  Before the
+	 * PG_VERSION / pg_control gates, if this data directory is a bare
+	 * upgrade-stream skeleton (the pg_upgrade_stream.signal sentinel is present)
+	 * with a primary to stream from (primary_conninfo set) and no PG_VERSION yet,
+	 * synthesize PG_VERSION + global/pg_control from this binary's constants so
+	 * the pre-start gates pass.  All data is then streamed from the primary.
+	 * Gated on the sentinel so an ordinary un-initdb'd directory still fails at
+	 * ValidatePgVersion() below.
+	 */
+	{
+		char		sigpath[MAXPGPATH];
+		char		verpath[MAXPGPATH];
+		struct stat st;
+
+		snprintf(sigpath, sizeof(sigpath), "%s/pg_upgrade_stream.signal", DataDir);
+		snprintf(verpath, sizeof(verpath), "%s/PG_VERSION", DataDir);
+		if (stat(verpath, &st) != 0 && stat(sigpath, &st) == 0 &&
+			PrimaryConnInfo != NULL && PrimaryConnInfo[0] != '\0')
+			SynthesizeUpgradeStreamControlFile();
+	}
+
 	/* Check for PG_VERSION */
 	ValidatePgVersion(DataDir);
 }

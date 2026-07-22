@@ -137,17 +137,18 @@ CONF
   [ "$NEW_FP" = "$OLD_FP" ] && log "  primary upgrade verified ($shape): data preserved" \
     || { echo "FAIL: $shape primary data ($NEW_FP) != old ($OLD_FP)"; GRC=1; }
 
-  # fresh skeleton STREAMS the window (no cp)
-  "$BIN/initdb" -D "$SKEL" -U postgres -N >/dev/null 2>&1
-  rm -f "$SKEL"/base/*/[0-9]* 2>/dev/null
-  rm -f "$SKEL"/global/[0-9]* "$SKEL"/global/pg_filenode.map 2>/dev/null
-  cat >> "$SKEL/postgresql.conf" <<CONF
+  # BARE skeleton STREAMS the window (NO initdb, no cp): the postmaster
+  # synthesizes pg_control + PG_VERSION from the sentinel on start.
+  rm -rf "$SKEL"; mkdir -p "$SKEL"; chmod 700 "$SKEL"
+  cat > "$SKEL/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
 hot_standby=on
 primary_conninfo='host=127.0.0.1 port=$PP user=postgres dbname=postgres'
 CONF
+  printf 'host all all 127.0.0.1/32 trust\nlocal all all trust\n' > "$SKEL/pg_hba.conf"
   touch "$SKEL/standby.signal"
+  touch "$SKEL/pg_upgrade_stream.signal"
   "$BIN/pg_ctl" -D "$SKEL" -l "$W/skel.log" -w -t 120 start >/dev/null 2>&1 || true
   UP=0
   for i in $(seq 1 90); do
