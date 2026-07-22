@@ -25,6 +25,7 @@
 
 #include "postgres_fe.h"
 
+#include <stdlib.h>				/* system() */
 #include <sys/stat.h>
 
 #include "access/xlog_internal.h"	/* XLOG_CONTROL_FILE */
@@ -368,6 +369,9 @@ do_signal_handoff(void)
 
 	if (old_cluster.pgdata == NULL || old_cluster.pgdata[0] == '\0')
 		pg_fatal("--wal-upgrade-signal-handoff requires the old cluster data directory (-d)");
+	if (old_cluster.bindir == NULL || old_cluster.bindir[0] == '\0')
+		pg_fatal("--wal-upgrade-signal-handoff requires the old cluster bin directory (-b)\n"
+				 "(needed to shut the old primary down at the handoff point)");
 
 	/*
 	 * The old primary is RUNNING here.  Flag a live check so get_sock_dir()
@@ -389,10 +393,49 @@ do_signal_handoff(void)
 	PQfinish(conn);
 	check_ok();
 
+	/*
+	 * Shut the old primary down IMMEDIATELY, at the handoff point.  This is the
+	 * whole reason signal-handoff drives the shutdown itself rather than leaving
+	 * it to the operator: any transaction that committed between the handoff
+	 * record and shutdown would append old-format WAL *after* the handoff marker,
+	 * so the handoff would no longer be the clean end of the old stream that
+	 * streaming standbys stop at.  A fast shutdown aborts in-flight backends (they
+	 * do not commit) and writes the shutdown checkpoint right after the handoff
+	 * record, so the handoff is effectively the last meaningful record.
+	 *
+	 * (A tiny window remains: another backend could COMMIT in the interval between
+	 * pg_upgrade_wal_handoff() returning and the fast-stop taking effect.  Closing
+	 * it completely requires making the handoff BE the shutdown checkpoint -- see
+	 * the note in xl_pg_upgrade_handoff.  In practice the primary is quiesced for
+	 * the upgrade, as for any pg_upgrade.)
+	 */
+	/*
+	 * Use system() rather than exec_prog() here: the lifecycle subcommands run
+	 * before make_outputdirs() has set log_opts.logdir, so exec_prog() (which
+	 * writes to that directory) would fail with a "(null)/..." log path.  A direct
+	 * pg_ctl invocation needs no output directory.
+	 */
+	{
+		char		cmd[MAXPGPATH * 2];
+		int			rc;
+
+		prep_status("Shutting down the old primary at the handoff point");
+		snprintf(cmd, sizeof(cmd), "\"%s/pg_ctl\" -w -D \"%s\" -m fast stop",
+				 old_cluster.bindir, old_cluster.pgdata);
+		rc = system(cmd);
+		if (rc != 0)
+			pg_fatal("could not shut down the old primary at the handoff point "
+					 "(command \"%s\" returned %d)\n"
+					 "The handoff record was written; stop the old primary "
+					 "manually before running \"pg_upgrade --wal-upgrade\".",
+					 cmd, rc);
+		check_ok();
+	}
+
 	pg_log(PG_REPORT,
-		   "\nHandoff trigger written to the old primary's WAL.  It propagates to\n"
-		   "streaming standbys (via the safekeepers in Neon), which replay it and\n"
-		   "shut down.  Now stop the old primary and run\n"
+		   "\nHandoff trigger written to the old primary's WAL and the primary was\n"
+		   "shut down at that point.  The trigger propagates to streaming standbys\n"
+		   "(via the safekeepers in Neon), which replay it and shut down.  Now run\n"
 		   "\"pg_upgrade --wal-upgrade ...\"; then re-provision each standby\n"
 		   "from the delivered upgrade window.");
 }

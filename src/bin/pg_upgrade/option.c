@@ -320,12 +320,17 @@ parseCommandLine(int argc, char *argv[])
 	else if (user_opts.revertable_op == REVERTABLE_OP_SIGNAL_HANDOFF)
 	{
 		/*
-		 * --signal-handoff connects to the LIVE old primary and writes the handoff
-		 * trigger into its WAL.  It needs the old data dir (to locate the running
-		 * cluster's socket); unlike other ops the old cluster is RUNNING here.
+		 * --signal-handoff connects to the LIVE old primary, writes the handoff
+		 * trigger into its WAL, and then shuts the primary down at that point so
+		 * no transaction can append WAL after the handoff.  It needs the old data
+		 * dir (to locate the running cluster's socket) and the old bin dir (to run
+		 * that cluster's pg_ctl for the shutdown).  Unlike most ops the old
+		 * cluster is RUNNING here.
 		 */
 		if (old_cluster.pgdata == NULL)
 			pg_fatal("--wal-upgrade-signal-handoff requires the old cluster data directory (-d/--old-datadir)");
+		if (old_cluster.bindir == NULL)
+			pg_fatal("--wal-upgrade-signal-handoff requires the old cluster bin directory (-b/--old-bindir)");
 		return;
 	}
 	else if (user_opts.revertable_op != REVERTABLE_OP_NONE)

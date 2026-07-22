@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
-# Edge cases for "pg_upgrade --wal-upgrade-signal-handoff" (emit the streaming-handoff
-# trigger on the live old primary).
+# Edge cases for "pg_upgrade --wal-upgrade-signal-handoff" (emit the streaming-
+# handoff trigger on the live old primary, then shut the primary down at that
+# point so nothing appends WAL after the handoff record).
 #
-#   D1. No standbys connected: --wal-upgrade-signal-handoff still succeeds and writes exactly
-#       one HANDOFF record to the primary's WAL (the trigger propagates via the
-#       WAL path; nobody consuming it right now is fine).
-#   D2. Called twice: idempotent in effect -- each call writes another harmless
-#       trigger; the primary keeps running and serving.
-#   D3. Against a STOPPED primary: clean failure (cannot connect), not a crash.
+#   D1. Normal: signal-handoff writes exactly one HANDOFF record to the primary's
+#       WAL and then SHUTS THE PRIMARY DOWN (it is no longer serving afterward).
+#       The stopped cluster is a clean, restartable cluster.
+#   D2. Re-run against the (now stopped) primary: clean connection failure, not a
+#       crash, and the cluster stays undamaged.
+#   D3. Against a never-started primary: clean connection failure too.
 #
 set -u
 BIN="${PGBIN:?set PGBIN}"
@@ -35,40 +36,46 @@ CONF
 "$BIN/pg_ctl" -D "$W/old" -l "$W/o.log" -w start >/dev/null 2>&1 || fail "start old"
 "$BIN/psql" -h "$W" -U postgres -qc "CREATE TABLE t(id int); INSERT INTO t SELECT generate_series(1,100);" >/dev/null 2>&1 || fail "load"
 
-# =========================================================== D1: no standbys
-log "D1: --wal-upgrade-signal-handoff with NO standbys connected"
+# =========================================================== D1: emit + shut down
+log "D1: --wal-upgrade-signal-handoff emits the trigger AND shuts the primary down"
 BEFORE=$(count_handoff "$W/old")
-"$BIN/pg_upgrade" --wal-upgrade-signal-handoff -d "$W/old" -U postgres >"$W/d1.log" 2>&1 || { cat "$W/d1.log"; fail "D1: signal-handoff failed"; }
+"$BIN/pg_upgrade" --wal-upgrade-signal-handoff -b "$BIN" -d "$W/old" -U postgres >"$W/d1.log" 2>&1 || { cat "$W/d1.log"; fail "D1: signal-handoff failed"; }
 grep -qi "handoff trigger written" "$W/d1.log" || { cat "$W/d1.log"; fail "D1: missing success message"; }
-# force the record to disk so waldump sees it, then count
-"$BIN/psql" -h "$W" -U postgres -qc "CHECKPOINT" >/dev/null 2>&1
+# the primary must now be STOPPED (signal-handoff shut it down at the handoff point)
+if "$BIN/psql" -h "$W" -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
+    fail "D1: primary still serving after signal-handoff (should have shut down)"
+fi
+[ -f "$W/old/postmaster.pid" ] && fail "D1: postmaster.pid still present (primary not stopped)"
+# exactly one HANDOFF record landed (shutdown flushed WAL to disk)
 AFTER1=$(count_handoff "$W/old")
 [ "${AFTER1:-0}" -ge $(( ${BEFORE:-0} + 1 )) ] || fail "D1: no new HANDOFF record (before=$BEFORE after=$AFTER1)"
-# primary must still be serving
-"$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*) FROM t" >/dev/null 2>&1 || fail "D1: primary stopped serving after signal-handoff"
-log "PASS D1 (handoff emitted, primary still serving; records $BEFORE -> $AFTER1)"
+# the stopped cluster is clean + restartable
+[ -f "$W/old/global/pg_control" ] || fail "D1: pg_control missing after handoff shutdown"
+log "PASS D1 (handoff emitted, primary shut down at the handoff point; records $BEFORE -> $AFTER1)"
 
-# =========================================================== D2: called twice
-log "D2: --wal-upgrade-signal-handoff called again is idempotent (harmless second trigger)"
-"$BIN/pg_upgrade" --wal-upgrade-signal-handoff -d "$W/old" -U postgres >"$W/d2.log" 2>&1 || { cat "$W/d2.log"; fail "D2: second signal-handoff failed"; }
-"$BIN/psql" -h "$W" -U postgres -qc "CHECKPOINT" >/dev/null 2>&1
-AFTER2=$(count_handoff "$W/old")
-[ "${AFTER2:-0}" -ge $(( ${AFTER1:-0} + 1 )) ] || fail "D2: second call wrote no additional record (was=$AFTER1 now=$AFTER2)"
-"$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*) FROM t" >/dev/null 2>&1 || fail "D2: primary stopped serving"
-log "PASS D2 (records $AFTER1 -> $AFTER2, primary still serving)"
-
+# =========================================================== D2: re-run vs stopped
+log "D2: --wal-upgrade-signal-handoff again (primary now stopped) fails cleanly"
+if "$BIN/pg_upgrade" --wal-upgrade-signal-handoff -b "$BIN" -d "$W/old" -U postgres >"$W/d2.log" 2>&1; then
+    fail "D2: signal-handoff succeeded against a stopped primary (should fail to connect)"
+fi
+grep -qiE "could not connect|connection.*failed|no such file|is the server running" "$W/d2.log" || { cat "$W/d2.log"; fail "D2: wrong/absent connection-failure message"; }
+# cluster undamaged and still restartable after the failed re-run
+"$BIN/pg_ctl" -D "$W/old" -l "$W/o2.log" -w start >/dev/null 2>&1 || fail "D2: cluster no longer starts after handoff+failed re-run"
 "$BIN/pg_ctl" -D "$W/old" -w stop >/dev/null 2>&1
+log "PASS D2 (clean connection failure; cluster undamaged and restartable)"
 
-# =========================================================== D3: stopped primary
-log "D3: --wal-upgrade-signal-handoff against a STOPPED primary fails cleanly"
-if "$BIN/pg_upgrade" --wal-upgrade-signal-handoff -d "$W/old" -U postgres >"$W/d3.log" 2>&1; then
-    fail "D3: signal-handoff succeeded against a stopped primary (should fail to connect)"
+# =========================================================== D3: never-started primary
+log "D3: --wal-upgrade-signal-handoff against a never-started primary fails cleanly"
+"$BIN/initdb" -D "$W/old3" -U postgres -N >/dev/null 2>&1 || fail "initdb old3"
+cat >> "$W/old3/postgresql.conf" <<CONF
+unix_socket_directories='$W'
+port=$((PORT+1))
+CONF
+if "$BIN/pg_upgrade" --wal-upgrade-signal-handoff -b "$BIN" -d "$W/old3" -U postgres >"$W/d3.log" 2>&1; then
+    fail "D3: signal-handoff succeeded against a never-started primary (should fail to connect)"
 fi
 grep -qiE "could not connect|connection.*failed|no such file|is the server running" "$W/d3.log" || { cat "$W/d3.log"; fail "D3: wrong/absent connection-failure message"; }
-# the stopped cluster must be undamaged (still has a normal pg_control, startable)
-[ -f "$W/old/global/pg_control" ] || fail "D3: stopped cluster's pg_control disturbed"
-"$BIN/pg_ctl" -D "$W/old" -l "$W/o3.log" -w start >/dev/null 2>&1 || fail "D3: cluster no longer starts after a failed signal-handoff"
-"$BIN/pg_ctl" -D "$W/old" -w stop >/dev/null 2>&1
+[ -f "$W/old3/global/pg_control" ] || fail "D3: cluster's pg_control disturbed"
 log "PASS D3 (clean connection failure, cluster undamaged)"
 
 log "ALL SIGNAL-HANDOFF EDGE CASES PASSED"

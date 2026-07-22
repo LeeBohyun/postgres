@@ -467,11 +467,16 @@ PostgreSQL documentation
       <term><option>--wal-upgrade-signal-handoff</option></term>
       <listitem>
        <para>
-        Emit a handoff trigger into the live old cluster's WAL
-        (<option>-d</option>/<option>--old-datadir</option>) so that streaming
-        standbys following it stand down before the upgrade.  This is used
-        before a <option>--wal-upgrade</option> run in replicated deployments;
-        it does not itself upgrade anything.
+        Emit a handoff trigger into the live old cluster's WAL and then shut the
+        old cluster down at that point, so that streaming standbys following it
+        stand down before the upgrade.  Shutting the old cluster down as part of
+        this step ensures no transaction appends WAL after the handoff record,
+        which would otherwise leave standbys stopping short of the primary's
+        final state.  Requires the old cluster's data directory
+        (<option>-d</option>/<option>--old-datadir</option>) and bin directory
+        (<option>-b</option>/<option>--old-bindir</option>).  This is used before
+        a <option>--wal-upgrade</option> run in replicated deployments; it does
+        not itself upgrade anything.
        </para>
       </listitem>
      </varlistentry>

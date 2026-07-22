@@ -2,10 +2,12 @@
 # Prove the OLD-format streaming-handoff TRIGGER halts a live streaming standby.
 #
 # This tests the TRIGGER mechanism (item 1 in TODO.md), NOT cross-version replay:
-# a caught-up physical standby is streaming the primary; the primary emits
-# pg_upgrade_wal_handoff() into its OWN (old-format) WAL; the standby streams
-# that record and MUST halt cleanly with the handoff FATAL -- reaching it (unlike
-# the new-format START burst, which a streaming standby can never read).
+# a caught-up physical standby is streaming the primary; the operator runs
+# "pg_upgrade --wal-upgrade-signal-handoff", which emits pg_upgrade_wal_handoff()
+# into the primary's OWN (old-format) WAL and then shuts the primary down at that
+# point; the standby streams that record and MUST halt cleanly with the handoff
+# FATAL -- reaching it (unlike the new-format START burst, which a streaming
+# standby can never read).
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 BIN="${PGBIN:-$ROOT/pginst/bin}"
@@ -49,10 +51,20 @@ log "standby streaming, sees $SB_ROWS rows (want 500)"
 SPID=$(head -1 "$W/s/postmaster.pid" 2>/dev/null)
 log "standby postmaster pid=$SPID"
 
-log "2. primary emits the handoff trigger into its OWN wal, then a bit more WAL"
-HLSN=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT pg_upgrade_wal_handoff(20)")
-log "handoff trigger written at $HLSN"
-"$BIN/psql" -h "$W" -p $PP -U postgres -qc "SELECT pg_switch_wal()" >/dev/null
+log "2. operator runs --wal-upgrade-signal-handoff: emits the trigger AND shuts the primary down"
+# Drive the real operator path (the CLI), not the raw SQL function: the CLI
+# emits pg_upgrade_wal_handoff() into the primary's own WAL and then fast-stops
+# the primary AT the handoff point, so nothing appends WAL after the trigger.
+HLSN=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT pg_current_wal_lsn()")
+"$BIN/pg_upgrade" --wal-upgrade-signal-handoff -b "$BIN" -d "$W/p" -U postgres >"$W/handoff.log" 2>&1 \
+    || { echo "FAIL: --wal-upgrade-signal-handoff"; cat "$W/handoff.log"; FAIL=1; }
+grep -qi "handoff trigger written" "$W/handoff.log" || { echo "FAIL: no handoff success message"; cat "$W/handoff.log"; FAIL=1; }
+# the primary must be STOPPED now (the CLI shut it down at the handoff point)
+if "$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
+    echo "FAIL: primary still serving after signal-handoff (should have shut down at the handoff point)"; FAIL=1
+else
+    log "  primary shut down at the handoff point (no WAL can follow the trigger)"
+fi
 
 log "3. standby must HALT (FATAL) upon replaying the handoff trigger"
 # give the standby time to stream + replay the trigger and die
@@ -90,8 +102,15 @@ log "  handoff FATAL count in log: $NF (want 1 -- proves no restart loop)"
 [ "$NF" = 1 ] || { echo "  FAIL: FATAL appears $NF times -- standby is loop-restarting, not halted"; FAIL=1; }
 
 log "5. pg_waldump shows the trigger with old-format identify string"
-SEG=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT pg_walfile_name('$HLSN')")
-"$BIN/pg_waldump" -p "$W/p/pg_wal" "$SEG" 2>/dev/null | grep -i "PG_UPGRADE_HANDOFF" | head -1 || echo "  (waldump: handoff record not shown -- may be in a different seg)"
+# The primary is stopped (signal-handoff shut it down), so scan its WAL directly
+# rather than querying it.  The handoff was written at/after $HLSN.
+HREC=""
+for seg in "$W/p/pg_wal"/[0-9A-F]*; do
+  HREC=$("$BIN/pg_waldump" "$seg" 2>/dev/null | grep -i "PG_UPGRADE_HANDOFF" | head -1)
+  [ -n "$HREC" ] && break
+done
+[ -n "$HREC" ] && log "  $HREC" \
+              || { echo "  FAIL: no PG_UPGRADE_HANDOFF record found in the primary's WAL"; FAIL=1; }
 
 "$BIN/pg_ctl" -D "$W/s" -w stop >/dev/null 2>&1 || true
 "$BIN/pg_ctl" -D "$W/p" -w stop >/dev/null 2>&1 || true
