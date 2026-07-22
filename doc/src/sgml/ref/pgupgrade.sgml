@@ -278,6 +278,12 @@ PostgreSQL documentation
         exist when this option is given; if it does,
         <application>pg_upgrade</application> will exit with an error.
        </para>
+       <para>
+        This option cannot be combined with
+        <option>-c</option>/<option>--check</option>, because
+        <option>--check</option> is read-only and must not create the new
+        cluster.
+       </para>
       </listitem>
      </varlistentry>
 

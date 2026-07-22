@@ -266,6 +266,25 @@ parseCommandLine(int argc, char *argv[])
 		pg_fatal("too many command-line arguments (first is \"%s\")", argv[optind]);
 
 	/*
+	 * --check is read-only and may run against a live old cluster, while
+	 * --initdb creates the new cluster on disk.  Reject the combination.
+	 */
+	if (user_opts.check && user_opts.initdb_new_cluster)
+		pg_fatal("options %s and %s cannot be used together",
+				 "-c/--check", "--initdb");
+
+	/*
+	 * LEE: unlike the standalone --initdb branch, we do NOT reject -O with
+	 * --initdb.  create_new_cluster_via_initdb() derives initdb's options from
+	 * the old cluster's control data and never forwards -O to initdb; -O reaches
+	 * only the new cluster's postmaster (the server phases of the upgrade).  For
+	 * --wal-upgrade that combination is legitimate and needed -- e.g. passing
+	 * "-c allow_in_place_tablespaces=on" to the upgrade server while still having
+	 * pg_upgrade create the cluster.  The two options act on different phases, so
+	 * there is no conflict to reject.
+	 */
+
+	/*
 	 * LEE: --swap IS allowed with --wal-upgrade.  The upgrade still runs and the
 	 * WAL window is still generated, so standbys can be reconstructed from it as
 	 * usual -- that value does not depend on the transfer mode.  What --swap gives
