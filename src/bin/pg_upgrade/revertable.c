@@ -65,11 +65,13 @@ new_cluster_complete(const char *new_datadir)
  * quarantine hold) means rollback is no longer gated on "before first write";
  * it is gated on old_dir being INTACT.  We check the ACTUAL state of old_dir
  * (its control file reads as a cleanly shut-down cluster), not which transfer
- * mode was used: on this branch --wal-upgrade keeps the old cluster's files
- * intact for every allowed mode (copy AND link -- the primary is not demolished;
- * old-cluster deletion is a separate deferred step, and --swap is rejected at
- * parse time).  If old_dir is instead damaged, missing, or was already started
- * post-upgrade, refuse and point at PITR rather than start something unsound.
+ * mode was used.  --copy/--clone leave the old cluster genuinely intact (its
+ * files are independent), so rollback returns to it.  --link and --swap disable
+ * the old cluster during the upgrade (its pg_control is renamed away, as in
+ * upstream), so this check fails and rollback refuses -- link shares the old
+ * cluster's inodes and swap consumes them, so neither is a safe rollback target.
+ * If old_dir is instead damaged, missing, or was already started post-upgrade,
+ * refuse rather than start something unsound.
  */
 static bool
 old_cluster_intact(const char *old_datadir)
@@ -115,9 +117,11 @@ old_cluster_intact(const char *old_datadir)
  * --wal-upgrade-rollback: discard the new cluster and return to the old one.
  *
  * Auto-serve model: the new cluster may already be live and have taken writes.
- * Rollback is allowed as long as old_dir is intact; if the new cluster diverged,
- * those writes are permanently lost (a warning, not an error).  If old_dir is
- * NOT intact (--link/--swap, or damaged), refuse and point at PITR.
+ * Rollback (for --copy/--clone) is allowed as long as old_dir is intact; if the
+ * new cluster diverged, those writes are permanently lost (a warning, not an
+ * error).  If old_dir is NOT intact -- disabled by --link/--swap during the
+ * upgrade, damaged, or already started post-upgrade -- there is nothing safe to
+ * return to, so refuse.
  */
 static void
 do_rollback(void)

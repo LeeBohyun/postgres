@@ -2,24 +2,28 @@
 # Transfer-mode coverage for --wal-upgrade.
 #
 # pg_upgrade has 5 transfer modes; their interaction with revertability differs:
-#   --copy, --clone, --link : the old cluster's data SURVIVES the transfer, so the
-#         upgrade is REVERTABLE.  --copy/--clone duplicate the files; --link only
-#         READS them (hard links).  For all three, --wal-upgrade keeps the old
-#         cluster intact (its removal is a separate, explicit --wal-upgrade-delete-old
-#         step), so --wal-upgrade-rollback can restore it.
+#   --copy, --clone : duplicate the old cluster's files into the new cluster, so
+#         the old cluster is genuinely untouched and the upgrade is REVERTABLE.
+#         --wal-upgrade keeps the old cluster intact (its removal is a separate,
+#         explicit --wal-upgrade-delete-old step), so --wal-upgrade-rollback
+#         restores it.
 #   --copy-file-range : same family as copy, but needs the copy_file_range syscall
 #         (Linux); skipped where unavailable.
-#   --swap  : MOVES the old cluster's data into the new cluster.  The upgrade still
-#         runs and still generates the WAL window (standbys reconstruct as usual),
-#         so --swap IS allowed with --wal-upgrade -- it is simply forward-only:
-#         old_dir is consumed, so --wal-upgrade-rollback refuses afterward.
+#   --link, --swap : disable the old cluster during the upgrade, exactly as in
+#         upstream.  --swap MOVES old_dir into the new cluster; --link hard-links
+#         old_dir's files into the new cluster (shared inodes), so once the new
+#         cluster starts and writes, the old cluster is mutated through those
+#         inodes and is no longer a safe rollback target.  Both still run and
+#         still generate the WAL window (standbys reconstruct as usual); they are
+#         simply forward-only: old_dir's pg_control is renamed away, so
+#         --wal-upgrade-rollback refuses afterward.
 #
 # This test asserts, per mode:
-#   copy/clone/link -> old cluster stays intact after the upgrade; --wal-upgrade-rollback
+#   copy/clone      -> old cluster stays intact after the upgrade; --wal-upgrade-rollback
 #                      restores it (data intact); the new cluster auto-serves the
 #                      upgraded data.
-#   swap            -> upgrade SUCCEEDS (WAL window generated), but
-#                      --wal-upgrade-rollback is REFUSED (old_dir consumed).
+#   link/swap       -> upgrade SUCCEEDS (WAL window generated), old cluster
+#                      disabled, and --wal-upgrade-rollback is REFUSED.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 BIN="${PGBIN:-$ROOT/pginst/bin}"
@@ -39,8 +43,8 @@ seed() {
   "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 }
 
-# ---- revertable modes: copy, clone, link ----
-for MODE in copy clone link; do
+# ---- revertable modes: copy, clone ----
+for MODE in copy clone; do
   log "MODE --$MODE : upgrade -> rollback restores old; then upgrade -> auto-serve"
   OLD=$W/${MODE}_old NEW=$W/${MODE}_new
   seed "$OLD" || { echo "FAIL: seed --$MODE"; FAIL=1; continue; }
@@ -102,34 +106,38 @@ else
 fi
 cd /
 
-# ---- swap: ALLOWED (upgrade succeeds + WAL generated), but rollback REFUSED ----
-log "MODE --swap : upgrade must SUCCEED (forward-only); --wal-upgrade-rollback must be REFUSED"
-OLD=$W/swap_old NEW=$W/swap_new
-seed "$OLD" || { echo "FAIL: seed --swap"; FAIL=1; }
-cd "$W"
-if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --swap >"$W/swap_up.log" 2>&1; then
-  log "  --swap + --wal-upgrade accepted (forward-only upgrade)"
-  # the WAL window must have been generated (upgrade segments present in new pg_wal/)
-  ls "$NEW/pg_wal"/[0-9A-F]* >/dev/null 2>&1 \
-    && log "  --swap: upgrade WAL window present in new pg_wal/" \
-    || { echo "FAIL: --swap generated no upgrade WAL window"; FAIL=1; }
-  # swap CONSUMES old_dir: its control file is renamed away (disable_old_cluster),
-  # so the old cluster is no longer a startable intact cluster.
-  [ -f "$OLD/global/pg_control" ] && { echo "FAIL: --swap left old pg_control in place (should be consumed)"; FAIL=1; }
-  # rollback must now REFUSE, because old_dir is not intact to return to.
-  if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-upgrade-rollback >"$W/swap_rb.log" 2>&1; then
-    echo "FAIL: --wal-upgrade-rollback SUCCEEDED after --swap (old_dir consumed; must refuse)"; FAIL=1
+# ---- forward-only modes: link, swap (upgrade succeeds + WAL generated, but
+#      old cluster disabled -> rollback REFUSED) ----
+for MODE in link swap; do
+  log "MODE --$MODE : upgrade must SUCCEED (forward-only); --wal-upgrade-rollback must be REFUSED"
+  OLD=$W/${MODE}_old NEW=$W/${MODE}_new
+  seed "$OLD" || { echo "FAIL: seed --$MODE"; FAIL=1; continue; }
+  cd "$W"
+  if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade --$MODE >"$W/${MODE}_up.log" 2>&1; then
+    log "  --$MODE + --wal-upgrade accepted (forward-only upgrade)"
+    # the WAL window must have been generated (upgrade segments present in new pg_wal/)
+    ls "$NEW/pg_wal"/[0-9A-F]* >/dev/null 2>&1 \
+      && log "  --$MODE: upgrade WAL window present in new pg_wal/" \
+      || { echo "FAIL: --$MODE generated no upgrade WAL window"; FAIL=1; }
+    # --link and --swap both DISABLE old_dir (disable_old_cluster renames its
+    # control file away), so the old cluster is no longer a startable intact
+    # cluster: link shares its inodes, swap consumes them.
+    [ -f "$OLD/global/pg_control" ] && { echo "FAIL: --$MODE left old pg_control in place (should be disabled)"; FAIL=1; }
+    # rollback must now REFUSE, because old_dir is not intact to return to.
+    if "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-upgrade-rollback >"$W/${MODE}_rb.log" 2>&1; then
+      echo "FAIL: --wal-upgrade-rollback SUCCEEDED after --$MODE (old_dir disabled; must refuse)"; FAIL=1
+    else
+      grep -qi "not intact" "$W/${MODE}_rb.log" \
+        && log "  --$MODE: rollback correctly refused (old cluster not intact)" \
+        || { echo "FAIL: --$MODE rollback refused for the wrong reason:"; tail -5 "$W/${MODE}_rb.log"; FAIL=1; }
+    fi
   else
-    grep -qi "not intact" "$W/swap_rb.log" \
-      && log "  --swap: rollback correctly refused (old cluster not intact)" \
-      || { echo "FAIL: --swap rollback refused for the wrong reason:"; tail -5 "$W/swap_rb.log"; FAIL=1; }
+    echo "FAIL: --$MODE + --wal-upgrade was REFUSED (must be accepted, forward-only)"; tail -5 "$W/${MODE}_up.log"; FAIL=1
   fi
-else
-  echo "FAIL: --swap + --wal-upgrade was REFUSED (must be accepted, forward-only)"; tail -5 "$W/swap_up.log"; FAIL=1
-fi
-cd /
+  cd /
+done
 
 echo "========================================================================"
-[ "$FAIL" = 0 ] && log "PASS: transfer modes -- copy/clone/link revertable (rollback restores old); swap forward-only (upgrade ok, rollback refused)" \
+[ "$FAIL" = 0 ] && log "PASS: transfer modes -- copy/clone revertable (rollback restores old); link/swap forward-only (upgrade ok, rollback refused)" \
                 || log "FAIL: see messages above"
 exit $FAIL

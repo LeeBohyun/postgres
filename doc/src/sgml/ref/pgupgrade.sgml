@@ -411,11 +411,13 @@ PostgreSQL documentation
        </para>
        <para>
         It may be combined with any transfer mode.  With
-        <option>--copy</option>, <option>--clone</option>, or
-        <option>--link</option> the old cluster stays intact and the upgrade is
-        revertable.  <option>--swap</option> also works, but it consumes the old
-        cluster, so that upgrade is forward-only:
-        <option>--wal-upgrade-rollback</option> then has nothing to revert to.
+        <option>--copy</option> or <option>--clone</option> the old cluster's
+        files are duplicated, so it stays intact and the upgrade is revertable.
+        <option>--link</option> and <option>--swap</option> also work, but they
+        disable the old cluster (as in an ordinary upgrade), so those upgrades
+        are forward-only: <option>--wal-upgrade-rollback</option> then has
+        nothing to revert to.  (<option>--link</option> shares the old cluster's
+        files, and <option>--swap</option> moves them into the new cluster.)
        </para>
       </listitem>
      </varlistentry>

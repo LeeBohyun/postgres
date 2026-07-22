@@ -256,22 +256,25 @@ main(int argc, char **argv)
 	 *
 	 * LEE: for --wal-upgrade we KEEP the old cluster intact where the transfer
 	 * mode allows it, so it can be rolled back to -- and let the explicit
-	 * "pg_upgrade --wal-upgrade-delete-old" step remove it later.  This applies to
-	 * --copy/--clone/--link (which only read the old files).  --swap is different:
-	 * it MOVES the old cluster's files into the new one, so disabling/consuming
-	 * old_dir is intrinsic to how swap transfers -- we cannot skip it.  A --swap
-	 * upgrade is therefore forward-only: it still runs and still generates the WAL
-	 * window (standbys reconstruct as usual), but --wal-upgrade-rollback will
-	 * refuse at run time because old_dir is no longer intact.
-	 * (--link: new_dir hard-links old_dir's files, so the usual upstream caveat --
-	 * do not run BOTH clusters -- still applies; rollback discards new_dir without
-	 * ever having started it.)
+	 * "pg_upgrade --wal-upgrade-delete-old" step remove it later.  This applies
+	 * only to --copy/--clone, which produce independent files: the old cluster is
+	 * genuinely untouched and rollback (discard new_dir) returns to it safely.
+	 *
+	 * --link and --swap disable the old cluster, exactly as in upstream:
+	 *   - --swap MOVES the old cluster's files into the new one, so old_dir is
+	 *     consumed outright.
+	 *   - --link hard-links the old cluster's files into the new one, so the two
+	 *     share inodes; once the new cluster starts and writes, the old cluster's
+	 *     data is mutated through those shared inodes and is no longer a safe
+	 *     rollback target.  Disabling old_dir up front (renaming its pg_control,
+	 *     like upstream) both preserves the upstream "do not run both clusters"
+	 *     safety and makes --wal-upgrade-rollback refuse for --link.
+	 * Either way the upgrade still runs and still generates the WAL window
+	 * (standbys reconstruct as usual); only local rollback is given up, and
+	 * --wal-upgrade-rollback refuses at run time because old_dir is not intact.
 	 */
-	if ((!user_opts.wal_upgrade &&
-		 (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
-		  user_opts.transfer_mode == TRANSFER_MODE_SWAP)) ||
-		(user_opts.wal_upgrade &&
-		 user_opts.transfer_mode == TRANSFER_MODE_SWAP))
+	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
+		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
 		disable_old_cluster(user_opts.transfer_mode);
 
 	transfer_all_new_tablespaces(&old_cluster.dbarr, &new_cluster.dbarr,
