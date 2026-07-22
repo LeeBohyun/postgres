@@ -4427,7 +4427,7 @@ WriteControlFile(void)
  * write it directly, rather than going through the global ControlFile pointer.
  */
 void
-SynthesizeUpgradeStreamControlFile(void)
+SynthesizeUpgradeStreamControlFile(bool allow_overwrite)
 {
 	ControlFileData *cf;
 	char		buffer[PG_CONTROL_FILE_SIZE];	/* need not be aligned */
@@ -4533,9 +4533,15 @@ SynthesizeUpgradeStreamControlFile(void)
 		}
 	}
 
-	/* Write global/pg_control (O_EXCL: never clobber an existing one). */
+	/*
+	 * Write global/pg_control.  Streaming standby (allow_overwrite=false) uses
+	 * O_EXCL to never clobber an existing control file (a bare skeleton has
+	 * none).  Archive-PITR cross-version recovery (allow_overwrite=true) MUST
+	 * overwrite the OLD-version control file that Phase 1 left, so use O_TRUNC.
+	 */
 	fd = BasicOpenFile(ctlpath,
-					   O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
+					   O_RDWR | O_CREAT | PG_BINARY |
+					   (allow_overwrite ? O_TRUNC : O_EXCL));
 	if (fd < 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),

@@ -30,6 +30,7 @@
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
+#include "access/pgupgrade_wal.h"	/* LEE: UpgradeWindowPresentInWal (PITR recover) */
 #include "catalog/pg_authid.h"
 #include "common/file_perm.h"
 #include "libpq/libpq.h"
@@ -390,14 +391,44 @@ checkDataDir(void)
 	 */
 	{
 		char		sigpath[MAXPGPATH];
+		char		recsig[MAXPGPATH];
 		char		verpath[MAXPGPATH];
 		struct stat st;
 
 		snprintf(sigpath, sizeof(sigpath), "%s/pg_upgrade_stream.signal", DataDir);
+		snprintf(recsig, sizeof(recsig), "%s/pg_upgrade_recover.signal", DataDir);
 		snprintf(verpath, sizeof(verpath), "%s/PG_VERSION", DataDir);
+
 		if (stat(verpath, &st) != 0 && stat(sigpath, &st) == 0 &&
 			PrimaryConnInfo != NULL && PrimaryConnInfo[0] != '\0')
-			SynthesizeUpgradeStreamControlFile();
+		{
+			/* Streaming standby: bare skeleton, window arrives from the primary. */
+			SynthesizeUpgradeStreamControlFile(false);
+		}
+		else if (stat(recsig, &st) == 0)
+		{
+			/*
+			 * LEE: ARCHIVE-PITR cross-version recovery (Phase 2).  The data
+			 * directory here is a pre-upgrade base backup that Phase 1 (the OLD
+			 * binary) replayed up to the upgrade boundary and shut down, so it
+			 * still carries the OLD major's pg_control/PG_VERSION -- which this
+			 * NEW binary would reject at the version gate below.  The operator
+			 * dropped pg_upgrade_recover.signal to sanction the handoff, and the
+			 * upgrade window (CN..COMPLETE) has been staged into pg_wal/.  Only
+			 * proceed if that window is actually present; otherwise this is a
+			 * misplaced signal and we must NOT clobber a real control file.
+			 * Synthesize a NEW-version pg_control from this binary's constants so
+			 * the gate passes; PerformWalUpgradeIfNeeded() then re-anchors at CN,
+			 * adopts the window's sysid, and replays the window + archived tail.
+			 */
+			if (UpgradeWindowPresentInWal())
+				SynthesizeUpgradeStreamControlFile(true);
+			else
+				ereport(FATAL,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("pg_upgrade_recover.signal is present but no pg_upgrade window was found in pg_wal/"),
+						 errhint("Stage the upgrade window segments (CN..COMPLETE) into pg_wal/, or remove pg_upgrade_recover.signal.")));
+		}
 	}
 
 	/* Check for PG_VERSION */

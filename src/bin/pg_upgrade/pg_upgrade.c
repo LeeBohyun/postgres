@@ -73,12 +73,22 @@ static void make_outputdirs(char *pgdata);
 static void setup(char *argv0);
 static void resolve_new_bindir(const char *argv0);
 static void create_new_cluster_via_initdb(const char *argv0);
+static char *detect_old_cluster_archive_command(void);
+static void write_wal_upgrade_archive_conf(const char *archive_command);
 static void create_logical_replication_slots(void);
 static void create_conflict_detection_slot(void);
 
 ClusterInfo old_cluster,
 			new_cluster;
 OSInfo		os_info;
+
+/*
+ * LEE: with --wal-upgrade, the old cluster's archive_command carried forward to
+ * the new cluster (NULL if the old cluster was not archiving).  Detected while
+ * the old server is up during new-cluster creation; consumed to enable
+ * archiving of the upgrade window so PITR spans the upgrade.
+ */
+static char *old_cluster_archive_command = NULL;
 
 char	   *output_files[] = {
 	SERVER_LOG_FILE,
@@ -290,6 +300,9 @@ main(int argc, char **argv)
 	{
 		PGconn	   *conn;
 
+		/* Window's last segment (holds COMPLETE), for the archive barrier. */
+		char		upgrade_window_last_seg[MAXPGPATH] = {0};
+
 		/*
 		 * Restart with a fresh buffer pool for the WAL capture phase.  The
 		 * server now reads the just-transplanted counters from pg_control, so
@@ -395,7 +408,75 @@ main(int argc, char **argv)
 									 "SELECT pg_upgrade_wal_complete(%u, %u)",
 									 old_cluster.major_version,
 									 new_cluster.major_version));
+		/*
+		 * LEE: capture the segment that holds PG_UPGRADE_COMPLETE *before* the
+		 * switch, so the wait-for-archive barrier below targets the last segment
+		 * of the upgrade window (CN..COMPLETE) rather than a later, post-window
+		 * segment.  pg_switch_wal() then seals that segment so it is archivable.
+		 * pg_waldump confirms COMPLETE lands in the segment current at this point.
+		 */
+		if (old_cluster_archive_command != NULL)
+		{
+			PGresult   *res;
+
+			res = executeQueryOrDie(conn,
+									"SELECT pg_walfile_name(pg_current_wal_lsn())");
+			strlcpy(upgrade_window_last_seg, PQgetvalue(res, 0, 0),
+					sizeof(upgrade_window_last_seg));
+			PQclear(res);
+		}
+
 		PQclear(executeQueryOrDie(conn, "SELECT pg_switch_wal()"));
+
+		/*
+		 * LEE: when the window is being archived (--archive-command), wait until
+		 * the archiver has drained the window's LAST segment (the one holding
+		 * PG_UPGRADE_COMPLETE, captured above) before shutting the burst server
+		 * down.  Only CN..COMPLETE must reach the archive; recovery anchors at CN
+		 * and the pre-CN pg_restore WAL is irrelevant (and is legitimately
+		 * recycled), so we do NOT wait for those.  The retention slot pins the
+		 * window in pg_wal/ meanwhile, and smart shutdown drains the archiver, so
+		 * in practice the window is already archived by the time we get here; this
+		 * barrier just makes that guarantee explicit.  Mirrors do_pg_backup_stop()'s
+		 * waitforarchive spin on pg_stat_archiver.last_archived_wal.
+		 */
+		if (old_cluster_archive_command != NULL)
+		{
+			PGresult   *res;
+
+			prep_status("Waiting for the upgrade window to be archived");
+			for (;;)
+			{
+				char		last_archived[MAXPGPATH];
+				char		last_failed[MAXPGPATH];
+
+				res = executeQueryOrDie(conn,
+										"SELECT coalesce(last_archived_wal, ''), "
+										"coalesce(last_failed_wal, '') "
+										"FROM pg_stat_archiver");
+				strlcpy(last_archived, PQgetvalue(res, 0, 0), sizeof(last_archived));
+				strlcpy(last_failed, PQgetvalue(res, 0, 1), sizeof(last_failed));
+				PQclear(res);
+
+				/*
+				 * last_archived_wal advances in segment-name order, so once it has
+				 * reached (>=) the window's last segment, CN..COMPLETE is archived.
+				 */
+				if (last_archived[0] != '\0' &&
+					strcmp(last_archived, upgrade_window_last_seg) >= 0)
+					break;
+
+				/* A persistent archive_command failure would loop forever. */
+				if (last_failed[0] != '\0' &&
+					strcmp(last_failed, upgrade_window_last_seg) >= 0)
+					pg_fatal("archive_command failed while archiving the upgrade "
+							 "window (last failed WAL file: %s); the upgrade cannot "
+							 "be made recoverable by PITR", last_failed);
+
+				pg_usleep(100000);	/* 100ms */
+			}
+			check_ok();
+		}
 
 		/*
 		 * LEE (2026-07-20, auto-serve): the quarantine hold is REMOVED.  We used
@@ -709,11 +790,12 @@ create_new_cluster_via_initdb(const char *argv0)
 		old_cluster.bin_version = old_cluster.major_version;
 
 	/*
-	 * LEE: a leftover new cluster from a previous --wal-upgrade attempt is just
-	 * discarded and rebuilt.  There is no revert/adopt interface anymore
-	 * (--wal-upgrade-rollback / --wal-upgrade-delete-old were removed), so a
-	 * stale new_dir carries no state worth preserving -- the old cluster is the
-	 * only source of truth.  rm -rf it and re-initdb, rather than refusing.
+	 * LEE: refuse to clobber an already-populated new data directory.  --initdb
+	 * is meant to create the new cluster from scratch, so an existing PG_VERSION
+	 * there means the operator pointed us at the wrong directory or a leftover
+	 * from a previous attempt; either way, silently removing a database system is
+	 * too dangerous.  Fail with pg_upgrade's own clear message (not initdb's
+	 * "directory not empty") so the operator can remove it deliberately.
 	 */
 	{
 		char		verfile[MAXPGPATH];
@@ -722,15 +804,9 @@ create_new_cluster_via_initdb(const char *argv0)
 		snprintf(verfile, sizeof(verfile), "%s/PG_VERSION",
 				 new_cluster.pgdata);
 		if (stat(verfile, &st) == 0)
-		{
-			pg_log(PG_REPORT,
-				   "new cluster data directory \"%s\" already contains a database "
-				   "system from a previous attempt; removing it",
-				   new_cluster.pgdata);
-			if (!rmtree(new_cluster.pgdata, true))
-				pg_fatal("could not remove stale new cluster data directory \"%s\"",
-						 new_cluster.pgdata);
-		}
+			pg_fatal("new cluster data directory \"%s\" already contains a database system; "
+					 "--initdb requires an empty or nonexistent directory",
+					 new_cluster.pgdata);
 	}
 
 	get_control_data(&old_cluster);
@@ -749,6 +825,16 @@ create_new_cluster_via_initdb(const char *argv0)
 	prep_status("Inspecting old cluster locale for new cluster creation");
 	start_postmaster(&old_cluster, true);
 	get_template0_info(&old_cluster);
+	/*
+	 * LEE: while the old server is up, capture its archive_command.  If the
+	 * cluster was archiving WAL (i.e. a PITR-style backup regime is configured),
+	 * we carry that command forward to the new cluster so the upgrade window and
+	 * the post-upgrade WAL flow to the SAME archive automatically -- making the
+	 * upgrade recoverable by ordinary archive-based PITR with no extra operator
+	 * action.  Returns NULL when the old cluster was not archiving.
+	 */
+	if (user_opts.wal_upgrade)
+		old_cluster_archive_command = detect_old_cluster_archive_command();
 	stop_postmaster(false);
 	check_ok();
 
@@ -801,6 +887,90 @@ create_new_cluster_via_initdb(const char *argv0)
 	log_opts.logdir = saved_logdir;
 
 	check_ok();
+
+	/*
+	 * LEE: if the old cluster was archiving WAL, turn on the same archiving in
+	 * the freshly-created new cluster's postgresql.conf.  Both the burst server
+	 * (which emits the window) and the auto-served upgraded cluster (which
+	 * generates the post-upgrade tail) then archive to the same place, so the
+	 * whole history is recoverable by archive-based PITR with no operator action.
+	 * Writing it into postgresql.conf (rather than passing -o flags) lets an
+	 * archive_command with spaces and shell metacharacters be quoted correctly.
+	 */
+	if (old_cluster_archive_command != NULL)
+		write_wal_upgrade_archive_conf(old_cluster_archive_command);
+}
+
+/*
+ * LEE: read the old cluster's archive_command over a connection to the running
+ * old server.  Returns a pg_strdup'd copy if archiving was configured
+ * (archive_mode <> off AND archive_command non-empty), else NULL.  Used to
+ * carry the old cluster's archiving forward to the new cluster (see
+ * PITR_UPGRADE_DESIGN.md).
+ */
+static char *
+detect_old_cluster_archive_command(void)
+{
+	PGconn	   *conn = connectToServer(&old_cluster, "template1");
+	PGresult   *res;
+	char	   *mode;
+	char	   *cmd;
+	char	   *result = NULL;
+
+	res = executeQueryOrDie(conn,
+							"SELECT current_setting('archive_mode'), "
+							"current_setting('archive_command')");
+	mode = PQgetvalue(res, 0, 0);
+	cmd = PQgetvalue(res, 0, 1);
+
+	/*
+	 * archive_mode is off/on/always; archive_command defaults to '' (or the
+	 * placeholder "(disabled)" on some builds).  Only carry a real command.
+	 */
+	if (strcmp(mode, "off") != 0 &&
+		cmd[0] != '\0' &&
+		strcmp(cmd, "(disabled)") != 0)
+		result = pg_strdup(cmd);
+
+	PQclear(res);
+	PQfinish(conn);
+	return result;
+}
+
+/*
+ * LEE: append archive settings to the new cluster's postgresql.conf so the
+ * upgrade window and the post-upgrade WAL reach the archive (see
+ * PITR_UPGRADE_DESIGN.md).  archive_command is the old cluster's command,
+ * carried forward.  Only called when the old cluster was archiving.
+ */
+static void
+write_wal_upgrade_archive_conf(const char *archive_command)
+{
+	char		conf_path[MAXPGPATH];
+	FILE	   *fp;
+	const char *p;
+
+	snprintf(conf_path, sizeof(conf_path), "%s/postgresql.conf",
+			 new_cluster.pgdata);
+
+	fp = fopen(conf_path, "a");
+	if (fp == NULL)
+		pg_fatal("could not open \"%s\" to enable WAL archiving: %m", conf_path);
+
+	/* archive_command is emitted as a single-quoted GUC value; double any '. */
+	fputs("\n# added by pg_upgrade --wal-upgrade (carried from the old cluster)\n"
+		  "archive_mode = on\n"
+		  "archive_command = '", fp);
+	for (p = archive_command; *p; p++)
+	{
+		if (*p == '\'')
+			fputc('\'', fp);
+		fputc(*p, fp);
+	}
+	fputs("'\n", fp);
+
+	if (fclose(fp) != 0)
+		pg_fatal("could not write \"%s\": %m", conf_path);
 }
 
 

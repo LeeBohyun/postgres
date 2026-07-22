@@ -231,6 +231,15 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 								 " -c wal_keep_size=1TB"
 								 " -c max_wal_size=1TB"
 								 " -c checkpoint_timeout=1h");
+
+			/*
+			 * LEE: archiving of the upgrade window (--archive-command) is
+			 * configured in the new cluster's postgresql.conf, not here: an
+			 * archive_command contains spaces and shell metacharacters that do
+			 * not survive pg_ctl's "-o" option string, and postgresql.conf also
+			 * makes the auto-served cluster archive its post-upgrade tail.  See
+			 * write_wal_upgrade_archive_conf() and PITR_UPGRADE_DESIGN.md.
+			 */
 		}
 		else
 			appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");

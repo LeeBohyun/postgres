@@ -187,8 +187,10 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 	int			segsize = 0;
 	XLogSegNo	lowseg = 0;
 	XLogSegNo	highseg = 0;
+	XLogSegNo	runstart = 0;
 	bool		any = false;
 	char		lowseg_path[MAXPGPATH] = {0};
+	char		runstart_path[MAXPGPATH] = {0};
 	UpgradeWalReadPrivate priv;
 	XLogReaderState *reader;
 	XLogRecPtr	startptr;
@@ -256,6 +258,38 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 		return false;
 
 	/*
+	 * LEE: bound the scan to the CONTIGUOUS run of TLI-1 segments ending at
+	 * highseg, not from lowseg.  The upgrade window (CN..COMPLETE) is always the
+	 * topmost contiguous run of segments; when it is delivered by archive PITR
+	 * staging, pg_wal/ can ALSO contain unrelated pre-window segments from the
+	 * restored base backup, with a gap (the upgrade repositions the new cluster's
+	 * WAL past the old cluster's end, so intermediate segment numbers never
+	 * exist).  Starting the reader at lowseg would make XLogFindNextRecord walk
+	 * forward into that hole and FATAL on a missing segment.  Walk down from
+	 * highseg while each preceding segment is present to find the run start; the
+	 * window's CN checkpoint lives at or after it.  (On the primary's own first
+	 * start the window is the only content, so runstart == lowseg and behavior is
+	 * unchanged.)
+	 */
+	runstart = highseg;
+	{
+		char		segname[MAXFNAMELEN];
+		char		segpath[MAXPGPATH];
+		struct stat st;
+
+		while (runstart > lowseg)
+		{
+			XLogFileName(segname, 1, runstart - 1, segsize);
+			snprintf(segpath, sizeof(segpath), "%s/%s", waldir, segname);
+			if (stat(segpath, &st) != 0)
+				break;			/* gap: runstart-1 is missing */
+			runstart--;
+		}
+		XLogFileName(segname, 1, runstart, segsize);
+		snprintf(runstart_path, sizeof(runstart_path), "%s/%s", waldir, segname);
+	}
+
+	/*
 	 * LEE: capture the system identifier the upgrade WAL was emitted under, by
 	 * reading xlp_sysid from the long page header at the start of the lowest
 	 * segment.  Recovery validates every WAL page's xlp_sysid against
@@ -267,7 +301,7 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 	 * consistency between pg_control and the WAL is all recovery requires.)
 	 */
 	{
-		int			fd = OpenTransientFile(lowseg_path, O_RDONLY | PG_BINARY);
+		int			fd = OpenTransientFile(runstart_path, O_RDONLY | PG_BINARY);
 		XLogLongPageHeaderData longhdr;
 
 		if (fd >= 0)
@@ -282,7 +316,7 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 
 	priv.tli = 1;
 	strlcpy(priv.dir, waldir, sizeof(priv.dir));
-	XLogSegNoOffsetToRecPtr(lowseg, 0, segsize, startptr);
+	XLogSegNoOffsetToRecPtr(runstart, 0, segsize, startptr);
 	XLogSegNoOffsetToRecPtr(highseg + 1, 0, segsize, priv.endptr);
 
 	reader = XLogReaderAllocate(segsize, NULL,
@@ -544,6 +578,31 @@ ArmFromPrimaryAnchorIfConfigured(void)
 	return true;
 }
 
+/*
+ * LEE: is a complete pg_upgrade window (START..COMPLETE) present in this
+ * cluster's pg_wal/?  Used by checkDataDir() during ARCHIVE-PITR cross-version
+ * recovery to decide whether it is safe to synthesize a new-version pg_control
+ * over the old one (see miscinit.c).  Runs BEFORE ChangeToDataDir(), so build
+ * the pg_wal path from DataDir rather than using the relative XLOGDIR.
+ */
+bool
+UpgradeWindowPresentInWal(void)
+{
+	char		waldir[MAXPGPATH];
+	bool		found_start = false;
+	bool		found_complete = false;
+	CheckPoint	cn;
+	XLogRecPtr	cn_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	complete_lsn = InvalidXLogRecPtr;
+	uint64		wal_sysid = 0;
+
+	snprintf(waldir, sizeof(waldir), "%s/%s", DataDir, XLOGDIR);
+	if (!upgrade_wal_scan_markers(waldir, &found_start, &found_complete,
+								  &cn, &cn_lsn, &complete_lsn, &wal_sysid))
+		return false;
+	return found_start && found_complete;
+}
+
 bool
 PerformWalUpgradeIfNeeded(void)
 {
@@ -629,7 +688,33 @@ PerformWalUpgradeIfNeeded(void)
 	 */
 	if (!upgrade_wal_scan_markers(wal_dir, &found_start, &found_complete,
 								  &cn, &cn_lsn, &complete_lsn, &wal_sysid))
-		return false;			/* no readable upgrade WAL — normal startup */
+	{
+		/*
+		 * LEE: ARCHIVE-PITR PATH.  No upgrade window is present in local pg_wal/,
+		 * but if this is an archive-recovery restore (recovery.signal present),
+		 * the window may arrive later via restore_command as recovery replays
+		 * forward from a pre-upgrade base backup, across the upgrade boundary,
+		 * into the post-upgrade tail.  Recovery starts at the base backup's
+		 * checkpoint (from backup_label) and flows through CN organically, so we
+		 * need not re-anchor the control file here (unlike the primary-first-start
+		 * and streaming-standby paths); we only need to permit the upgrade redo
+		 * handlers to apply when the window is reached.  Arm in_upgrade_bootstrap
+		 * so the XLOG_UPGRADE_START redo does not FATAL as "encountered during
+		 * replay".  When no window is ever reached (an ordinary PITR restore),
+		 * the flag is simply never consulted.  See PITR_UPGRADE_DESIGN.md.
+		 */
+		struct stat st;
+
+		if (stat(RECOVERY_SIGNAL_FILE, &st) == 0 ||
+			stat(STANDBY_SIGNAL_FILE, &st) == 0)
+		{
+			ereport(LOG,
+					(errmsg("archive recovery active with no local pg_upgrade window; "
+							"arming upgrade replay in case the window arrives from the archive")));
+			in_upgrade_bootstrap = true;
+		}
+		return false;			/* let StartupXLOG drive recovery from backup_label */
+	}
 
 	/*
 	 * complete_lsn is populated by the scan but not needed on this path (the

@@ -14,6 +14,7 @@
 
 /* WAL upgrade check — called from StartupProcessMain() before StartupXLOG() */
 extern bool PerformWalUpgradeIfNeeded(void);
+extern bool UpgradeWindowPresentInWal(void);
 
 /*
  * LEE: scan a pg_wal directory for the --wal-upgrade markers (START/COMPLETE)

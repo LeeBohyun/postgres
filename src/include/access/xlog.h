@@ -291,7 +291,7 @@ extern XLogRecPtr GetControlFileCheckPointLSN(void);
  * cleared back to DB_IN_PRODUCTION at COMPLETE) -- diagnostics only */
 extern void SetControlFileInUpgrade(void);
 extern void ClearControlFileInUpgrade(void);
-extern void SynthesizeUpgradeStreamControlFile(void);
+extern void SynthesizeUpgradeStreamControlFile(bool allow_overwrite);
 /* LEE: batched relation-file images live in access/pgupgrade_wal.h */
 extern void UpdateFullPageWrites(void);
 extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p);
