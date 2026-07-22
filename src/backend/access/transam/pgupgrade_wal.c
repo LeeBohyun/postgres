@@ -572,6 +572,21 @@ PerformWalUpgradeIfNeeded(void)
 	if (ArmFromPrimaryAnchorIfConfigured())
 	{
 		in_upgrade_bootstrap = true;
+
+		/*
+		 * Suppress hot standby from the very start of recovery, BEFORE any record
+		 * is replayed -- not just from the XLOG_UPGRADE_START redo.  A streaming
+		 * standby staged without initdb has no shared catalogs (global/*) on disk;
+		 * they only arrive when the upgrade window streams in.  Recovery would
+		 * otherwise reach a consistent point and admit read-only connections in the
+		 * gap before XLOG_UPGRADE_START replays, and such a connection would FATAL
+		 * trying to open a not-yet-materialized catalog (e.g. global/1260,
+		 * pg_authid).  Setting the guard here holds hot standby off until
+		 * XLOG_UPGRADE_COMPLETE clears it, by which point the whole cluster --
+		 * including the shared catalogs -- has been reconstructed.
+		 */
+		pgUpgradeReplayInProgress = true;
+
 		return true;
 	}
 

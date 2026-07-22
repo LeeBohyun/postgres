@@ -303,11 +303,15 @@ static bool backupEndRequired = false;
 bool		reachedConsistency = false;
 
 /*
- * LEE: true while replaying a pg_upgrade --wal-upgrade window, i.e. after
- * an XLOG_UPGRADE_START record and before its matching
- * XLOG_UPGRADE_COMPLETE.  While set, hot standby must NOT go active: the
- * cluster is only half-upgraded (new catalogs partially applied), so no
- * read-only connection may observe it.  Set/cleared by pg_upgrade_redo().
+ * LEE: true while replaying a pg_upgrade --wal-upgrade window.  While set, hot
+ * standby must NOT go active: the cluster is only half-upgraded (new catalogs
+ * partially applied), so no read-only connection may observe it.  Normally set
+ * by the XLOG_UPGRADE_START redo and cleared by XLOG_UPGRADE_COMPLETE
+ * (pg_upgrade_redo()).  For a streaming standby staged without initdb it is set
+ * even earlier -- at arm time in PerformWalUpgradeIfNeeded(), before any record
+ * replays -- because such a skeleton has no shared catalogs on disk until the
+ * window streams in, so it must not admit connections in the gap before
+ * XLOG_UPGRADE_START.
  */
 bool		pgUpgradeReplayInProgress = false;
 
