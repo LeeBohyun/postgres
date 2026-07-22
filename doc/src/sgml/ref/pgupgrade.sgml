@@ -406,8 +406,19 @@ PostgreSQL documentation
         old cluster intact so the upgrade can be reverted (see
         <option>--wal-upgrade-rollback</option>) until it is explicitly retired
         (see <option>--wal-upgrade-delete-old</option>), and it makes the
-        upgraded state streamable so a standby can be re-provisioned by ordinary
-        replication from the upgraded primary rather than a fresh base backup.
+        upgraded state streamable so a standby can be re-provisioned from the
+        upgraded primary by ordinary replication rather than a fresh base backup.
+       </para>
+       <para>
+        A replacement standby need not even be initialized with
+        <command>initdb</command>: an empty data directory containing only its
+        configuration, a <filename>standby.signal</filename>, a
+        <filename>pg_upgrade_stream.signal</filename> sentinel, and
+        <varname>primary_conninfo</varname> pointing at the upgraded primary is
+        sufficient.  On its first start the server synthesizes the control file
+        and <filename>PG_VERSION</filename>, fetches the upgrade anchor from the
+        primary over the replication connection, and streams the upgrade in,
+        coming up as a hot standby of the new-version primary.
        </para>
        <para>
         It may be combined with any transfer mode.  With
