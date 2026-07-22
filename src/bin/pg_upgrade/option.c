@@ -66,11 +66,9 @@ parseCommandLine(int argc, char *argv[])
 		{"initdb", no_argument, NULL, 8},
 		/* LEE: capture the upgrade as WAL and reconstruct it on first startup */
 		{"wal-upgrade", no_argument, NULL, 9},
-		/* LEE: --wal-upgrade lifecycle subcommands (act on -D new / -d old).
-		 * Namespaced with the "wal-upgrade-" prefix so they are clearly part of
-		 * THIS feature and never mistaken for stock pg_upgrade behavior. */
-		{"wal-upgrade-rollback", no_argument, NULL, 11},
-		{"wal-upgrade-delete-old", no_argument, NULL, 12},
+		/* LEE: --wal-upgrade lifecycle subcommand (acts on -d old).  Namespaced
+		 * with the "wal-upgrade-" prefix so it is clearly part of THIS feature
+		 * and never mistaken for stock pg_upgrade behavior. */
 		{"wal-upgrade-signal-handoff", no_argument, NULL, 14},
 
 		{NULL, 0, NULL, 0}
@@ -252,13 +250,7 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.wal_upgrade = true;
 				break;
 
-			/* LEE: revertable-upgrade lifecycle subcommands */
-			case 11:
-				user_opts.revertable_op = REVERTABLE_OP_ROLLBACK;
-				break;
-			case 12:
-				user_opts.revertable_op = REVERTABLE_OP_DELETE_OLD;
-				break;
+			/* LEE: --wal-upgrade lifecycle subcommand */
 			case 14:
 				user_opts.revertable_op = REVERTABLE_OP_SIGNAL_HANDOFF;
 				break;
@@ -277,12 +269,9 @@ parseCommandLine(int argc, char *argv[])
 	 * LEE: --swap IS allowed with --wal-upgrade.  The upgrade still runs and the
 	 * WAL window is still generated, so standbys can be reconstructed from it as
 	 * usual -- that value does not depend on the transfer mode.  What --swap gives
-	 * up is *local rollback*: it MOVES the old cluster's data directories into the
-	 * new cluster (do_swap), so old_dir is consumed and there is nothing intact to
-	 * return to.  We therefore do NOT reject --swap here; instead rollback refuses
-	 * at run time when old_dir is not an intact, cleanly-shut-down cluster (see
-	 * old_cluster_intact() in revertable.c).  So a --swap upgrade is a fully valid,
-	 * forward-only upgrade whose only lost capability is --wal-upgrade-rollback.
+	 * up is nothing that --wal-upgrade relies on: it MOVES the old cluster's data
+	 * directories into the new cluster (do_swap), which is fine because there is
+	 * no revert-to-old interface anymore.  So we do NOT reject --swap here.
 	 */
 
 	if (!user_opts.sync_method)
@@ -306,38 +295,20 @@ parseCommandLine(int argc, char *argv[])
 		setenv("PGOPTIONS", FIX_DEFAULT_READ_ONLY, 1);
 
 	/*
-	 * LEE: revertable-upgrade lifecycle subcommands act on a single existing
-	 * cluster and do not run an upgrade, so they need only their own directory
-	 * (-D for commit/rollback, -d for delete-old), not the full old/new
-	 * bindir+datadir set the normal flow requires.
+	 * LEE: --wal-upgrade-signal-handoff acts on a single existing (running) old
+	 * cluster and does not run an upgrade, so it needs only the old cluster's
+	 * data + bin directories, not the full old/new set the normal flow requires.
+	 * It connects to the LIVE old primary, writes the handoff trigger into its
+	 * WAL, and shuts the primary down at that point so no transaction can append
+	 * WAL after the handoff.  The old bin dir is needed to run that cluster's
+	 * pg_ctl for the shutdown.
 	 */
-	if (user_opts.revertable_op == REVERTABLE_OP_DELETE_OLD)
+	if (user_opts.revertable_op == REVERTABLE_OP_SIGNAL_HANDOFF)
 	{
-		if (old_cluster.pgdata == NULL)
-			pg_fatal("--wal-upgrade-delete-old requires the old cluster data directory (-d/--old-datadir)");
-		return;
-	}
-	else if (user_opts.revertable_op == REVERTABLE_OP_SIGNAL_HANDOFF)
-	{
-		/*
-		 * --signal-handoff connects to the LIVE old primary, writes the handoff
-		 * trigger into its WAL, and then shuts the primary down at that point so
-		 * no transaction can append WAL after the handoff.  It needs the old data
-		 * dir (to locate the running cluster's socket) and the old bin dir (to run
-		 * that cluster's pg_ctl for the shutdown).  Unlike most ops the old
-		 * cluster is RUNNING here.
-		 */
 		if (old_cluster.pgdata == NULL)
 			pg_fatal("--wal-upgrade-signal-handoff requires the old cluster data directory (-d/--old-datadir)");
 		if (old_cluster.bindir == NULL)
 			pg_fatal("--wal-upgrade-signal-handoff requires the old cluster bin directory (-b/--old-bindir)");
-		return;
-	}
-	else if (user_opts.revertable_op != REVERTABLE_OP_NONE)
-	{
-		/* --commit / --rollback: need -D (new); -d optional */
-		if (new_cluster.pgdata == NULL)
-			pg_fatal("this operation requires the new cluster data directory (-D/--new-datadir)");
 		return;
 	}
 

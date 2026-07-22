@@ -112,10 +112,9 @@ main(int argc, char **argv)
 	parseCommandLine(argc, argv);
 
 	/*
-	 * LEE: revertable-upgrade lifecycle subcommands (--wal-upgrade-rollback /
-	 * --wal-upgrade-delete-old / --wal-upgrade-signal-handoff) act on an existing
-	 * cluster and exit; they do not run an upgrade.  new_cluster.bindir locates
-	 * pg_ctl.
+	 * LEE: the --wal-upgrade-signal-handoff lifecycle subcommand acts on an
+	 * existing (running) old cluster and exits; it does not run an upgrade.
+	 * new_cluster.bindir locates pg_ctl.
 	 */
 	if (user_opts.revertable_op != REVERTABLE_OP_NONE)
 	{
@@ -254,24 +253,14 @@ main(int argc, char **argv)
 	 * new cluster is started, and for --swap will make it unsafe to start the
 	 * old cluster at all.
 	 *
-	 * LEE: for --wal-upgrade we KEEP the old cluster intact where the transfer
-	 * mode allows it, so it can be rolled back to -- and let the explicit
-	 * "pg_upgrade --wal-upgrade-delete-old" step remove it later.  This applies
-	 * only to --copy/--clone, which produce independent files: the old cluster is
-	 * genuinely untouched and rollback (discard new_dir) returns to it safely.
-	 *
-	 * --link and --swap disable the old cluster, exactly as in upstream:
-	 *   - --swap MOVES the old cluster's files into the new one, so old_dir is
-	 *     consumed outright.
-	 *   - --link hard-links the old cluster's files into the new one, so the two
-	 *     share inodes; once the new cluster starts and writes, the old cluster's
-	 *     data is mutated through those shared inodes and is no longer a safe
-	 *     rollback target.  Disabling old_dir up front (renaming its pg_control,
-	 *     like upstream) both preserves the upstream "do not run both clusters"
-	 *     safety and makes --wal-upgrade-rollback refuse for --link.
-	 * Either way the upgrade still runs and still generates the WAL window
-	 * (standbys reconstruct as usual); only local rollback is given up, and
-	 * --wal-upgrade-rollback refuses at run time because old_dir is not intact.
+	 * LEE: for --wal-upgrade with --copy/--clone we KEEP the old cluster intact
+	 * (its files are independent), matching upstream: the old cluster stays
+	 * startable and is removed by the stock delete_old_cluster script when the
+	 * operator is ready.  --link and --swap disable the old cluster, exactly as
+	 * in upstream (--swap moves its files into the new cluster; --link shares
+	 * inodes, so running the old cluster after the new one starts is unsafe).
+	 * Either way the upgrade still generates the WAL window, so standbys are
+	 * re-provisioned by streaming it from the upgraded primary.
 	 */
 	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
 		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
@@ -415,8 +404,7 @@ main(int argc, char **argv)
 		 * read-write on first start, like upstream pg_upgrade: its control
 		 * checkpoint lands past
 		 * COMPLETE, so PerformWalUpgradeIfNeeded()'s "already applied" guard makes
-		 * it skip the window and serve.  Rollback is a frontend operation gated on
-		 * old_dir integrity ("pg_upgrade --wal-upgrade-rollback"), not a startup hold.
+		 * it skip the window and serve.
 		 */
 		PQfinish(conn);
 
@@ -438,8 +426,7 @@ main(int argc, char **argv)
 		stop_postmaster(false);
 
 		/*
-		 * LEE: drop the durable "window reached COMPLETE" marker that the
-		 * --wal-upgrade-rollback completeness gate consults.  On a STANDBY this marker
+		 * LEE: drop the durable "window reached COMPLETE" marker.  On a STANDBY it
 		 * is written by the COMPLETE redo handler during window replay; the PRIMARY
 		 * does not replay, so we write it here -- the window definitionally reached
 		 * COMPLETE (we emitted pg_upgrade_wal_complete() above, unless the
@@ -541,18 +528,6 @@ main(int argc, char **argv)
 	 */
 	if (!user_opts.wal_upgrade)
 		issue_warnings_and_set_wal_level();
-
-	/*
-	 * LEE: revertable upgrade.  We do NOT pre-stamp the new cluster here: the
-	 * upgrade window is left pending in pg_wal/, and the cluster is reconstructed
-	 * and then HELD (DB_UPGRADE_QUARANTINED) on its first startup, at the
-	 * end-of-recovery seam in StartupXLOG().  We emit self-contained
-	 * pg_upgrade_commit.sh / pg_upgrade_rollback.sh (paths baked in, same style
-	 * as delete_old_cluster.sh) so the operator adopts or discards the upgrade
-	 * without re-typing -b/-B/-d/-D.
-	 */
-	if (user_opts.wal_upgrade)
-		create_revertable_scripts();
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -733,7 +708,13 @@ create_new_cluster_via_initdb(const char *argv0)
 	if (old_cluster.bin_version == 0)
 		old_cluster.bin_version = old_cluster.major_version;
 
-	/* Refuse to overwrite an existing cluster. */
+	/*
+	 * LEE: a leftover new cluster from a previous --wal-upgrade attempt is just
+	 * discarded and rebuilt.  There is no revert/adopt interface anymore
+	 * (--wal-upgrade-rollback / --wal-upgrade-delete-old were removed), so a
+	 * stale new_dir carries no state worth preserving -- the old cluster is the
+	 * only source of truth.  rm -rf it and re-initdb, rather than refusing.
+	 */
 	{
 		char		verfile[MAXPGPATH];
 		struct stat st;
@@ -741,9 +722,15 @@ create_new_cluster_via_initdb(const char *argv0)
 		snprintf(verfile, sizeof(verfile), "%s/PG_VERSION",
 				 new_cluster.pgdata);
 		if (stat(verfile, &st) == 0)
-			pg_fatal("new cluster data directory \"%s\" already contains a database system; "
-					 "--initdb requires an empty or nonexistent directory",
-					 new_cluster.pgdata);
+		{
+			pg_log(PG_REPORT,
+				   "new cluster data directory \"%s\" already contains a database "
+				   "system from a previous attempt; removing it",
+				   new_cluster.pgdata);
+			if (!rmtree(new_cluster.pgdata, true))
+				pg_fatal("could not remove stale new cluster data directory \"%s\"",
+						 new_cluster.pgdata);
+		}
 	}
 
 	get_control_data(&old_cluster);

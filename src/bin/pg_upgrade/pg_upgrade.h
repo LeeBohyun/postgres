@@ -255,8 +255,6 @@ typedef enum
 typedef enum
 {
 	REVERTABLE_OP_NONE = 0,		/* normal pg_upgrade run */
-	REVERTABLE_OP_ROLLBACK,		/* discard the new_dir, return to old_dir */
-	REVERTABLE_OP_DELETE_OLD,	/* delete a superseded old_dir */
 	REVERTABLE_OP_SIGNAL_HANDOFF,	/* emit the handoff trigger into the LIVE old
 								 * primary's WAL; it propagates to streaming
 								 * standbys (via safekeepers in Neon) which then
@@ -418,7 +416,6 @@ void		disable_old_cluster(transferMode transfer_mode);
 /* revertable.c */
 
 void		perform_revertable_op(void);
-void		create_revertable_scripts(void);
 
 
 /* dump.c */

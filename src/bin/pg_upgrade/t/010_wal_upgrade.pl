@@ -17,7 +17,8 @@
 #   crash path:  old (vN)  --pg_upgrade with COMPLETE suppressed-->  a window
 #                with START but no COMPLETE on disk  --first start-->  FATAL
 #                (never serves a half-built catalog); the old cluster stays
-#                intact and startable, and --wal-upgrade-rollback discards new.
+#                intact and startable, and the dead-end new cluster is discarded
+#                with rm -rf (there is no revert interface).
 #
 # Cross-version: when $ENV{oldinstall} is set the old cluster is built with an
 # older major's binaries (checksums are pre-18 so pass -k there); otherwise the
@@ -26,6 +27,7 @@
 use strict;
 use warnings FATAL => 'all';
 
+use File::Path qw(rmtree);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -181,8 +183,9 @@ sub add_conn_conf
 # PG_UPGRADE_TEST_SKIP_COMPLETE (a test-only backend/frontend hook) makes
 # pg_upgrade emit the whole upgrade window but omit the COMPLETE marker,
 # simulating a crash after START.  The new cluster must FATAL on first start
-# (never serve a half-built catalog), the old cluster must stay intact, and
-# --wal-upgrade-rollback must discard the dead-end new cluster.
+# (never serve a half-built catalog) and the old cluster must stay intact.  The
+# dead-end new cluster carries no state worth keeping (there is no revert
+# interface), so it is simply discarded with rm -rf.
 #
 {
 	my $old = setup_old('old_crash');
@@ -227,23 +230,11 @@ sub add_conn_conf
 		$old_fp, 'crash: old cluster intact and startable after the failed upgrade');
 	$old->stop;
 
-	# Rollback discards the dead-end new cluster (old_dir is intact so this is
-	# allowed) and removes the new data directory.
-	command_ok(
-		[
-			'pg_upgrade',
-			'--old-datadir' => $old->data_dir,
-			'--new-datadir' => $new->data_dir,
-			'--old-bindir' => $old->config_data('--bindir'),
-			'--new-bindir' => $new->config_data('--bindir'),
-			'--socketdir' => $new->host,
-			'--old-port' => $old->port,
-			'--new-port' => $new->port,
-			'--wal-upgrade-rollback',
-		],
-		'crash: --wal-upgrade-rollback discards the half-upgraded new cluster');
+	# The dead-end new cluster is simply discarded (rm -rf); there is no revert
+	# interface, and the old cluster is the source of truth.
+	rmtree($new->data_dir);
 	ok(!-d $new->data_dir,
-		'crash: rollback removed the half-upgraded new data directory');
+		'crash: half-upgraded new data directory discarded');
 
 	$old->clean_node;
 	$new->clean_node;

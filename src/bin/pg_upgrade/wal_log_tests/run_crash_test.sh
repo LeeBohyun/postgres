@@ -53,10 +53,11 @@ log "partial cluster: COMPLETE marker absent (nothing to adopt)"
 # The COMPLETE marker must be ABSENT for a crash-truncated window.
 [ -e "$NEW/pg_upgrade_complete.done" ] && { echo "FAIL: COMPLETE marker present on a partial (no-COMPLETE) cluster"; FAIL=1; } || echo "COMPLETE marker absent (good)"
 
-log "rollback the half-upgraded cluster (discard it); old must be untouched"
-# old_dir is intact (--copy, never started), so rollback is allowed.
-"$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" --wal-upgrade-rollback >"$W/rollback.log" 2>&1 || { cat "$W/rollback.log"; echo "FAIL: rollback of half-upgraded cluster"; FAIL=1; }
-[ -d "$NEW" ] && { echo "FAIL: rollback did not remove the half-upgraded new cluster"; FAIL=1; }
+log "discard the half-upgraded cluster (rm -rf); old must be untouched"
+# There is no revert interface: a half-upgraded new_dir carries no state worth
+# keeping (the old cluster is the source of truth), so it is simply removed.
+rm -rf "$NEW"
+[ -d "$NEW" ] && { echo "FAIL: could not remove the half-upgraded new cluster"; FAIL=1; }
 
 log "verify OLD cluster is still fully usable"
 "$BIN/pg_ctl" -D "$OLD" -l "$W/old2.log" -w start >/dev/null 2>&1
