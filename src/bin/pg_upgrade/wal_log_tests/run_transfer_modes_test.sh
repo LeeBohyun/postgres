@@ -59,11 +59,10 @@ for MODE in copy clone link; do
   ST=$("$BIN/pg_controldata" -D "$NEW" | grep -i "cluster state" | sed 's/.*: *//')
   case "$ST" in *quarantine*) echo "FAIL: --$MODE quarantined; auto-serve expected (state='$ST')"; FAIL=1;; esac
 
-  # ROLLBACK before starting new.  On this branch --wal-upgrade keeps the old
-  # cluster's files INTACT for every allowed transfer mode (the primary is not
-  # demolished; old-cluster deletion is a separate, deferred step).  copy and link
-  # therefore both leave old_dir intact, so rollback SUCCEEDS and restores it.
-  # (--swap is rejected at parse time, tested separately below.)
+  # ROLLBACK before starting new.  copy/clone/link only read the old cluster's
+  # files (the primary is not demolished; old-cluster deletion is a separate,
+  # deferred step), so old_dir stays intact and rollback SUCCEEDS and restores it.
+  # (--swap consumes old_dir and is forward-only; tested separately below.)
   "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" --wal-upgrade-rollback >"$W/${MODE}_rb.log" 2>&1 \
     || { echo "FAIL: --$MODE rollback should succeed (old_dir intact on this branch)"; cat "$W/${MODE}_rb.log"; FAIL=1; }
   [ -d "$NEW" ] && { echo "FAIL: --$MODE rollback left new_dir"; FAIL=1; }

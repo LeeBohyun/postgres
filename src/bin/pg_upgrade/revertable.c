@@ -77,6 +77,20 @@ old_cluster_intact(const char *old_datadir)
 	ControlFileData *cf;
 	bool		crc_ok;
 	bool		ok;
+	char		ctlpath[MAXPGPATH];
+	struct stat st;
+
+	/*
+	 * The control file must be present before we call get_controlfile(), which
+	 * pg_fatal()s (does not return) on a missing/unreadable file.  A --swap
+	 * upgrade renames old_dir's pg_control away (disable_old_cluster), so here it
+	 * is simply gone -- treat "no control file" as "not intact" and return false,
+	 * so do_rollback() can refuse gracefully rather than dying inside
+	 * get_controlfile() with a raw open error.
+	 */
+	snprintf(ctlpath, sizeof(ctlpath), "%s/global/pg_control", old_datadir);
+	if (stat(ctlpath, &st) != 0)
+		return false;
 
 	cf = get_controlfile(old_datadir, &crc_ok);
 	if (cf == NULL || !crc_ok)
