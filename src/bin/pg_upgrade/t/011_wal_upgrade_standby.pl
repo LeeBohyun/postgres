@@ -75,7 +75,7 @@ $old->safe_psql(
 	CREATE INDEX ON t (v);
 	CREATE TABLE toasted (id int, big text);
 	INSERT INTO toasted
-	  SELECT g, repeat(md5(g::text), 300) FROM generate_series(1, 300) g;
+	  SELECT g, repeat('abcdef0123456789', 3000) FROM generate_series(1, 300) g;
 });
 my $want = $old->safe_psql('postgres',
 	'SELECT count(*), sum(hashtext(v)::bigint) FROM t');

@@ -75,7 +75,7 @@ sub setup_old
 		INSERT INTO t SELECT g, 'row ' || g FROM generate_series(1, 500) g;
 		CREATE TABLE toasted (id int, big text);
 		INSERT INTO toasted
-		  SELECT g, repeat(md5(g::text), 200) FROM generate_series(1, 200) g;
+		  SELECT g, repeat('abcdef0123456789', 2000) FROM generate_series(1, 200) g;
 		CREATE DATABASE extra_db;
 	});
 	$old->stop;
