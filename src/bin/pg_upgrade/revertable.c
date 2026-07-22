@@ -386,6 +386,32 @@ do_signal_handoff(void)
 
 	conn = connectToServer(&old_cluster, "template1");
 
+	/*
+	 * Gate writes BEFORE emitting the handoff so no user WAL follows it.
+	 *
+	 * 1. Terminate every existing CLIENT backend except our own session.  This
+	 *    stops any in-flight write transaction from committing after the handoff
+	 *    record.  We deliberately filter on backend_type = 'client backend' so we
+	 *    do NOT terminate the walsender(s) feeding streaming standbys -- those
+	 *    must stay up to carry the handoff record to the standbys.  (Autovacuum
+	 *    and other background workers are left alone; they are torn down by the
+	 *    fast shutdown a moment later.)
+	 * 2. Immediately after, emit the handoff and fast-stop the primary.  A fast
+	 *    shutdown refuses new connections from the instant it begins, so together
+	 *    these close the window in which a user transaction could write WAL past
+	 *    the handoff.
+	 *
+	 * We do NOT persist "default_transaction_read_only" via ALTER SYSTEM: it would
+	 * survive into a later --wal-upgrade-rollback that restarts this same old
+	 * cluster, leaving it unexpectedly read-only.
+	 */
+	res = executeQueryOrDie(conn,
+							"SELECT pg_terminate_backend(pid) "
+							"FROM pg_stat_activity "
+							"WHERE pid <> pg_backend_pid() "
+							"AND backend_type = 'client backend'");
+	PQclear(res);
+
 	snprintf(query, sizeof(query),
 			 "SELECT pg_upgrade_wal_handoff(%d)", PG_MAJORVERSION_NUM);
 	res = executeQueryOrDie(conn, "%s", query);
@@ -396,18 +422,13 @@ do_signal_handoff(void)
 	/*
 	 * Shut the old primary down IMMEDIATELY, at the handoff point.  This is the
 	 * whole reason signal-handoff drives the shutdown itself rather than leaving
-	 * it to the operator: any transaction that committed between the handoff
-	 * record and shutdown would append old-format WAL *after* the handoff marker,
-	 * so the handoff would no longer be the clean end of the old stream that
-	 * streaming standbys stop at.  A fast shutdown aborts in-flight backends (they
-	 * do not commit) and writes the shutdown checkpoint right after the handoff
-	 * record, so the handoff is effectively the last meaningful record.
-	 *
-	 * (A tiny window remains: another backend could COMMIT in the interval between
-	 * pg_upgrade_wal_handoff() returning and the fast-stop taking effect.  Closing
-	 * it completely requires making the handoff BE the shutdown checkpoint -- see
-	 * the note in xl_pg_upgrade_handoff.  In practice the primary is quiesced for
-	 * the upgrade, as for any pg_upgrade.)
+	 * it to the operator: any transaction that committed after the handoff record
+	 * would append old-format WAL *after* the handoff marker, so the handoff would
+	 * no longer be the clean end of the old stream that streaming standbys stop
+	 * at.  Client backends were already terminated above (and the fast shutdown
+	 * refuses new connections), so nothing writes past the handoff; the shutdown
+	 * checkpoint lands right after it, making the handoff the last meaningful
+	 * record.  The remaining shutdown checkpoint carries no user data.
 	 */
 	/*
 	 * Use system() rather than exec_prog() here: the lifecycle subcommands run

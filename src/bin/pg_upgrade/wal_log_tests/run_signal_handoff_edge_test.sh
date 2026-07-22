@@ -36,6 +36,23 @@ CONF
 "$BIN/pg_ctl" -D "$W/old" -l "$W/o.log" -w start >/dev/null 2>&1 || fail "start old"
 "$BIN/psql" -h "$W" -U postgres -qc "CREATE TABLE t(id int); INSERT INTO t SELECT generate_series(1,100);" >/dev/null 2>&1 || fail "load"
 
+# =========================================================== D0: write gate
+log "D0: signal-handoff terminates live CLIENT connections (write gate)"
+# Open a long-lived idle client session in the background (sleeps inside a psql
+# connection).  signal-handoff must terminate it so no user txn can commit past
+# the handoff.  We record its backend PID first, then confirm it is gone.
+"$BIN/psql" -h "$W" -U postgres -tAc "SELECT pg_sleep(120)" >/dev/null 2>&1 &
+SLEEPER=$!
+# wait until the backend is visible on the server
+GATEPID=""
+for i in $(seq 1 20); do
+    GATEPID=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT pid FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(120)%' AND pid <> pg_backend_pid() LIMIT 1" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$GATEPID" ] && break
+    sleep 0.5
+done
+[ -n "$GATEPID" ] || fail "D0: could not establish the test client backend"
+log "  opened a live client backend pid=$GATEPID"
+
 # =========================================================== D1: emit + shut down
 log "D1: --wal-upgrade-signal-handoff emits the trigger AND shuts the primary down"
 BEFORE=$(count_handoff "$W/old")
@@ -46,6 +63,12 @@ if "$BIN/psql" -h "$W" -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
     fail "D1: primary still serving after signal-handoff (should have shut down)"
 fi
 [ -f "$W/old/postmaster.pid" ] && fail "D1: postmaster.pid still present (primary not stopped)"
+# D0 follow-up: the pre-opened client backend must be gone (terminated by the
+# write gate, at latest by the shutdown).  Reap the background psql and confirm
+# it is no longer running.
+wait "$SLEEPER" 2>/dev/null
+kill -0 "$SLEEPER" 2>/dev/null && fail "D0: pre-opened client backend survived signal-handoff (write gate failed)"
+log "PASS D0 (live client backend pid=$GATEPID terminated by the write gate)"
 # exactly one HANDOFF record landed (shutdown flushed WAL to disk)
 AFTER1=$(count_handoff "$W/old")
 [ "${AFTER1:-0}" -ge $(( ${BEFORE:-0} + 1 )) ] || fail "D1: no new HANDOFF record (before=$BEFORE after=$AFTER1)"
