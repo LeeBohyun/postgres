@@ -1468,6 +1468,18 @@ SlruUpgradeRestoreSegment(SlruDesc *ctl, int64 segno,
 {
 	int			npages = (int) (datalen / BLCKSZ);
 	int64		basepage = segno * SLRU_PAGES_PER_SEGMENT;
+	SlruWriteAllData fdata;
+
+	/*
+	 * LEE: write the whole segment through a single SlruWriteAll batch so the
+	 * segment file is opened once, not once per page.  Passing &fdata to
+	 * SlruInternalWritePage makes SlruPhysicalWritePage cache and reuse the open
+	 * fd across all of this segment's pages (exactly as SimpleLruWriteAll does at
+	 * checkpoint); we close it once at the end.  All pages of one segment share a
+	 * bank on well-configured SLRUs, but acquire the correct bank lock per page
+	 * to stay correct regardless of bank layout.
+	 */
+	fdata.num_files = 0;
 
 	for (int i = 0; i < npages; i++)
 	{
@@ -1483,10 +1495,17 @@ SlruUpgradeRestoreSegment(SlruDesc *ctl, int64 segno,
 			   data + (Size) i * BLCKSZ, BLCKSZ);
 		ctl->shared->page_dirty[slotno] = true;
 
-		/* persist immediately, mirroring clog_redo()'s CLOG_ZEROPAGE path */
-		SimpleLruWritePage(ctl, slotno);
+		/* persist through the batch (reuses the cached fd for this segment) */
+		SlruInternalWritePage(ctl, slotno, &fdata);
 
 		LWLockRelease(lock);
+	}
+
+	/* Close the fd(s) the batch left open. */
+	for (int i = 0; i < fdata.num_files; i++)
+	{
+		if (CloseTransientFile(fdata.fd[i]) != 0)
+			SlruReportIOError(ctl, basepage, NULL);
 	}
 }
 

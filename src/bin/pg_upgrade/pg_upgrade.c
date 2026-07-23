@@ -344,23 +344,27 @@ main(int argc, char **argv)
 								 "SELECT pg_create_physical_replication_slot('%s', true, false)",
 								 UPGRADE_WINDOW_SLOT));
 
-		PQclear(executeQueryOrDie(conn, "CHECKPOINT"));
-		PQclear(executeQueryOrDie(conn, "SELECT pg_upgrade_wal_flush_slru()"));
-
 		/*
-		 * LEE: the CHECKPOINT above is CN — the recovery anchor.  This, not the
-		 * initdb checkpoint (C0), is where replay starts: it applies ONLY the
-		 * end-of-upgrade full-page images that follow, so it never re-runs
+		 * LEE: pg_upgrade_wal_flush_slru() forces a checkpoint (and fsyncs the
+		 * SLRU segments the fsync-off burst server left in cache).  That
+		 * checkpoint IS CN — the recovery anchor.  We deliberately do NOT issue a
+		 * separate standalone CHECKPOINT first: it would only be superseded, since
+		 * CN is "the last checkpoint preceding XLOG_UPGRADE_START" and the flush's
+		 * checkpoint immediately precedes START below.  One checkpoint, not two.
+		 *
+		 * CN, not the initdb checkpoint (C0), is where replay starts: it applies
+		 * ONLY the end-of-upgrade full-page images that follow, so it never re-runs
 		 * pg_restore's CREATE DATABASE FILE_COPY records (which would need the
 		 * template databases on disk).  Anchoring at CN is what lets the cluster
 		 * be reconstructed from an empty data directory.
 		 *
-		 * We no longer capture CN's LSN here: the new cluster's first startup
+		 * We do not capture CN's LSN here: the new cluster's first startup
 		 * (PerformWalUpgradeIfNeeded) derives it directly from the WAL — it is
 		 * "the last checkpoint preceding XLOG_UPGRADE_START" — and arms
 		 * pg_control at CN in-process.  Deriving it from the WAL is what lets a
 		 * physical standby recover the same anchor from the streamed WAL.
 		 */
+		PQclear(executeQueryOrDie(conn, "SELECT pg_upgrade_wal_flush_slru()"));
 
 		/*
 		 * LEE: write the upgrade WAL as full-page images, all into the still-
@@ -372,9 +376,8 @@ main(int argc, char **argv)
 		 *  5. pg_switch_wal() — seal the segment so all records are durable
 		 *
 		 * The XID/OID/multixact counters are NOT emitted as a separate record:
-		 * they were transplanted into pg_control before the CHECKPOINT above, so
-		 * the CN checkpoint record already carries them and recovery reproduces
-		 * them.
+		 * they were transplanted into pg_control before CN, so the CN checkpoint
+		 * record already carries them and recovery reproduces them.
 		 */
 		PQclear(executeQueryOrDie(conn,
 								 "SELECT pg_upgrade_wal_start(%u, %u)",
@@ -526,20 +529,7 @@ main(int argc, char **argv)
 				pg_fatal("could not create \"%s\": %m", marker_path);
 			fclose(mf);
 		}
-
-		/*
-		 * LEE: the transferred-files manifest has served its purpose (the emit
-		 * phase read it).  Remove it so it does not linger in the live cluster.
-		 */
-		{
-			char		manifest_path[MAXPGPATH];
-
-			snprintf(manifest_path, sizeof(manifest_path),
-					 "%s/pg_upgrade_transferred_files", new_cluster.pgdata);
-			unlink(manifest_path);
-		}
 	}
-	/* (the server was already stopped before the file transfer above) */
 
 	/*
 	 * Migrate replication slots to the new cluster.
