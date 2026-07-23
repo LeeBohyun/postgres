@@ -231,10 +231,6 @@ main(int argc, char **argv)
 	create_new_objects();
 
 	/*
-	 * LEE: write the matching XLOG_UPGRADE_COMPLETE marker when
-	 * --wal-upgrade is set.
-	 */
-	/*
 	 * LEE: always stop the server before transferring relation files, exactly
 	 * as stock pg_upgrade does.  (The earlier --wal-upgrade variant kept
 	 * the server running through the transfer; that was wrong.  The transfer
@@ -250,10 +246,11 @@ main(int argc, char **argv)
 	stop_postmaster(false);
 
 	/*
-	 * LEE: the OLD cluster's system identifier is stamped into the new cluster
-	 * by the "Resetting WAL archives" step inside copy_xact_xlog_xid(), which
-	 * runs BEFORE disable_old_cluster() renames the old pg_control -- so it can
-	 * read the old sysid directly there.  (No separate capture is needed here.)
+	 * LEE: the new cluster keeps a FRESH system identifier (the same "new cluster
+	 * gets a new sysid" behavior as stock pg_upgrade); we do NOT stamp the old
+	 * cluster's sysid.  Recovery of the upgrade window only requires pg_control
+	 * and the window's WAL to agree on the sysid, not that it match the old
+	 * cluster -- see the "Resetting WAL archives" step in copy_xact_xlog_xid().
 	 */
 
 	/*
@@ -318,9 +315,9 @@ main(int argc, char **argv)
 		 *
 		 * First force every dirty buffer and SLRU page to disk so the on-disk
 		 * images we are about to capture are the authoritative final state.
-		 * The CHECKPOINT flushes shared buffers; pg_upgrade_wal_flush_slru() then
-		 * runs a forced checkpoint and fsyncs the SLRU segment files so the
-		 * committed transaction statuses are durable before we read them.
+		 * pg_upgrade_wal_flush_slru() below runs the (single) forced checkpoint --
+		 * which is CN -- and fsyncs the SLRU segment files so the committed
+		 * transaction statuses are durable before we read them.
 		 */
 		/*
 		 * LEE: retention slot.  Create a physical replication slot reserving WAL
@@ -328,17 +325,12 @@ main(int argc, char **argv)
 		 * its restart_lsn sits AT or BEFORE CN.  That is essential: a streaming
 		 * standby anchors recovery at CN (the checkpoint preceding START), so CN
 		 * and the whole window must be pinned; a restart_lsn past CN could let CN
-		 * itself be recycled.  The slot pins the window in pg_wal/ so it is NOT
-		 * recycled -- neither by the end-of-recovery checkpoint the first
-		 * hold-start writes (measured: the window is otherwise reclaimed the
-		 * instant the cluster holds in quarantine), nor by the go-live checkpoint
-		 * at --commit.  A streaming standby later connects with primary_slot_name =
-		 * this slot and pulls the window from the LIVE (committed) primary.
-		 * --commit keeps the slot; --rollback and the eventual "standby caught up"
-		 * step drop it.  The slot's on-disk state lives in pg_replslot/, which the
-		 * revert step preserves (it wipes only base/ and global/, keeping
-		 * pg_control), so it survives the wipe-and-reconstruct cycle into the
-		 * persisted new cluster.
+		 * itself be recycled.  The slot is what pins the window in pg_wal/ so no
+		 * checkpoint recycles it -- this is the size-independent retention
+		 * guarantee (see server.c's max_slot_wal_keep_size=-1).  A streaming
+		 * standby later connects with primary_slot_name = this slot and pulls the
+		 * window from the live upgraded primary; the slot is dropped once the
+		 * window is no longer needed.
 		 */
 		PQclear(executeQueryOrDie(conn,
 								 "SELECT pg_create_physical_replication_slot('%s', true, false)",

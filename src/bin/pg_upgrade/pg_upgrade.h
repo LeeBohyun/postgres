@@ -263,9 +263,9 @@ typedef enum
 
 /*
  * LEE: name of the internal physical replication slot pg_upgrade creates during
- * --wal-upgrade capture to RETAIN the upgrade window in pg_wal/ (pinned at
- * CN) so a streaming standby can pull it from the committed/live primary.  Kept
- * across --commit; dropped on --rollback and once the standby has caught up.
+ * --wal-upgrade capture to RETAIN the upgrade window in pg_wal/ (pinned at CN)
+ * so a streaming standby can pull it from the live upgraded primary.  It is
+ * dropped once the window is no longer needed (e.g. the standby has caught up).
  */
 #define UPGRADE_WINDOW_SLOT		"pg_upgrade_window"
 
@@ -493,8 +493,6 @@ char	   *cluster_conn_opts(ClusterInfo *cluster);
 
 bool		start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error);
 void		stop_postmaster(bool in_atexit);
-/* LEE: immediate stop (no checkpoint) for --wal-upgrade WAL preservation */
-void		stop_postmaster_immediate(void);
 uint32		get_major_server_version(ClusterInfo *cluster);
 void		check_pghost_envvar(void);
 

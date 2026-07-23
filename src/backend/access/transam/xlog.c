@@ -4405,22 +4405,29 @@ WriteControlFile(void)
 }
 
 /*
- * LEE: Synthesize a minimal, valid global/pg_control (and PG_VERSION) for a
- * fresh --wal-upgrade STREAMING standby, WITHOUT initdb.
+ * LEE: Synthesize a minimal, valid global/pg_control (and PG_VERSION) from THIS
+ * binary's compile-time constants, so a --wal-upgrade recovery can start the new
+ * binary without initdb and reconstruct all data by replaying the upgrade window.
  *
- * Called from the postmaster's checkControlFile() when pg_control is absent AND
- * the operator has staged an upgrade-stream standby (the pg_upgrade_stream.signal
- * sentinel is present).  Rationale: a streaming standby reconstructs ALL of its
- * data by replaying the upgrade window from the primary; the ONLY things it needs
- * on disk before the postmaster will start are PG_VERSION and a pg_control that
- * passes ReadControlFile()'s compatibility checks.  Every one of those checked
- * fields is a compile-time constant of THIS binary (PG_CONTROL_VERSION,
- * CATALOG_VERSION_NO, MAXALIGN, BLCKSZ, NAMEDATALEN, ...), and the run-time fields
- * (system_identifier, checkPoint, minRecoveryPoint, state, ...) are all
- * overwritten in-process by ArmControlFileForUpgradeRecovery(for_streaming=true)
- * once the CN anchor is fetched from the primary.  So a control file built purely
- * from this binary's constants is sufficient to clear the pre-start gate; the arm
- * fixes up the rest.
+ * Called from checkDataDir() (miscinit.c), BEFORE the version gate, in two modes:
+ *   - allow_overwrite=false: fresh STREAMING standby.  pg_control is ABSENT (bare
+ *     skeleton), gated on the pg_upgrade_stream.signal sentinel + primary_conninfo;
+ *     the window streams from the primary.  We create pg_control (O_EXCL).
+ *   - allow_overwrite=true: archive-PITR cross-version recovery (Phase 2).  An
+ *     OLD-version pg_control is PRESENT (left by the old binary's Phase-1 replay)
+ *     and would fail the version gate; gated on recovery.signal + a staged upgrade
+ *     window in pg_wal/.  We OVERWRITE pg_control (O_TRUNC).
+ *
+ * Rationale: the ONLY things needed on disk before the postmaster will start are
+ * PG_VERSION and a pg_control that passes ReadControlFile()'s compatibility
+ * checks.  Every checked field is a compile-time constant of this binary
+ * (PG_CONTROL_VERSION, CATALOG_VERSION_NO, MAXALIGN, BLCKSZ, NAMEDATALEN, ...);
+ * the run-time fields (system_identifier, checkPoint, minRecoveryPoint, state,
+ * ...) are fixed up in-process afterward -- by ArmControlFileForUpgradeRecovery()
+ * from the CN anchor (fetched from the primary for streaming, or derived from the
+ * local window for archive-PITR).  So a control file built purely from this
+ * binary's constants is sufficient to clear the pre-start gate; the arm does the
+ * rest.
  *
  * This runs in the POSTMASTER, BEFORE CreateSharedMemoryAndSemaphores(), so the
  * shared ControlFile does not exist yet.  We therefore build a LOCAL buffer and
@@ -4907,7 +4914,7 @@ ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn, XLogRecPtr cn_lsn,
  * mid-window or pg_controldata shows "in pg_upgrade" instead of "in production".
  * These do NOT affect the recovery-mode decision (that already happened from the
  * armed DB_IN_PRODUCTION); Clear restores DB_IN_PRODUCTION so the end-of-recovery
- * seam behaves exactly as before (quarantine hold or go-live).
+ * seam goes live normally (there is no quarantine hold -- the cluster auto-serves).
  */
 void
 SetControlFileInUpgrade(void)
@@ -9646,7 +9653,7 @@ XLogFlushUpgradeSLRU(void)
 	 * writes only reach the OS page cache.  We temporarily set enableFsync=true
 	 * so the checkpoint process calls fsync() on all pending sync requests.
 	 * CHECKPOINT_FORCE ensures it runs even if nothing appears dirty.
-	 * CHECKPOINT_IMMEDIATE makes it run right now rather than spreading it out.
+	 * CHECKPOINT_FAST makes it run right now rather than spreading it out.
 	 * CHECKPOINT_WAIT blocks until the checkpointer confirms completion.
 	 */
 	{

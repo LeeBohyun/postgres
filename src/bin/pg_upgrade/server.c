@@ -361,35 +361,6 @@ stop_postmaster(bool in_atexit)
 }
 
 /*
- * LEE: stop_postmaster_immediate()
- *
- * Stop the postmaster with -m immediate (SIGQUIT) so that no shutdown
- * checkpoint is written and no WAL segments are recycled.  Used by
- * --wal-upgrade after writing XLOG_UPGRADE_COMPLETE so the upgrade
- * WAL stream remains intact for preservation in pg_wal_upgrade/.
- */
-void
-stop_postmaster_immediate(void)
-{
-	ClusterInfo *cluster;
-
-	if (os_info.running_cluster == &old_cluster)
-		cluster = &old_cluster;
-	else if (os_info.running_cluster == &new_cluster)
-		cluster = &new_cluster;
-	else
-		return;
-
-	exec_prog(SERVER_STOP_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_ctl\" -w -D \"%s\" -o \"%s\" -m immediate stop",
-			  cluster->bindir, cluster->pgconfig,
-			  cluster->pgopts ? cluster->pgopts : "");
-
-	os_info.running_cluster = NULL;
-}
-
-
-/*
  * check_pghost_envvar()
  *
  * Tests that PGHOST does not point to a non-local server

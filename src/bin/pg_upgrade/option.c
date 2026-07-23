@@ -275,12 +275,11 @@ parseCommandLine(int argc, char *argv[])
 
 	/*
 	 * LEE: unlike the standalone --initdb branch, we do NOT reject -O with
-	 * --initdb.  create_new_cluster_via_initdb() derives initdb's options from
-	 * the old cluster's control data and never forwards -O to initdb; -O reaches
-	 * only the new cluster's postmaster (the server phases of the upgrade).  For
-	 * --wal-upgrade that combination is legitimate and needed -- e.g. passing
-	 * "-c allow_in_place_tablespaces=on" to the upgrade server while still having
-	 * pg_upgrade create the cluster.  The two options act on different phases, so
+	 * --initdb.  create_new_cluster_via_initdb() derives initdb's core options
+	 * from the old cluster's control data, then appends -O (new_cluster.pgopts)
+	 * to the initdb command line; the same -O options are also passed to the new
+	 * cluster's postmaster during the server phases.  For --wal-upgrade that is
+	 * legitimate and needed -- e.g. "-c allow_in_place_tablespaces=on" -- so
 	 * there is no conflict to reject.
 	 */
 
