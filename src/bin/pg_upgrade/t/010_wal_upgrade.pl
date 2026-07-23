@@ -436,13 +436,12 @@ sub add_conn_conf
 	open(my $s2, '>', $restore->data_dir . '/recovery.signal') or die $!;
 	close($s2);
 
-	# Cross-version only: Phase 1 left an OLD-version pg_control that this NEW
-	# binary would reject at the version gate.  pg_upgrade_recover.signal sanctions
-	# synthesizing a new-version pg_control over it (the staged window is verified
-	# present first).  Same-version needs no synthesis, but the signal is harmless
-	# there (the window is present either way), so drop it unconditionally.
-	open(my $rs, '>', $restore->data_dir . '/pg_upgrade_recover.signal') or die $!;
-	close($rs);
+	# Cross-version: Phase 1 left an OLD-version pg_control that this NEW binary
+	# would reject at the version gate.  The new binary detects this from the
+	# ordinary recovery.signal (above) plus the staged upgrade window in pg_wal/
+	# and synthesizes a new-version pg_control -- no dedicated sentinel needed.
+	# Same-version needs no synthesis and is unaffected (control file already
+	# matches).
 
 	my $p2 = $restore->start(fail_ok => 1);
 	is($p2, 1, 'pitr phase 2: new binary replays the window + tail and comes up');

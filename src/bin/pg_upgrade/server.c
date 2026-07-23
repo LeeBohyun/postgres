@@ -218,17 +218,25 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 			/*
 			 * LEE: the end-of-upgrade image WAL — from the CN checkpoint
 			 * through PG_UPGRADE_COMPLETE — must survive intact in pg_wal/ so
-			 * that first startup can crash-recover the whole upgrade.  A large
-			 * cluster generates gigabytes of WAL (the full-page images are as
-			 * large as the data), which would otherwise trigger checkpoints that
-			 * recycle those segments and leave gaps.
+			 * that first startup can crash-recover the whole upgrade and a
+			 * standby / PITR restore can replay it.  The full-page images are as
+			 * large as the data, so on a big cluster the window is many GB (and
+			 * can exceed 1 TB); checkpoints during the burst must not recycle any
+			 * of it.
 			 *
-			 * Pin all WAL for the upgrade window: an effectively unbounded
-			 * wal_keep_size prevents any segment from being removed, and large
-			 * max_wal_size / checkpoint_timeout avoid needless checkpoint churn.
+			 * The real, SIZE-INDEPENDENT guarantee is the UPGRADE_WINDOW_SLOT
+			 * physical replication slot (created in pg_upgrade.c before CN with
+			 * immediately_reserve): KeepLogSeg() pins every segment at or after
+			 * the slot's restart_lsn (which sits at/before CN), and that
+			 * retention is uncapped as long as max_slot_wal_keep_size is -1.  Set
+			 * that explicitly here so nothing bounds the window by size -- a
+			 * hardcoded wal_keep_size ceiling (previously 1 TB) would wrongly
+			 * imply a size limit the slot does not actually impose.  max_wal_size
+			 * / checkpoint_timeout stay large only to avoid needless checkpoint
+			 * churn during the burst, not as the retention mechanism.
 			 */
 			appendPQExpBufferStr(&pgoptions,
-								 " -c wal_keep_size=1TB"
+								 " -c max_slot_wal_keep_size=-1"
 								 " -c max_wal_size=1TB"
 								 " -c checkpoint_timeout=1h");
 

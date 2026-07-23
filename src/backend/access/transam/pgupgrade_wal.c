@@ -189,7 +189,6 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 	XLogSegNo	highseg = 0;
 	XLogSegNo	runstart = 0;
 	bool		any = false;
-	char		lowseg_path[MAXPGPATH] = {0};
 	char		runstart_path[MAXPGPATH] = {0};
 	UpgradeWalReadPrivate priv;
 	XLogReaderState *reader;
@@ -244,10 +243,7 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 		if (ftli != 1)
 			continue;
 		if (!any || segno < lowseg)
-		{
 			lowseg = segno;
-			snprintf(lowseg_path, sizeof(lowseg_path), "%s/%s", waldir, de->d_name);
-		}
 		if (!any || segno > highseg)
 			highseg = segno;
 		any = true;
@@ -790,6 +786,21 @@ PerformWalUpgradeIfNeeded(void)
 	 * live (see the XLOG_UPGRADE_START handler in pg_upgrade_redo()).
 	 */
 	in_upgrade_bootstrap = true;
+
+	/*
+	 * Suppress hot standby from the very start of recovery, BEFORE any record is
+	 * replayed -- not just from the XLOG_UPGRADE_START redo -- exactly as the
+	 * streaming-standby path above does.  Recovery is anchored at CN and the
+	 * window's full-page images rebuild the cluster (catalogs included) as they
+	 * replay; between reaching a consistent point and replaying XLOG_UPGRADE_START
+	 * the cluster is only partially reconstructed, so a read-only connection
+	 * admitted in that gap could observe (or FATAL on) a half-built catalog.
+	 * Holding the guard here keeps hot standby off until XLOG_UPGRADE_COMPLETE
+	 * clears it, by which point the whole cluster has been reconstructed.  This
+	 * matters for the archive-PITR path (a restored base backup can reach
+	 * consistency well before CN) and is harmless for the primary's own restart.
+	 */
+	pgUpgradeReplayInProgress = true;
 
 	return true;
 }
