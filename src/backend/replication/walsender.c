@@ -513,12 +513,13 @@ IdentifySystem(void)
  *
  * LEE: reply with the --wal-upgrade window anchor retained on this live
  * upgraded primary, so a fresh vN+1 standby skeleton can arm its control file at
- * CN and stream the window with no operator "prepare" step.  One row, one text
- * column "anchor" =
- * "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>" (the same string pg_upgrade_wal_window_anchor()
- * returns).  The standby learns sysid + TLI from IDENTIFY_SYSTEM separately.  The
- * column is NULL if this primary retains no upgrade window (not an upgrade
- * primary, or the window was already released by --wal-upgrade-delete-old).
+ * CN and stream the window with no operator "prepare" step -- and with no
+ * separate IDENTIFY_SYSTEM round trip.  One row, one text column "anchor" =
+ * "<sysid>/<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>/<tli>": the CN + redo LSNs plus
+ * everything the standby needs to arm (the primary's system identifier -- which
+ * equals the window's xlp_sysid -- and its current timeline).  The column is
+ * NULL if this primary retains no upgrade window (not an upgrade primary, or the
+ * window was already released).
  */
 static void
 PgUpgradeWindowAnchor(void)
@@ -557,9 +558,17 @@ PgUpgradeWindowAnchor(void)
 	}
 	else
 	{
-		char	   *anchor = psprintf("%X/%08X/%X/%08X",
+		/*
+		 * Fold in sysid + TLI so the standby arms from a single command (no
+		 * separate IDENTIFY_SYSTEM).  sysid is the primary's own identifier,
+		 * which is exactly what the window WAL is stamped with; TLI is the
+		 * primary's current insertion timeline (what IDENTIFY_SYSTEM reports).
+		 */
+		char	   *anchor = psprintf(UINT64_FORMAT "/%X/%08X/%X/%08X/%u",
+									  GetSystemIdentifier(),
 									  LSN_FORMAT_ARGS(cn_lsn),
-									  LSN_FORMAT_ARGS(cn.redo));
+									  LSN_FORMAT_ARGS(cn.redo),
+									  GetWALInsertionTimeLine());
 
 		values[0] = CStringGetTextDatum(anchor);
 	}

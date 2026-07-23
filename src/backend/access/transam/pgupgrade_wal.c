@@ -287,8 +287,8 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 
 	/*
 	 * LEE: capture the system identifier the upgrade WAL was emitted under, by
-	 * reading xlp_sysid from the long page header at the start of the lowest
-	 * segment.  Recovery validates every WAL page's xlp_sysid against
+	 * reading xlp_sysid from the long page header at the start of the run-start
+	 * segment (runstart).  Recovery validates every WAL page's xlp_sysid against
 	 * pg_control->system_identifier, so the arming step (ArmControlFileForUpgrade
 	 * Recovery) stamps pg_control with THIS value.  That lets a fresh skeleton
 	 * replay the delivered burst without any offline sysid stamping -- the sysid
@@ -323,7 +323,7 @@ upgrade_wal_scan_markers(const char *waldir, bool *found_start,
 	if (reader == NULL)
 		return false;
 
-	/* Find the first valid record at/after the start of the lowest segment. */
+	/* Find the first valid record at/after the start of the run-start segment. */
 	{
 		char	   *errormsg = NULL;
 
@@ -492,7 +492,6 @@ ArmFromPrimaryAnchorIfConfigured(void)
 {
 	WalReceiverConn *conn;
 	char	   *err = NULL;
-	char	   *primary_sysid;
 	TimeLineID	primary_tli = 0;
 	char	   *anchor_str;
 	uint64		sysid = 0;
@@ -522,23 +521,13 @@ ArmFromPrimaryAnchorIfConfigured(void)
 						err ? err : "unknown error"),
 				 errhint("Set primary_conninfo to a live --wal-upgrade primary.")));
 
-	/* sysid + primary timeline from the standard IDENTIFY_SYSTEM. */
-	primary_sysid = walrcv_identify_system(conn, &primary_tli);
-	if (primary_sysid == NULL || sscanf(primary_sysid, UINT64_FORMAT, &sysid) != 1 ||
-		sysid == 0 || primary_tli == 0)
-	{
-		walrcv_disconnect(conn);
-		ereport(FATAL,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("IDENTIFY_SYSTEM on the primary returned an invalid identity")));
-	}
-
 	/*
-	 * CN lsn + redo from the new PG_UPGRADE_WINDOW_ANCHOR replication command.
-	 * A NULL result means the primary retains no upgrade window (not upgrading,
-	 * or already released) -> fall back to normal startup.  The standby always
-	 * streams from an already-upgraded vN+1 primary, so the primary necessarily
-	 * understands this command.
+	 * Everything the standby needs to arm comes from the single
+	 * PG_UPGRADE_WINDOW_ANCHOR command: sysid + CN lsn + redo + primary TLI (no
+	 * separate IDENTIFY_SYSTEM round trip).  A NULL result means the primary
+	 * retains no upgrade window (not upgrading, or already released) -> fall back
+	 * to normal startup.  The standby always streams from an already-upgraded
+	 * vN+1 primary, so the primary necessarily understands this command.
 	 */
 	anchor_str = walrcv_upgrade_window_anchor(conn);
 	walrcv_disconnect(conn);
@@ -550,8 +539,10 @@ ArmFromPrimaryAnchorIfConfigured(void)
 		return false;
 	}
 
-	/* "<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>" */
-	if (sscanf(anchor_str, "%X/%X/%X/%X", &cn_hi, &cn_lo, &redo_hi, &redo_lo) != 4)
+	/* "<sysid>/<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>/<tli>" */
+	if (sscanf(anchor_str, UINT64_FORMAT "/%X/%X/%X/%X/%u",
+			   &sysid, &cn_hi, &cn_lo, &redo_hi, &redo_lo, &primary_tli) != 6 ||
+		sysid == 0 || primary_tli == 0)
 		ereport(FATAL,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("malformed pg_upgrade window anchor from primary: \"%s\"",
