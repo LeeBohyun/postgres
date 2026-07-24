@@ -6,6 +6,13 @@ captures a major-version upgrade as WAL so it can be streamed to physical
 standbys and replayed across the backup/PITR boundary — closing the replication
 and durability gaps of stock `pg_upgrade`.
 
+This branch is developed on top of the `pg_upgrade --initdb` patch proposed on
+pgsql-hackers
+([CAMPh8Mp7aH_iC_xMOOzeiB+kSGh5bAg4oRRS=H5KsC5a0x9iKQ@mail.gmail.com](https://www.postgresql.org/message-id/CAMPh8Mp7aH_iC_xMOOzeiB+kSGh5bAg4oRRS=H5KsC5a0x9iKQ@mail.gmail.com)),
+but the two are orthogonal: `--wal-upgrade` does not depend on that patch. It
+only uses `--initdb` as a convenience to create the new cluster; you can run
+`initdb` manually and use `--wal-upgrade` on its own instead.
+
 For the design rationale, interface, workflows, tests, and an example
 integration, see:
 
