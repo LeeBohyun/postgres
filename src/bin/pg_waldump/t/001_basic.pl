@@ -80,7 +80,8 @@ CommitTs
 ReplicationOrigin
 Generic
 LogicalMessage
-XLOG2$/,
+XLOG2
+PgUpgrade$/,
 	'rmgr list');
 
 

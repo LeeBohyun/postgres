@@ -249,6 +249,28 @@ typedef enum
 } transferMode;
 
 /*
+ * Revertable-upgrade lifecycle subcommands.  When set (not _NONE),
+ * pg_upgrade does NOT run an upgrade; it acts on an existing cluster and exits.
+ */
+typedef enum
+{
+	REVERTABLE_OP_NONE = 0,		/* normal pg_upgrade run */
+	REVERTABLE_OP_SIGNAL_HANDOFF,	/* emit the handoff trigger into the LIVE
+									 * old primary's WAL; it propagates to
+									 * streaming standbys through the normal
+									 * WAL/replication path, which replay it
+									 * and then stand down before the upgrade */
+} RevertableOp;
+
+/*
+ * Name of the internal physical replication slot pg_upgrade creates during
+ * --wal-upgrade capture to RETAIN the upgrade window in pg_wal/ (pinned at CN)
+ * so a streaming standby can pull it from the live upgraded primary.  It is
+ * dropped once the window is no longer needed (e.g. the standby has caught up).
+ */
+#define UPGRADE_WINDOW_SLOT		"pg_upgrade_window"
+
+/*
  * Enumeration to denote pg_log modes
  */
 typedef enum
@@ -306,6 +328,8 @@ typedef struct
 	char	   *dumpdir;		/* Dumps */
 	char	   *logdir;			/* Log files */
 	bool		isatty;			/* is stdout a tty */
+	/* WAL bytes generated during pg_restore (schema restore phase) */
+	uint64		pg_upgrade_wal_bytes;
 } LogOpts;
 
 
@@ -325,6 +349,19 @@ typedef struct
 	int			char_signedness;	/* default char signedness: -1 for initial
 									 * value, 1 for "signed" and 0 for
 									 * "unsigned" */
+	bool		initdb_new_cluster; /* run initdb to create the new cluster
+									 * before upgrading, instead of requiring
+									 * the user to have created it manually */
+
+	/*
+	 * capture the whole upgrade as a WAL-replayable full-page image at the
+	 * end and skip the on-disk data writes, so first startup reconstructs the
+	 * cluster purely from WAL (atomic, crash-safe, recoverable from an empty
+	 * data directory)
+	 */
+	bool		wal_upgrade;
+	/* revertable-upgrade lifecycle subcommand, if any (see enum above) */
+	RevertableOp revertable_op;
 } UserOpts;
 
 typedef struct
@@ -380,6 +417,11 @@ void		check_control_data(ControlData *oldctrl, ControlData *newctrl);
 void		disable_old_cluster(transferMode transfer_mode);
 
 
+/* revertable.c */
+
+void		perform_revertable_op(void);
+
+
 /* dump.c */
 
 void		generate_old_dump(void);
@@ -423,6 +465,7 @@ FileNameMap *gen_db_file_maps(DbInfo *old_db,
 							  DbInfo *new_db, int *nmaps, const char *old_pgdata,
 							  const char *new_pgdata);
 void		get_db_rel_and_slot_infos(ClusterInfo *cluster);
+void		get_template0_info(ClusterInfo *cluster);
 int			count_old_cluster_logical_slots(void);
 void		get_subscription_info(ClusterInfo *cluster);
 
@@ -454,6 +497,7 @@ char	   *cluster_conn_opts(ClusterInfo *cluster);
 
 bool		start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error);
 void		stop_postmaster(bool in_atexit);
+uint32		get_major_server_version(ClusterInfo *cluster);
 void		check_pghost_envvar(void);
 
 

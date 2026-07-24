@@ -1444,6 +1444,73 @@ SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied)
 }
 
 /*
+ * Restore one SLRU segment's worth of pages from a captured image during
+ * pg_upgrade --wal-upgrade WAL replay (XLOG_UPGRADE_SLRU_DATA redo).
+ *
+ * "segno" is the SLRU segment number; "data" is the raw segment image and
+ * "datalen" its length (a whole number of BLCKSZ pages, padded to a full
+ * segment by the emit side).  For each page the captured image is installed
+ * into a SimpleLru buffer, marked dirty, and flushed to disk immediately.
+ *
+ * The image is the final, merged CLOG/multixact state captured after the whole
+ * upgrade completed, so it is authoritative: it dominates anything an earlier
+ * replayed commit record wrote for the same page (this record is emitted last)
+ * and it does not depend on the on-disk SLRU segment file, which pg_upgrade has
+ * unlinked as part of skipping the disk writes.
+ *
+ * The SLRU directory (ctl->Dir) is recreated earlier in replay by the
+ * XLOG_UPGRADE_DIRTREE record (the logged after-image of the initdb directory
+ * tree), so it is guaranteed to exist by the time we write a segment here.
+ */
+void
+SlruUpgradeRestoreSegment(SlruDesc *ctl, int64 segno,
+						  const char *data, Size datalen)
+{
+	int			npages = (int) (datalen / BLCKSZ);
+	int64		basepage = segno * SLRU_PAGES_PER_SEGMENT;
+	SlruWriteAllData fdata;
+
+	/*
+	 * Write the whole segment through a single SlruWriteAll batch so the
+	 * segment file is opened once, not once per page.  Passing &fdata to
+	 * SlruInternalWritePage makes SlruPhysicalWritePage cache and reuse the
+	 * open fd across all of this segment's pages (exactly as
+	 * SimpleLruWriteAll does at checkpoint); we close it once at the end. All
+	 * pages of one segment share a bank on well-configured SLRUs, but acquire
+	 * the correct bank lock per page to stay correct regardless of bank
+	 * layout.
+	 */
+	fdata.num_files = 0;
+
+	for (int i = 0; i < npages; i++)
+	{
+		int64		pageno = basepage + i;
+		LWLock	   *lock = SimpleLruGetBankLock(ctl, pageno);
+		int			slotno;
+
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+
+		/* allocate/zero a buffer slot for this page, then overwrite it */
+		slotno = SimpleLruZeroPage(ctl, pageno);
+		memcpy(ctl->shared->page_buffer[slotno],
+			   data + (Size) i * BLCKSZ, BLCKSZ);
+		ctl->shared->page_dirty[slotno] = true;
+
+		/* persist through the batch (reuses the cached fd for this segment) */
+		SlruInternalWritePage(ctl, slotno, &fdata);
+
+		LWLockRelease(lock);
+	}
+
+	/* Close the fd(s) the batch left open. */
+	for (int i = 0; i < fdata.num_files; i++)
+	{
+		if (CloseTransientFile(fdata.fd[i]) != 0)
+			SlruReportIOError(ctl, basepage, NULL);
+	}
+}
+
+/*
  * Remove all segments before the one holding the passed page number
  *
  * All SLRUs prevent concurrent calls to this function, either with an LWLock

@@ -61,6 +61,7 @@
 /* Keyword tokens. */
 %token K_BASE_BACKUP
 %token K_IDENTIFY_SYSTEM
+%token K_PG_UPGRADE_WINDOW_ANCHOR
 %token K_READ_REPLICATION_SLOT
 %token K_SHOW
 %token K_START_REPLICATION
@@ -85,7 +86,7 @@
 %type <node>	base_backup start_replication start_logical_replication
 				create_replication_slot drop_replication_slot
 				alter_replication_slot identify_system read_replication_slot
-				timeline_history show upload_manifest
+				timeline_history show upload_manifest pg_upgrade_window_anchor
 %type <list>	generic_option_list
 %type <defelt>	generic_option
 %type <uintval>	opt_timeline
@@ -113,6 +114,7 @@ opt_semicolon:	';'
 
 command:
 			identify_system
+			| pg_upgrade_window_anchor
 			| base_backup
 			| start_replication
 			| start_logical_replication
@@ -132,6 +134,16 @@ identify_system:
 			K_IDENTIFY_SYSTEM
 				{
 					$$ = (Node *) makeNode(IdentifySystemCmd);
+				}
+			;
+
+/*
+ * PG_UPGRADE_WINDOW_ANCHOR
+ */
+pg_upgrade_window_anchor:
+			K_PG_UPGRADE_WINDOW_ANCHOR
+				{
+					$$ = (Node *) makeNode(PgUpgradeWindowAnchorCmd);
 				}
 			;
 
@@ -425,6 +437,7 @@ ident_or_keyword:
 			IDENT							{ $$ = $1; }
 			| K_BASE_BACKUP					{ $$ = "base_backup"; }
 			| K_IDENTIFY_SYSTEM				{ $$ = "identify_system"; }
+			| K_PG_UPGRADE_WINDOW_ANCHOR	{ $$ = "pg_upgrade_window_anchor"; }
 			| K_SHOW						{ $$ = "show"; }
 			| K_START_REPLICATION			{ $$ = "start_replication"; }
 			| K_CREATE_REPLICATION_SLOT	{ $$ = "create_replication_slot"; }

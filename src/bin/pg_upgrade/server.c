@@ -201,7 +201,50 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	 * win on ext4.
 	 */
 	if (cluster == &new_cluster)
-		appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");
+	{
+		/*
+		 * Turn off durability requirements to improve object creation speed.
+		 * For --wal-upgrade keep fsync and full_page_writes on: the smart
+		 * shutdown checkpoint then flushes complete page images to disk, so
+		 * all catalog pages are correct even with synchronous_commit off.
+		 */
+		if (user_opts.wal_upgrade)
+		{
+			/* keep fsync=on and full_page_writes=on for durability */
+			appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off");
+
+			/*
+			 * The end-of-upgrade window (CN checkpoint through
+			 * PG_UPGRADE_COMPLETE) must survive intact in pg_wal/ for first
+			 * startup and standby/PITR replay.  Its full-page images are as
+			 * large as the data (many GB, possibly TB), so checkpoints during
+			 * the burst must not recycle any of it.
+			 *
+			 * The size-independent guarantee is the UPGRADE_WINDOW_SLOT
+			 * physical slot (created before CN with immediately_reserve):
+			 * KeepLogSeg() pins every segment at/after its restart_lsn,
+			 * uncapped while max_slot_wal_keep_size is -1.  Set that here so
+			 * nothing bounds the window by size.  max_wal_size /
+			 * checkpoint_timeout stay large only to avoid needless checkpoint
+			 * churn during the burst.
+			 */
+			appendPQExpBufferStr(&pgoptions,
+								 " -c max_slot_wal_keep_size=-1"
+								 " -c max_wal_size=1TB"
+								 " -c checkpoint_timeout=1h");
+
+			/*
+			 * Window archiving (--archive-command) is configured in the new
+			 * cluster's postgresql.conf, not here: an archive_command's
+			 * spaces and shell metacharacters do not survive pg_ctl's "-o"
+			 * string, and postgresql.conf also makes the auto-served cluster
+			 * archive its post-upgrade tail.  See
+			 * write_wal_upgrade_archive_conf().
+			 */
+		}
+		else
+			appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");
+	}
 
 	/*
 	 * Use -b to disable autovacuum and logical replication launcher
@@ -309,7 +352,6 @@ stop_postmaster(bool in_atexit)
 
 	os_info.running_cluster = NULL;
 }
-
 
 /*
  * check_pghost_envvar()

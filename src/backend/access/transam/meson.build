@@ -6,6 +6,7 @@ backend_sources += files(
   'generic_xlog.c',
   'multixact.c',
   'parallel.c',
+  'pgupgrade_wal.c',
   'rmgr.c',
   'slru.c',
   'subtrans.c',

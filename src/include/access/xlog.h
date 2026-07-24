@@ -273,6 +273,37 @@ extern WALAvailability GetWALAvailability(XLogRecPtr targetLSN);
 extern void XLogPutNextOid(Oid nextOid);
 extern XLogRecPtr XLogRestorePoint(const char *rpName);
 extern XLogRecPtr XLogAssignLSN(void);
+
+/* pg_upgrade WAL markers */
+extern XLogRecPtr XLogWritePgUpgrade(bool is_start,
+									 uint32 old_major_version,
+									 uint32 new_major_version);
+
+/* SLRU bulk image for pg_upgrade WAL replay */
+extern XLogRecPtr XLogWriteUpgradeSlruData(uint8 slru_type);
+
+/* arm pg_control at CN for in-process --wal-upgrade recovery */
+struct CheckPoint;
+extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
+											 XLogRecPtr cn_lsn,
+											 uint64 wal_sysid,
+											 bool for_streaming);
+
+/* control-file checkpoint LSN, for the "upgrade already applied?" test */
+extern XLogRecPtr GetControlFileCheckPointLSN(void);
+
+/*
+ * informational DB_IN_UPGRADE flips during window replay (set at START,
+ * cleared back to DB_IN_PRODUCTION at COMPLETE) -- diagnostics only
+ */
+extern void SetControlFileInUpgrade(void);
+extern void ClearControlFileInUpgrade(void);
+extern void SynthesizeUpgradeStreamControlFile(bool allow_overwrite);
+
+/* emit the streaming-handoff trigger at shutdown if pg_upgrade armed it */
+extern void EmitPgUpgradeHandoffIfArmed(void);
+
+/* batched relation-file images live in access/pgupgrade_wal.h */
 extern void UpdateFullPageWrites(void);
 extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p);
 extern XLogRecPtr GetRedoRecPtr(void);
@@ -333,6 +364,8 @@ extern SessionBackupState get_backup_status(void);
 #define RECOVERY_SIGNAL_FILE	"recovery.signal"
 #define STANDBY_SIGNAL_FILE		"standby.signal"
 #define BACKUP_LABEL_FILE		"backup_label"
+/* armed by pg_upgrade --wal-upgrade-signal-handoff; consumed by ShutdownXLOG */
+#define PG_UPGRADE_HANDOFF_SIGNAL_FILE	"pg_upgrade_handoff.pending"
 #define BACKUP_LABEL_OLD		"backup_label.old"
 
 #define TABLESPACE_MAP			"tablespace_map"

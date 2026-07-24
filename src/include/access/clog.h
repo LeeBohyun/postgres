@@ -57,4 +57,7 @@ extern void clog_redo(XLogReaderState *record);
 extern void clog_desc(StringInfo buf, XLogReaderState *record);
 extern const char *clog_identify(uint8 info);
 
+/* restore captured CLOG segment during --wal-upgrade replay */
+extern void CLOGUpgradeRestoreSegment(int64 segno, const char *data, Size datalen);
+
 #endif							/* CLOG_H */

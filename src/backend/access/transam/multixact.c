@@ -2996,6 +2996,23 @@ multixact_redo(XLogReaderState *record)
 }
 
 /*
+ * Restore captured pg_multixact/offsets and pg_multixact/members segments
+ * during --wal-upgrade replay.  Thin wrappers exposing the static SLRU
+ * ctls to the RM_PG_UPGRADE_ID redo handler.
+ */
+void
+MultiXactOffsetUpgradeRestoreSegment(int64 segno, const char *data, Size datalen)
+{
+	SlruUpgradeRestoreSegment(MultiXactOffsetCtl, segno, data, datalen);
+}
+
+void
+MultiXactMemberUpgradeRestoreSegment(int64 segno, const char *data, Size datalen)
+{
+	SlruUpgradeRestoreSegment(MultiXactMemberCtl, segno, data, datalen);
+}
+
+/*
  * Entrypoint for sync.c to sync offsets files.
  */
 int

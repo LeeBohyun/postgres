@@ -2369,6 +2369,7 @@ PgStat_TableStatus
 PgStat_TableXactStatus
 PgStat_WalCounters
 PgStat_WalStats
+PgUpgradeWindowAnchorCmd
 PgXmlErrorContext
 PgXmlStrictness
 Pg_abi_values
@@ -2705,6 +2706,7 @@ ReturningClause
 ReturningExpr
 ReturningOption
 ReturningOptionKind
+RevertableOp
 RevmapContents
 RevokeRoleGrantAction
 RewriteMappingDataEntry
@@ -2941,6 +2943,7 @@ SlruErrorCause
 SlruOpts
 SlruPageStatus
 SlruScanCallback
+SlruSegInfo
 SlruSegState
 SlruShared
 SlruSharedData
@@ -3336,12 +3339,14 @@ UnresolvedTup
 UnresolvedTupData
 UpdateContext
 UpdateStmt
+UpgradeRelfileBatch
 UpgradeTask
 UpgradeTaskProcessCB
 UpgradeTaskReport
 UpgradeTaskSlot
 UpgradeTaskSlotState
 UpgradeTaskStep
+UpgradeWalReadPrivate
 UploadManifestCmd
 UpperRelationKind
 UserAuth

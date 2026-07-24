@@ -227,6 +227,10 @@ extern int	SimpleLruReadPage_ReadOnly(SlruDesc *ctl, int64 pageno,
 									   const void *opaque_data);
 extern void SimpleLruWritePage(SlruDesc *ctl, int slotno);
 extern void SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied);
+
+/* restore a captured SLRU segment image during --wal-upgrade replay */
+extern void SlruUpgradeRestoreSegment(SlruDesc *ctl, int64 segno,
+									  const char *data, Size datalen);
 #ifdef USE_ASSERT_CHECKING
 extern void SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page);
 #else

@@ -378,6 +378,63 @@ checkDataDir(void)
 	data_directory_mode = pg_dir_create_mode;
 #endif
 
+	/*
+	 * --wal-upgrade streaming standby without initdb.  Before the PG_VERSION
+	 * / pg_control gates, if this data directory is a bare upgrade-stream
+	 * skeleton (the pg_upgrade_stream.signal sentinel is present) with a
+	 * primary to stream from (primary_conninfo set) and no PG_VERSION yet,
+	 * synthesize PG_VERSION + global/pg_control from this binary's constants
+	 * so the pre-start gates pass.  All data is then streamed from the
+	 * primary. Gated on the sentinel so an ordinary un-initdb'd directory
+	 * still fails at ValidatePgVersion() below.
+	 */
+	{
+		char		streamsig[MAXPGPATH];
+		char		recsig[MAXPGPATH];
+		char		upgradesig[MAXPGPATH];
+		char		verpath[MAXPGPATH];
+		struct stat st;
+
+		snprintf(streamsig, sizeof(streamsig), "%s/pg_upgrade_stream.signal", DataDir);
+		snprintf(recsig, sizeof(recsig), "%s/%s", DataDir, RECOVERY_SIGNAL_FILE);
+		snprintf(upgradesig, sizeof(upgradesig), "%s/pg_upgrade_recovery.signal", DataDir);
+		snprintf(verpath, sizeof(verpath), "%s/PG_VERSION", DataDir);
+
+		if (stat(verpath, &st) != 0 && stat(streamsig, &st) == 0 &&
+			PrimaryConnInfo != NULL && PrimaryConnInfo[0] != '\0')
+		{
+			/*
+			 * Streaming standby: bare skeleton, window arrives from the
+			 * primary.
+			 */
+			SynthesizeUpgradeStreamControlFile(false);
+		}
+		else if (stat(recsig, &st) == 0 && stat(upgradesig, &st) == 0)
+		{
+			/*
+			 * ARCHIVE-PITR cross-version recovery (Phase 2).  The data
+			 * directory here is a pre-upgrade base backup that Phase 1 (the
+			 * OLD binary) replayed up to the upgrade boundary and shut down,
+			 * so it still carries the OLD major's pg_control/PG_VERSION --
+			 * which this NEW binary would reject at the version gate below.
+			 * This keys off the ordinary recovery.signal (this IS an archive
+			 * restore) plus the pg_upgrade_recovery.signal sentinel dropped
+			 * alongside the staged upgrade window: only a genuine
+			 * cross-version upgrade-PITR has both, so a normal same-version
+			 * PITR (recovery.signal but no sentinel) is never affected.  A
+			 * plain stat() matches how the backend already selects recovery
+			 * mode (see readRecoverySignalFile()); the authoritative check
+			 * that a complete window is really present is left to
+			 * PerformWalUpgradeIfNeeded(), which FATALs on a partial window.
+			 * Synthesize a NEW-version pg_control from this binary's
+			 * constants so the gate passes; recovery then re-anchors at CN,
+			 * adopts the window's sysid, and replays the window + archived
+			 * tail.
+			 */
+			SynthesizeUpgradeStreamControlFile(true);
+		}
+	}
+
 	/* Check for PG_VERSION */
 	ValidatePgVersion(DataDir);
 }

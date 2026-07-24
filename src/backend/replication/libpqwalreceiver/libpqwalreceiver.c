@@ -64,6 +64,7 @@ static void libpqrcv_get_senderinfo(WalReceiverConn *conn,
 									char **sender_host, int *sender_port);
 static char *libpqrcv_identify_system(WalReceiverConn *conn,
 									  TimeLineID *primary_tli);
+static char *libpqrcv_upgrade_window_anchor(WalReceiverConn *conn);
 static char *libpqrcv_get_dbname_from_conninfo(const char *connInfo);
 static char *libpqrcv_get_option_from_conninfo(const char *connInfo,
 											   const char *keyword);
@@ -101,6 +102,7 @@ static WalReceiverFunctionsType PQWalReceiverFunctions = {
 	.walrcv_get_conninfo = libpqrcv_get_conninfo,
 	.walrcv_get_senderinfo = libpqrcv_get_senderinfo,
 	.walrcv_identify_system = libpqrcv_identify_system,
+	.walrcv_upgrade_window_anchor = libpqrcv_upgrade_window_anchor,
 	.walrcv_server_version = libpqrcv_server_version,
 	.walrcv_readtimelinehistoryfile = libpqrcv_readtimelinehistoryfile,
 	.walrcv_startstreaming = libpqrcv_startstreaming,
@@ -455,6 +457,47 @@ libpqrcv_identify_system(WalReceiverConn *conn, TimeLineID *primary_tli)
 	PQclear(res);
 
 	return primary_sysid;
+}
+
+/*
+ * Run PG_UPGRADE_WINDOW_ANCHOR on the primary and return the retained
+ * --wal-upgrade window anchor ("<cn_hi>/<cn_lo>/<redo_hi>/<redo_lo>"), or
+ * NULL if the primary retains no window (NULL column).  Like IDENTIFY_SYSTEM,
+ * this is a replication-protocol command run directly on the replication
+ * connection -- it needs no database connection, so it does NOT go through
+ * libpqrcv_exec (which requires one).
+ */
+static char *
+libpqrcv_upgrade_window_anchor(WalReceiverConn *conn)
+{
+	PGresult   *res;
+	char	   *anchor = NULL;
+
+	res = libpqsrv_exec(conn->streamConn,
+						"PG_UPGRADE_WINDOW_ANCHOR",
+						WAIT_EVENT_LIBPQWALRECEIVER_RECEIVE);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		/*
+		 * A primary that predates this command reports an error; surface it
+		 * to the caller (which treats it as "no auto-fetch available" and
+		 * falls back) rather than crashing.
+		 */
+		char	   *err = pchomp(PQerrorMessage(conn->streamConn));
+
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("could not get pg_upgrade window anchor from the primary server: %s",
+						err)));
+	}
+
+	if (PQntuples(res) == 1 && PQnfields(res) >= 1 && !PQgetisnull(res, 0, 0))
+		anchor = pstrdup(PQgetvalue(res, 0, 0));
+	/* else: primary retains no window -> return NULL */
+
+	PQclear(res);
+	return anchor;
 }
 
 /*

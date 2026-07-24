@@ -302,6 +302,19 @@ static bool backupEndRequired = false;
  */
 bool		reachedConsistency = false;
 
+/*
+ * True while replaying a pg_upgrade --wal-upgrade window.  While set, hot
+ * standby must NOT go active: the cluster is only half-upgraded (new catalogs
+ * partially applied), so no read-only connection may observe it.  Normally set
+ * by the XLOG_UPGRADE_START redo and cleared by XLOG_UPGRADE_COMPLETE
+ * (pg_upgrade_redo()).  For a streaming standby staged without initdb it is set
+ * even earlier -- at arm time in PerformWalUpgradeIfNeeded(), before any record
+ * replays -- because such a skeleton has no shared catalogs on disk until the
+ * window streams in, so it must not admit connections in the gap before
+ * XLOG_UPGRADE_START.
+ */
+bool		pgUpgradeReplayInProgress = false;
+
 /* Buffers dedicated to consistency checks of size BLCKSZ */
 static char *replay_image_masked = NULL;
 static char *primary_image_masked = NULL;
@@ -2233,6 +2246,7 @@ CheckRecoveryConsistency(void)
 	if (standbyState == STANDBY_SNAPSHOT_READY &&
 		!LocalHotStandbyActive &&
 		reachedConsistency &&
+		!pgUpgradeReplayInProgress &&
 		IsUnderPostmaster)
 	{
 		SpinLockAcquire(&XLogRecoveryCtl->info_lck);

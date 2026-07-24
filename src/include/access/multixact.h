@@ -152,6 +152,10 @@ extern void multixact_twophase_postabort(FullTransactionId fxid, uint16 info,
 extern void multixact_redo(XLogReaderState *record);
 extern void multixact_desc(StringInfo buf, XLogReaderState *record);
 extern const char *multixact_identify(uint8 info);
+
+/* restore captured multixact SLRU segments during --wal-upgrade replay */
+extern void MultiXactOffsetUpgradeRestoreSegment(int64 segno, const char *data, Size datalen);
+extern void MultiXactMemberUpgradeRestoreSegment(int64 segno, const char *data, Size datalen);
 extern char *mxid_to_string(MultiXactId multi, int nmembers,
 							MultiXactMember *members);
 extern char *mxstatus_to_string(MultiXactStatus status);

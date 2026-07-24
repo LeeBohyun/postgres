@@ -24,6 +24,7 @@ OBJS = \
 	parallel.o \
 	pg_upgrade.o \
 	relfilenumber.o \
+	revertable.o \
 	server.o \
 	slru_io.o \
 	tablespace.o \
