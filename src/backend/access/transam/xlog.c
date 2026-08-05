@@ -9426,10 +9426,21 @@ XLogWriteUpgradeSlruData(uint8 slru_type)
  *     XLogUpgradeRelinkBatchEnd(&b);
  *
  * The batch is capped a little below XLogRecordMaxSize to leave room for the
- * XLogRecord header.
+ * XLogRecord header.  One entry is 20 bytes, so a full record would hold some
+ * 53 million of them; the cap exists for correctness at absurd file counts, not
+ * because it is expected to be reached.  Past it XLogUpgradeBatchFlush() simply
+ * starts another record.
  */
-#define UPGRADE_RELFILE_BATCH_CAP \
+#define UPGRADE_RELINK_BATCH_CAP \
 	((Size) ((XLogRecordMaxSize / BLCKSZ - 2) * (Size) BLCKSZ))
+
+/*
+ * Initial manifest buffer.  The entry count scales with the number of user
+ * relation *files* -- forks and 1GB segments each count -- so it is unbounded in
+ * principle but tiny in practice; grow on demand rather than allocating the cap
+ * up front.
+ */
+#define UPGRADE_RELINK_BATCH_INIT	((Size) (64 * 1024))
 
 /*
  * Flush the accumulated batch as one WAL record of type "info"
@@ -9562,14 +9573,14 @@ XLogUpgradeCaptureRelfile(const char *path, Oid tsoid, Oid dboid,
  * files the window omits.  Each entry is a fixed-size identity; no file data.
  * Redo links each from the standby's old datadir into the new skeleton.
  *
- * Uses the same payload cap as the relfile batch (UPGRADE_RELFILE_BATCH_CAP):
- * both accumulate into the same WAL-record payload limit.
+ * The buffer starts small and doubles as entries arrive, up to
+ * UPGRADE_RELINK_BATCH_CAP, at which point the batch is flushed as one record.
  */
 void
 XLogUpgradeRelinkBatchBegin(UpgradeRelfileBatch *b, uint8 xfer_mode)
 {
-	b->buf = palloc(UPGRADE_RELFILE_BATCH_CAP);
-	b->cap = UPGRADE_RELFILE_BATCH_CAP;
+	b->buf = palloc(UPGRADE_RELINK_BATCH_INIT);
+	b->cap = UPGRADE_RELINK_BATCH_INIT;
 	b->used = 0;
 	b->nentries = 0;
 	b->nrecords = 0;
@@ -9584,7 +9595,22 @@ XLogUpgradeRelinkBatchAdd(UpgradeRelfileBatch *b, Oid tsoid, Oid dboid,
 	xl_upgrade_relink_entry ent;
 
 	if (b->used + SizeOfXLUpgradeRelinkEntry > b->cap)
-		XLogUpgradeBatchFlush(b, XLOG_UPGRADE_RELINK);
+	{
+		/*
+		 * Grow while there is headroom below the record cap; only once the
+		 * buffer has reached the cap does the batch become a WAL record and
+		 * start over.
+		 */
+		if (b->cap < UPGRADE_RELINK_BATCH_CAP)
+		{
+			Size		newcap = Min(b->cap * 2, UPGRADE_RELINK_BATCH_CAP);
+
+			b->buf = repalloc(b->buf, newcap);
+			b->cap = newcap;
+		}
+		else
+			XLogUpgradeBatchFlush(b, XLOG_UPGRADE_RELINK);
+	}
 
 	/* zero the struct so alignment padding is never uninitialized WAL */
 	memset(&ent, 0, sizeof(ent));
