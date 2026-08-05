@@ -42,6 +42,7 @@ extern RelFileNumber RelationMapOidToFilenumberForDatabase(char *dbpath,
 														   Oid relationId);
 extern void RelationMapCopy(Oid dbid, Oid tsid, char *srcdbpath,
 							char *dstdbpath);
+extern void RelationMapLogFromDir(Oid dbid, Oid tsid, char *dbpath);
 extern void RelationMapUpdateMap(Oid relationId, RelFileNumber fileNumber,
 								 bool shared, bool immediate);
 

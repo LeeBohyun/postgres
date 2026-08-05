@@ -97,6 +97,15 @@ static int	wal_segsize_val;
 static bool char_signedness_given = false;
 static bool char_signedness_val;
 
+/*
+ * --wal-upgrade-exact: make the -l/--next-wal-file target authoritative so the
+ * new WAL start position can be forced DOWN (not just floored upward over the
+ * existing pg_wal/ segments and the current checkpoint).  Intended for internal
+ * use by "pg_upgrade --wal-upgrade", which must land the end-of-upgrade
+ * checkpoint (CN) at a byte-deterministic segment boundary.
+ */
+static bool wal_upgrade_exact = false;
+
 
 static TimeLineID minXlogTli = 0;
 static XLogSegNo minXlogSegNo = 0;
@@ -135,6 +144,7 @@ main(int argc, char *argv[])
 		{"next-transaction-id", required_argument, NULL, 'x'},
 		{"wal-segsize", required_argument, NULL, 1},
 		{"char-signedness", required_argument, NULL, 2},
+		{"wal-upgrade-exact", no_argument, NULL, 3},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -352,6 +362,10 @@ main(int argc, char *argv[])
 					break;
 				}
 
+			case 3:
+				wal_upgrade_exact = true;
+				break;
+
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -377,6 +391,13 @@ main(int argc, char *argv[])
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
+
+	/*
+	 * --wal-upgrade-exact makes the -l target authoritative, so it is
+	 * meaningless (and almost certainly a mistake) without -l.
+	 */
+	if (wal_upgrade_exact && log_fname == NULL)
+		pg_fatal("option --wal-upgrade-exact requires -l/--next-wal-file");
 
 	/*
 	 * Don't allow pg_resetwal to be run as root, to avoid overwriting the
@@ -510,7 +531,18 @@ main(int argc, char *argv[])
 	if (char_signedness_given)
 		ControlFile.default_char_signedness = char_signedness_val;
 
-	if (minXlogSegNo > newXlogSegNo)
+	if (wal_upgrade_exact)
+	{
+		/*
+		 * The -l target is authoritative: force the new WAL start to exactly
+		 * that segment, overriding the FindEndOfXLOG floor.  This is the only
+		 * way to move the position DOWN (below the current checkpoint / the
+		 * highest existing pg_wal/ segment), which pg_upgrade --wal-upgrade
+		 * needs to land CN at a byte-deterministic boundary.
+		 */
+		newXlogSegNo = minXlogSegNo;
+	}
+	else if (minXlogSegNo > newXlogSegNo)
 		newXlogSegNo = minXlogSegNo;
 
 	if (noupdate)
@@ -1238,6 +1270,14 @@ usage(void)
 	printf(_("  -x, --next-transaction-id=XID    set next transaction ID\n"));
 	printf(_("      --char-signedness=OPTION     set char signedness to \"signed\" or \"unsigned\"\n"));
 	printf(_("      --wal-segsize=SIZE           size of WAL segments, in megabytes\n"));
+
+	/*
+	 * --wal-upgrade-exact is intentionally NOT listed here: it is an internal
+	 * implementation detail of pg_upgrade --wal-upgrade (it forces the -l
+	 * target downward so the end-of-upgrade checkpoint lands at a
+	 * byte-deterministic boundary), not a user-facing option.  Kept
+	 * undocumented like other binary-upgrade-only machinery.
+	 */
 
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
 	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);

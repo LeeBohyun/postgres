@@ -1970,6 +1970,7 @@ PGP_S2K
 PGPing
 PGQueryClass
 PGRUsage
+PGReflinkResult
 PGSemaphore
 PGSemaphoreData
 PGShmemHeader
@@ -2369,11 +2370,14 @@ PgStat_TableStatus
 PgStat_TableXactStatus
 PgStat_WalCounters
 PgStat_WalStats
+PgUpgradeTransferMode
 PgXmlErrorContext
 PgXmlStrictness
 Pg_abi_values
 Pg_finfo_record
 Pg_magic_struct
+PhysicalSlotInfo
+PhysicalSlotInfoArr
 PipeProtoChunk
 PipeProtoHeader
 PlaceHolderInfo
@@ -2705,6 +2709,7 @@ ReturningClause
 ReturningExpr
 ReturningOption
 ReturningOptionKind
+RevertableOp
 RevmapContents
 RevokeRoleGrantAction
 RewriteMappingDataEntry
@@ -2941,6 +2946,7 @@ SlruErrorCause
 SlruOpts
 SlruPageStatus
 SlruScanCallback
+SlruSegInfo
 SlruSegState
 SlruShared
 SlruSharedData
@@ -3336,12 +3342,14 @@ UnresolvedTup
 UnresolvedTupData
 UpdateContext
 UpdateStmt
+UpgradeRelfileBatch
 UpgradeTask
 UpgradeTaskProcessCB
 UpgradeTaskReport
 UpgradeTaskSlot
 UpgradeTaskSlotState
 UpgradeTaskStep
+UpgradeWalReadPrivate
 UploadManifestCmd
 UpperRelationKind
 UserAuth
@@ -4521,6 +4529,8 @@ xl_multixact_create
 xl_multixact_truncate
 xl_overwrite_contrecord
 xl_parameter_change
+xl_pg_upgrade
+xl_pg_upgrade_handoff
 xl_relmap_update
 xl_replorigin_drop
 xl_replorigin_set
@@ -4534,6 +4544,9 @@ xl_standby_locks
 xl_tblspc_create_rec
 xl_tblspc_drop_rec
 xl_testcustomrmgrs_message
+xl_upgrade_dirtree
+xl_upgrade_rawfile
+xl_upgrade_relink_entry
 xl_xact_abort
 xl_xact_assignment
 xl_xact_commit

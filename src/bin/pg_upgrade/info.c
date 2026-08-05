@@ -21,7 +21,6 @@ static void create_rel_filename_map(const char *old_data, const char *new_data,
 static void report_unmatched_relation(const RelInfo *rel, const DbInfo *db,
 									  bool is_new_db);
 static void free_db_and_rel_infos(DbInfoArr *db_arr);
-static void get_template0_info(ClusterInfo *cluster);
 static void get_db_infos(ClusterInfo *cluster);
 static char *get_rel_infos_query(void);
 static void process_rel_infos(DbInfo *dbinfo, PGresult *res, void *arg);
@@ -328,7 +327,7 @@ get_db_rel_and_slot_infos(ClusterInfo *cluster)
  * Get information about template0, which will be copied from the old cluster
  * to the new cluster.
  */
-static void
+void
 get_template0_info(ClusterInfo *cluster)
 {
 	PGconn	   *conn = connectToServer(cluster, "template1");
@@ -830,6 +829,90 @@ count_old_cluster_logical_slots(void)
 		slot_count += old_cluster.dbarr.dbs[dbnum].slot_arr.nslots;
 
 	return slot_count;
+}
+
+/*
+ * get_old_cluster_physical_slot_infos()
+ *
+ * Gather the old cluster's physical replication slots so --wal-upgrade can
+ * recreate them on the new cluster.  Stock pg_upgrade does NOT migrate physical
+ * slots: before --wal-upgrade a standby could not follow the upgrade at all
+ * (it was rebuilt from scratch), so its slot was pointless to carry.  With
+ * --wal-upgrade the standby follows by streaming the upgrade window, so its
+ * slot becomes meaningful across the boundary -- migrating it preserves both
+ * the standby's slot identity (HA tooling / primary_slot_name keep working)
+ * and, because the recreated slot is reserved before CN, the window retention
+ * itself.  It is the only slot that pins the window; with no physical slot,
+ * --wal-upgrade has no streaming consumer and the window is not pinned.
+ *
+ * Physical slots are cluster-wide (not database-scoped) and carry no decoding
+ * state, so a single query over pg_replication_slots suffices.  Temporary and
+ * invalidated ("lost") slots are skipped: temporary slots cannot survive the
+ * start/stop cycles of the upgrade, and an invalidated slot has no usable
+ * restart_lsn to recreate.  Assumes the old server is running.
+ */
+void
+get_old_cluster_physical_slot_infos(void)
+{
+	PGconn	   *conn;
+	PGresult   *res;
+	PhysicalSlotInfo *slotinfos = NULL;
+	int			num_slots;
+
+	old_cluster.phys_slot_arr.slots = NULL;
+	old_cluster.phys_slot_arr.nslots = 0;
+
+	/* Only relevant to --wal-upgrade. */
+	if (!user_opts.wal_upgrade)
+		return;
+
+	conn = connectToServer(&old_cluster, "template1");
+
+	/*
+	 * Skip invalidated slots so we do not try to recreate a dead one.  The
+	 * pg_replication_slots.invalidation_reason column only exists in PG17+,
+	 * so gate the predicate on the old cluster's version -- otherwise the
+	 * query would error on an older major and abort the whole upgrade.  On
+	 * older majors we simply enumerate all physical slots; recreation below
+	 * is best-effort and warns rather than fails, so a slot that turns out to
+	 * be unusable does not stop the upgrade.
+	 *
+	 * Exclude the internal "pg_conflict_detection" slot: since PG19 the
+	 * conflict-detection slot for retain_dead_tuples subscriptions is a
+	 * cluster-wide (physical) slot, so it shows up here, but its name is
+	 * reserved -- pg_create_physical_replication_slot() rejects it -- and
+	 * pg_upgrade recreates it separately via its own path.  Migrating it here
+	 * would only emit a spurious warning and, if it were the sole physical
+	 * slot, make us believe a standby consumer exists (and try to pin the
+	 * window) when none does.
+	 */
+	res = executeQueryOrDie(conn,
+							"SELECT slot_name "
+							"FROM pg_catalog.pg_replication_slots "
+							"WHERE slot_type = 'physical' AND "
+							"temporary IS FALSE AND "
+							"slot_name <> 'pg_conflict_detection'%s",
+							GET_MAJOR_VERSION(old_cluster.major_version) >= 1700 ?
+							" AND invalidation_reason IS NULL" : "");
+
+	num_slots = PQntuples(res);
+
+	if (num_slots)
+	{
+		int			i_slotname = PQfnumber(res, "slot_name");
+
+		slotinfos = pg_malloc_array(PhysicalSlotInfo, num_slots);
+
+		for (int slotnum = 0; slotnum < num_slots; slotnum++)
+			slotinfos[slotnum].slotname =
+				pg_strdup(PQgetvalue(res, slotnum, i_slotname));
+	}
+
+	PQclear(res);
+	PQfinish(conn);
+
+	old_cluster.phys_slot_arr.slots = slotinfos;
+	old_cluster.phys_slot_arr.nslots = num_slots;
 }
 
 /*

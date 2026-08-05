@@ -150,6 +150,13 @@ extern PGDLLIMPORT TimeLineID recoveryTargetTLI;
 /* Have we already reached a consistent database state? */
 extern PGDLLIMPORT bool reachedConsistency;
 
+/*
+ * Set while replaying a pg_upgrade --wal-upgrade window (between
+ * XLOG_UPGRADE_START and XLOG_UPGRADE_COMPLETE).  Suppresses hot standby
+ * activation so no read-only connection sees a half-upgraded cluster.
+ */
+extern PGDLLIMPORT bool pgUpgradeReplayInProgress;
+
 /* Are we currently in standby mode? */
 extern PGDLLIMPORT bool StandbyMode;
 

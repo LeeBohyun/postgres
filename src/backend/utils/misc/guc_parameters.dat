@@ -2361,6 +2361,21 @@
   max => 'INT_MAX',
 },
 
+{ name => 'pg_upgrade_standby_old_datadir', type => 'string', context => 'PGC_POSTMASTER', group => 'REPLICATION_STANDBY',
+  short_desc => 'Sets the path of this standby\'s retained pre-upgrade data directory for pg_upgrade --wal-upgrade.',
+  flags => 'GUC_SUPERUSER_ONLY',
+  variable => 'pg_upgrade_standby_old_datadir',
+  boot_val => '""',
+},
+
+{ name => 'pg_upgrade_standby_transfer_mode', type => 'enum', context => 'PGC_POSTMASTER', group => 'REPLICATION_STANDBY',
+  short_desc => 'Sets how a pg_upgrade --wal-upgrade streaming standby places user relation files.',
+  long_desc => 'The default, mirror, reproduces the transfer mode the upgraded primary used; the others override it on this standby.',
+  variable => 'pg_upgrade_standby_transfer_mode',
+  boot_val => 'PG_UPGRADE_XFER_MIRROR',
+  options => 'pg_upgrade_standby_transfer_mode_options',
+},
+
 { name => 'plan_cache_mode', type => 'enum', context => 'PGC_USERSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Controls the planner\'s selection of custom or generic plan.',
   long_desc => 'Prepared statements can have custom and generic plans, and the planner will attempt to choose which is better.  This can be set to override the default behavior.',

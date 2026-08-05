@@ -11,6 +11,7 @@
 
 #include "postgres.h"
 
+#include "access/pgupgrade_wal.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/binary_upgrade.h"
@@ -432,6 +433,35 @@ binary_upgrade_create_conflict_detection_slot(PG_FUNCTION_ARGS)
 	CreateConflictDetectionSlot();
 
 	ReplicationSlotRelease();
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * binary_upgrade_emit_wal_window
+ *
+ * pg_upgrade --wal-upgrade: emit the whole upgrade window (CN..COMPLETE) as WAL
+ * in a single call.  The frontend invokes this once, on the burst server it
+ * started in binary-upgrade mode; the whole capture runs inside this one call
+ * rather than through separate SQL-exposed WAL-injection primitives.  Gated on
+ * IsBinaryUpgrade so the WAL-generation machinery is never reachable as SQL on
+ * an ordinary cluster.
+ *
+ * Args: old_major_version int4, new_major_version int4, transfer_mode int4,
+ *       skip_complete bool (test-only: omit the COMPLETE marker to simulate a
+ *       crash mid-window).
+ */
+Datum
+binary_upgrade_emit_wal_window(PG_FUNCTION_ARGS)
+{
+	uint32		old_major = PG_GETARG_UINT32(0);
+	uint32		new_major = PG_GETARG_UINT32(1);
+	uint8		transfer_mode = (uint8) PG_GETARG_INT32(2);
+	bool		skip_complete = PG_GETARG_BOOL(3);
+
+	CHECK_IS_BINARY_UPGRADE;
+
+	EmitUpgradeWalWindow(old_major, new_major, transfer_mode, skip_complete);
 
 	PG_RETURN_VOID();
 }

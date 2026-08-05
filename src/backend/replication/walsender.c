@@ -53,6 +53,7 @@
 
 #include "access/timeline.h"
 #include "access/transam.h"
+#include "access/pgupgrade_wal.h"
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"

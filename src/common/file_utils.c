@@ -23,7 +23,15 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef HAVE_COPYFILE_H
+#include <copyfile.h>
+#endif
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#endif
 
+#include "common/file_perm.h"
 #include "common/file_utils.h"
 #ifdef FRONTEND
 #include "common/logging.h"
@@ -747,4 +755,120 @@ pg_pwrite_zeros(int fd, size_t size, pgoff_t offset)
 	Assert(total_written == size);
 
 	return total_written;
+}
+
+/*
+ * pg_clone_file -- create "dst" as a reflink (copy-on-write) clone of "src".
+ *
+ * Uses copyfile(COPYFILE_CLONE_FORCE) where available (macOS), else
+ * ioctl(FICLONE) (Linux).  "dst" must not already exist.  Returns
+ * PG_REFLINK_UNSUPPORTED when the build has neither primitive,
+ * PG_REFLINK_ERROR (with *save_errno set) on a syscall failure -- in which case
+ * a partially created "dst" has been unlinked -- and PG_REFLINK_OK on success.
+ *
+ * Shared by pg_upgrade's file transfer and the backend --wal-upgrade relink
+ * replay so the two reproduce identical on-disk results.
+ */
+PGReflinkResult
+pg_clone_file(const char *src, const char *dst, int *save_errno)
+{
+	*save_errno = 0;
+
+#if defined(HAVE_COPYFILE) && defined(COPYFILE_CLONE_FORCE)
+	if (copyfile(src, dst, NULL, COPYFILE_CLONE_FORCE) < 0)
+	{
+		*save_errno = errno;
+		return PG_REFLINK_ERROR;
+	}
+	return PG_REFLINK_OK;
+#elif defined(__linux__) && defined(FICLONE)
+	{
+		int			src_fd;
+		int			dst_fd;
+
+		if ((src_fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
+		{
+			*save_errno = errno;
+			return PG_REFLINK_ERROR;
+		}
+		if ((dst_fd = open(dst, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
+						   pg_file_create_mode)) < 0)
+		{
+			*save_errno = errno;
+			close(src_fd);
+			return PG_REFLINK_ERROR;
+		}
+		if (ioctl(dst_fd, FICLONE, src_fd) < 0)
+		{
+			*save_errno = errno;
+			close(dst_fd);
+			close(src_fd);
+			unlink(dst);
+			return PG_REFLINK_ERROR;
+		}
+		close(dst_fd);
+		close(src_fd);
+		return PG_REFLINK_OK;
+	}
+#else
+	return PG_REFLINK_UNSUPPORTED;
+#endif
+}
+
+/*
+ * pg_copy_file_range_all -- copy the whole of "src" to a new file "dst" using
+ * copy_file_range(2) (a server-side / reflink-capable copy on supporting
+ * filesystems).  "dst" must not already exist.  Return codes match
+ * pg_clone_file().
+ *
+ * Shared by pg_upgrade's file transfer and the backend --wal-upgrade relink
+ * replay.
+ */
+PGReflinkResult
+pg_copy_file_range_all(const char *src, const char *dst, int *save_errno)
+{
+	*save_errno = 0;
+
+#if defined(HAVE_COPY_FILE_RANGE)
+	{
+		int			src_fd;
+		int			dst_fd;
+
+		if ((src_fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
+		{
+			*save_errno = errno;
+			return PG_REFLINK_ERROR;
+		}
+		if ((dst_fd = open(dst, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
+						   pg_file_create_mode)) < 0)
+		{
+			*save_errno = errno;
+			close(src_fd);
+			return PG_REFLINK_ERROR;
+		}
+
+		/* Loop until copy_file_range() reports end-of-file (a 0 return). */
+		for (;;)
+		{
+			ssize_t		nbytes = copy_file_range(src_fd, NULL, dst_fd, NULL,
+												 SSIZE_MAX, 0);
+
+			if (nbytes < 0)
+			{
+				*save_errno = errno;
+				close(dst_fd);
+				close(src_fd);
+				unlink(dst);
+				return PG_REFLINK_ERROR;
+			}
+			if (nbytes == 0)
+				break;
+		}
+		close(dst_fd);
+		close(src_fd);
+		return PG_REFLINK_OK;
+	}
+#else
+	return PG_REFLINK_UNSUPPORTED;
+#endif
 }

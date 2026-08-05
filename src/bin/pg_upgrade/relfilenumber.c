@@ -614,5 +614,6 @@ transfer_relfile(FileNameMap *map, const char *type_suffix)
 				pg_fatal("should never happen");
 				break;
 		}
+
 	}
 }

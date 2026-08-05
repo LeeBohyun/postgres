@@ -383,6 +383,14 @@
 
 #primary_conninfo = ''                  # connection string to sending server
 #primary_slot_name = ''                 # replication slot on sending server
+#pg_upgrade_standby_transfer_mode = 'mirror'    # how a --wal-upgrade streaming standby
+                                        # places user files: 'mirror' (match the
+                                        # primary), 'copy', 'clone',
+                                        # 'copy_file_range', 'link', 'swap'
+                                        # (change requires restart)
+#pg_upgrade_standby_old_datadir = ''            # retained pre-upgrade data directory to
+                                        # link user relations from
+                                        # (change requires restart)
 #hot_standby = on                       # "off" disallows queries during recovery
                                         # (change requires restart)
 #max_standby_archive_delay = 30s        # max delay before canceling queries

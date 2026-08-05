@@ -101,6 +101,7 @@ char	   *PrimaryConnInfo = NULL;
 char	   *PrimarySlotName = NULL;
 bool		wal_receiver_create_temp_slot = false;
 
+
 /*
  * recoveryTargetTimeLineGoal: what the user requested, if any
  *
@@ -301,6 +302,19 @@ static bool backupEndRequired = false;
  * which then sets it to true upon receiving the signal.
  */
 bool		reachedConsistency = false;
+
+/*
+ * True while replaying a pg_upgrade --wal-upgrade window.  While set, hot
+ * standby must not go active: the cluster is only half-upgraded (new catalogs
+ * partially applied), so no read-only connection may observe it.  Normally set
+ * by the XLOG_UPGRADE_START redo and cleared by XLOG_UPGRADE_COMPLETE
+ * (pg_upgrade_redo()).  For a streaming standby staged without initdb it is set
+ * even earlier -- at arm time in PerformWalUpgradeIfNeeded(), before any record
+ * replays -- because such a skeleton has no shared catalogs on disk until the
+ * window streams in, so it must not admit connections in the gap before
+ * XLOG_UPGRADE_START.
+ */
+bool		pgUpgradeReplayInProgress = false;
 
 /* Buffers dedicated to consistency checks of size BLCKSZ */
 static char *replay_image_masked = NULL;
@@ -1816,6 +1830,23 @@ PerformWalRecovery(void)
 						(errmsg("requested recovery stop point is before consistent recovery point")));
 
 			/*
+			 * Refuse to stop inside a --wal-upgrade window.
+			 * pgUpgradeReplayInProgress is set at the window's
+			 * XLOG_UPGRADE_START and cleared only at XLOG_UPGRADE_COMPLETE,
+			 * so if it is still set here the recovery target landed between
+			 * them: the catalog is only half-upgraded. Promoting (or pausing
+			 * then promoting) would open that half-applied cluster
+			 * read-write.  There is no consistent cluster to expose at an
+			 * intra-window point, so fail rather than come up corrupt; the
+			 * operator must choose a target at or after the upgrade.
+			 */
+			if (pgUpgradeReplayInProgress)
+				ereport(FATAL,
+						(errmsg("requested recovery stop point is inside a pg_upgrade window"),
+						 errdetail("The upgrade has begun but not completed at this point, so the cluster would be only partially upgraded."),
+						 errhint("Choose a recovery target at or after the end of the pg_upgrade window, or remove the recovery target to replay the whole upgrade.")));
+
+			/*
 			 * This is the last point where we can restart recovery with a new
 			 * recovery target, if we shutdown and begin again. After this,
 			 * Resource Managers may choose to do permanent corrective actions
@@ -2233,6 +2264,7 @@ CheckRecoveryConsistency(void)
 	if (standbyState == STANDBY_SNAPSHOT_READY &&
 		!LocalHotStandbyActive &&
 		reachedConsistency &&
+		!pgUpgradeReplayInProgress &&
 		IsUnderPostmaster)
 	{
 		SpinLockAcquire(&XLogRecoveryCtl->info_lck);

@@ -6823,6 +6823,9 @@
 { oid => '2849', descr => 'current wal write location',
   proname => 'pg_current_wal_lsn', provolatile => 'v', prorettype => 'pg_lsn',
   proargtypes => '', prosrc => 'pg_current_wal_lsn' },
+# The pg_upgrade --wal-upgrade window is emitted by the single
+# binary-upgrade-gated function binary_upgrade_emit_wal_window() (see the
+# binary_upgrade_* block), not by per-step SQL functions.
 { oid => '2852', descr => 'current wal insert location',
   proname => 'pg_current_wal_insert_lsn', provolatile => 'v',
   prorettype => 'pg_lsn', proargtypes => '',
@@ -11994,6 +11997,11 @@
   proisstrict => 'f', provolatile => 'v', proparallel => 'u',
   prorettype => 'void', proargtypes => '',
   prosrc => 'binary_upgrade_create_conflict_detection_slot' },
+{ oid => '9700', descr => 'for use by pg_upgrade (--wal-upgrade window)',
+  proname => 'binary_upgrade_emit_wal_window', proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u', prorettype => 'void',
+  proargtypes => 'int4 int4 int4 bool',
+  prosrc => 'binary_upgrade_emit_wal_window' },
 
 # conversion functions
 { oid => '4310', descr => 'internal conversion function for KOI8R to WIN1251',

@@ -158,6 +158,23 @@ typedef struct
 } LogicalSlotInfoArr;
 
 /*
+ * Physical replication slot info.  Unlike logical slots these are
+ * cluster-wide (not database-scoped) and carry no decoding state, so the
+ * name is all we need to recreate the slot on the new cluster.  Only
+ * migrated on the --wal-upgrade path (see get_old_cluster_physical_slot_infos).
+ */
+typedef struct
+{
+	char	   *slotname;		/* slot name */
+} PhysicalSlotInfo;
+
+typedef struct
+{
+	int			nslots;			/* number of physical slot infos */
+	PhysicalSlotInfo *slots;	/* array of physical slot infos */
+} PhysicalSlotInfoArr;
+
+/*
  * The following structure represents a relation mapping.
  */
 typedef struct
@@ -249,6 +266,20 @@ typedef enum
 } transferMode;
 
 /*
+ * Revertable-upgrade lifecycle subcommands.  When set (not _NONE),
+ * pg_upgrade does not run an upgrade; it acts on an existing cluster and exits.
+ */
+typedef enum
+{
+	REVERTABLE_OP_NONE = 0,		/* normal pg_upgrade run */
+	REVERTABLE_OP_SIGNAL_HANDOFF,	/* emit the handoff trigger into the LIVE
+									 * old primary's WAL; it propagates to
+									 * streaming standbys through the normal
+									 * WAL/replication path, which replay it
+									 * and then stand down before the upgrade */
+} RevertableOp;
+
+/*
  * Enumeration to denote pg_log modes
  */
 typedef enum
@@ -289,6 +320,8 @@ typedef struct
 	int			nsubs;			/* number of subscriptions */
 	bool		sub_retain_dead_tuples; /* whether a subscription enables
 										 * retain_dead_tuples. */
+	PhysicalSlotInfoArr phys_slot_arr;	/* physical slots to migrate
+										 * (--wal-upgrade only) */
 } ClusterInfo;
 
 
@@ -306,6 +339,8 @@ typedef struct
 	char	   *dumpdir;		/* Dumps */
 	char	   *logdir;			/* Log files */
 	bool		isatty;			/* is stdout a tty */
+	/* WAL bytes generated during pg_restore (schema restore phase) */
+	uint64		pg_upgrade_wal_bytes;
 } LogOpts;
 
 
@@ -325,6 +360,19 @@ typedef struct
 	int			char_signedness;	/* default char signedness: -1 for initial
 									 * value, 1 for "signed" and 0 for
 									 * "unsigned" */
+	bool		initdb_new_cluster; /* run initdb to create the new cluster
+									 * before upgrading, instead of requiring
+									 * the user to have created it manually */
+
+	/*
+	 * capture the whole upgrade as a WAL-replayable full-page image at the
+	 * end and skip the on-disk data writes, so first startup reconstructs the
+	 * cluster purely from WAL (atomic, crash-safe, recoverable from an empty
+	 * data directory)
+	 */
+	bool		wal_upgrade;
+	/* revertable-upgrade lifecycle subcommand, if any (see enum above) */
+	RevertableOp revertable_op;
 } UserOpts;
 
 typedef struct
@@ -380,6 +428,11 @@ void		check_control_data(ControlData *oldctrl, ControlData *newctrl);
 void		disable_old_cluster(transferMode transfer_mode);
 
 
+/* revertable.c */
+
+void		perform_revertable_op(void);
+
+
 /* dump.c */
 
 void		generate_old_dump(void);
@@ -423,7 +476,9 @@ FileNameMap *gen_db_file_maps(DbInfo *old_db,
 							  DbInfo *new_db, int *nmaps, const char *old_pgdata,
 							  const char *new_pgdata);
 void		get_db_rel_and_slot_infos(ClusterInfo *cluster);
+void		get_template0_info(ClusterInfo *cluster);
 int			count_old_cluster_logical_slots(void);
+void		get_old_cluster_physical_slot_infos(void);
 void		get_subscription_info(ClusterInfo *cluster);
 
 /* option.c */

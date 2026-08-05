@@ -59,6 +59,23 @@ extern ssize_t pg_pwritev_with_retry(int fd,
 
 extern ssize_t pg_pwrite_zeros(int fd, size_t size, pgoff_t offset);
 
+/*
+ * Result of the reflink helpers below.  The caller decides how to report a
+ * failure (pg_fatal in the frontend, ereport in the backend), so these return a
+ * code rather than raising an error themselves.
+ */
+typedef enum PGReflinkResult
+{
+	PG_REFLINK_OK,				/* the clone/copy succeeded */
+	PG_REFLINK_UNSUPPORTED,		/* not compiled with support on this platform */
+	PG_REFLINK_ERROR,			/* a syscall failed; see *save_errno */
+}			PGReflinkResult;
+
+extern PGReflinkResult pg_clone_file(const char *src, const char *dst,
+									 int *save_errno);
+extern PGReflinkResult pg_copy_file_range_all(const char *src, const char *dst,
+											  int *save_errno);
+
 /* Filename components */
 #define PG_TEMP_FILES_DIR "pgsql_tmp"
 #define PG_TEMP_FILE_PREFIX "pgsql_tmp"

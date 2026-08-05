@@ -98,6 +98,26 @@ typedef enum RecoveryState
 extern PGDLLIMPORT int wal_level;
 extern PGDLLIMPORT bool XLogLogicalInfo;
 
+/*
+ * pg_upgrade --wal-upgrade streaming-standby transfer mode (postgresql.conf
+ * GUC pg_upgrade_standby_transfer_mode).  PG_UPGRADE_XFER_MIRROR reproduces the
+ * per-file mode the primary recorded in the manifest; the others override it.
+ * Concrete modes map to UPGRADE_RELINK_MODE_* in pg_control.h.  See
+ * ArmFromLocalDerivationIfConfigured().
+ */
+typedef enum
+{
+	PG_UPGRADE_XFER_MIRROR = -1,	/* unset: use the manifest's per-file mode */
+	PG_UPGRADE_XFER_CLONE = 0,
+	PG_UPGRADE_XFER_COPY = 1,
+	PG_UPGRADE_XFER_COPY_FILE_RANGE = 2,
+	PG_UPGRADE_XFER_LINK = 3,
+	PG_UPGRADE_XFER_SWAP = 4,
+} PgUpgradeTransferMode;
+
+extern PGDLLIMPORT int pg_upgrade_standby_transfer_mode;
+extern PGDLLIMPORT char *pg_upgrade_standby_old_datadir;
+
 /* Is WAL archiving enabled (always or only while server is running normally)? */
 #define XLogArchivingActive() \
 	(AssertMacro(XLogArchiveMode == ARCHIVE_MODE_OFF || wal_level >= WAL_LEVEL_REPLICA), XLogArchiveMode > ARCHIVE_MODE_OFF)
@@ -273,6 +293,47 @@ extern WALAvailability GetWALAvailability(XLogRecPtr targetLSN);
 extern void XLogPutNextOid(Oid nextOid);
 extern XLogRecPtr XLogRestorePoint(const char *rpName);
 extern XLogRecPtr XLogAssignLSN(void);
+
+/* pg_upgrade WAL markers */
+extern XLogRecPtr XLogWritePgUpgrade(bool is_start,
+									 uint32 old_major_version,
+									 uint32 new_major_version);
+
+/* SLRU bulk image for pg_upgrade WAL replay */
+extern XLogRecPtr XLogWriteUpgradeSlruData(uint8 slru_type);
+
+/* arm pg_control at CN for in-process --wal-upgrade recovery */
+struct CheckPoint;
+extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
+											 XLogRecPtr cn_lsn,
+											 uint64 wal_sysid,
+											 bool for_streaming);
+
+/* control-file checkpoint LSN, for the "upgrade already applied?" test */
+extern XLogRecPtr GetControlFileCheckPointLSN(void);
+
+/*
+ * informational DB_IN_UPGRADE flips during window replay (set at START,
+ * cleared back to DB_IN_PRODUCTION at COMPLETE) -- diagnostics only
+ */
+extern void SetControlFileInUpgrade(void);
+extern void ClearControlFileInUpgrade(void);
+extern void SynthesizeUpgradeStreamControlFile(bool allow_overwrite);
+
+/*
+ * --wal-upgrade: durable "window replayed to COMPLETE" flag in pg_control, set
+ * at COMPLETE redo and paired with a control checkpoint past CN to decide
+ * "finalized".
+ */
+extern void SetControlFileUpgradeFinalized(void);
+extern bool GetControlFileUpgradeFinalized(void);
+extern void SetControlFileUpgradeStarted(void);
+extern bool GetControlFileUpgradeStarted(void);
+
+/* emit the streaming-handoff trigger at shutdown if pg_upgrade armed it */
+extern void EmitPgUpgradeHandoffIfArmed(void);
+
+/* batched relation-file images live in access/pgupgrade_wal.h */
 extern void UpdateFullPageWrites(void);
 extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p);
 extern XLogRecPtr GetRedoRecPtr(void);
@@ -333,6 +394,19 @@ extern SessionBackupState get_backup_status(void);
 #define RECOVERY_SIGNAL_FILE	"recovery.signal"
 #define STANDBY_SIGNAL_FILE		"standby.signal"
 #define BACKUP_LABEL_FILE		"backup_label"
+/* armed by pg_upgrade --wal-upgrade-signal-handoff; consumed by ShutdownXLOG */
+#define PG_UPGRADE_HANDOFF_SIGNAL_FILE	"pg_upgrade_handoff.pending"
+/*
+ * Empty, presence-only sentinel (like standby.signal) the operator stages into
+ * a --wal-upgrade recovery target; its presence arms upgrade replay at
+ * first-startup.  Recovery mode comes from stock config (primary_conninfo =>
+ * stream from the live primary; recovery.signal => restore_command).  The
+ * standby-local options (old-datadir path, transfer mode) live in
+ * postgresql.conf GUCs, not in this file.  See
+ * ArmFromLocalDerivationIfConfigured().
+ */
+#define PG_UPGRADE_SIGNAL_FILE			"pg_upgrade.signal"
+
 #define BACKUP_LABEL_OLD		"backup_label.old"
 
 #define TABLESPACE_MAP			"tablespace_map"

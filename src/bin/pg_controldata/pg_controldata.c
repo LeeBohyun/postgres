@@ -65,6 +65,8 @@ dbState(DBState state)
 			return _("in archive recovery");
 		case DB_IN_PRODUCTION:
 			return _("in production");
+		case DB_IN_UPGRADE:
+			return _("in pg_upgrade");
 	}
 	return _("unrecognized status code");
 }
@@ -349,6 +351,8 @@ main(int argc, char *argv[])
 		   ControlFile->data_checksum_version);
 	printf(_("Default char data signedness:         %s\n"),
 		   (ControlFile->default_char_signedness ? _("signed") : _("unsigned")));
+	printf(_("wal-upgrade window finalized:         %s\n"),
+		   (ControlFile->upgrade_finalized ? _("yes") : _("no")));
 	printf(_("Mock authentication nonce:            %s\n"),
 		   mock_auth_nonce_str);
 	return 0;

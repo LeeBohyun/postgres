@@ -41,14 +41,18 @@
 
 #include "postgres_fe.h"
 
+#include <dirent.h>
 #include <time.h>
 
 #include "access/multixact.h"
 #include "catalog/pg_class_d.h"
+#include "catalog/pg_collation_d.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
 #include "common/restricted_token.h"
 #include "fe_utils/string_utils.h"
+#include "fe_utils/version.h"
+#include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
 
 /*
@@ -67,12 +71,40 @@ static void copy_xact_xlog_xid(void);
 static void set_frozenxids(void);
 static void make_outputdirs(char *pgdata);
 static void setup(char *argv0);
+static void resolve_new_bindir(const char *argv0);
+static void create_new_cluster_via_initdb(const char *argv0);
+static char *detect_old_cluster_archive_command(void);
+static void write_wal_upgrade_archive_conf(const char *archive_command);
 static void create_logical_replication_slots(void);
 static void create_conflict_detection_slot(void);
 
 ClusterInfo old_cluster,
 			new_cluster;
 OSInfo		os_info;
+
+/*
+ * For --wal-upgrade, the old cluster's archive_command carried forward to the
+ * new cluster (NULL if it was not archiving).  Detected while the old server is
+ * up; used to archive the upgrade window so PITR spans the upgrade.
+ */
+static char *old_cluster_archive_command = NULL;
+
+/*
+ * Fault-injection hook: when set, suppress the XLOG_UPGRADE_COMPLETE record
+ * (and its durable marker), leaving an incomplete window as a crash mid-window
+ * would.  Gated on USE_ASSERT_CHECKING, so a production (non-assert) build
+ * ignores the environment variable entirely and can never emit an incomplete
+ * window.
+ */
+static inline bool
+wal_upgrade_skip_complete(void)
+{
+#ifdef USE_ASSERT_CHECKING
+	return getenv("PG_UPGRADE_TEST_SKIP_COMPLETE") != NULL;
+#else
+	return false;
+#endif
+}
 
 char	   *output_files[] = {
 	SERVER_LOG_FILE,
@@ -102,11 +134,29 @@ main(int argc, char **argv)
 	/* Set default restrictive mask until new cluster permissions are read */
 	umask(PG_MODE_MASK_OWNER);
 
+
 	parseCommandLine(argc, argv);
+
+	/*
+	 * A --wal-upgrade lifecycle subcommand acts on the running old cluster
+	 * and exits without running an upgrade.  new_cluster.bindir locates
+	 * pg_ctl.
+	 */
+	if (user_opts.revertable_op != REVERTABLE_OP_NONE)
+	{
+		resolve_new_bindir(argv[0]);
+		perform_revertable_op();
+		return 0;
+	}
+
 
 	get_restricted_token();
 
 	adjust_data_dir(&old_cluster);
+
+	if (user_opts.initdb_new_cluster)
+		create_new_cluster_via_initdb(argv[0]);
+
 	adjust_data_dir(&new_cluster);
 
 	/*
@@ -135,6 +185,12 @@ main(int argc, char **argv)
 	get_sock_dir(&new_cluster);
 
 	check_cluster_compatibility();
+
+	/*
+	 * The --wal-upgrade recovery anchor (CN) is the checkpoint taken just
+	 * before the end-of-upgrade full-page image burst, not the initdb
+	 * checkpoint.  See the end-of-upgrade block below.
+	 */
 
 	check_and_dump_old_cluster();
 
@@ -165,14 +221,41 @@ main(int argc, char **argv)
 
 	/* New now using xids of the old system */
 
-	/* -- NEW -- */
+	/*
+	 * For --wal-upgrade the new cluster runs at wal_level=replica (initdb's
+	 * default), so the end-of-upgrade full-page images -- and the persisted
+	 * pg_control -- are at a level a standby can recover from.  Recovery
+	 * anchors at CN and never replays pg_restore's WAL, so restore-phase WAL
+	 * is throwaway.
+	 */
 	start_postmaster(&new_cluster, true);
 
 	prepare_new_globals();
 
+	/*
+	 * For --wal-upgrade no WAL markers are emitted here; the entire upgrade
+	 * image is captured as full-page images at the very end, once everything
+	 * is on disk and a CHECKPOINT has flushed all buffers.  See below.
+	 */
+
 	create_new_objects();
 
+	/*
+	 * Stop the server before transferring relation files, as stock pg_upgrade
+	 * does.  The transfer overwrites the pg_restore-built files by a raw
+	 * copy/clone/link that bypasses the buffer manager; if the server were
+	 * up, the capture-time CHECKPOINT could flush stale dirty pages back over
+	 * the transferred files.  For --wal-upgrade the server restarts with a
+	 * clean buffer pool, so the capture reads exactly the transferred files.
+	 */
 	stop_postmaster(false);
+
+	/*
+	 * The new cluster keeps a fresh system identifier, as stock pg_upgrade
+	 * does.  Recovery of the upgrade window only requires pg_control and the
+	 * window's WAL to agree on the sysid, not that it match the old cluster
+	 * -- see the "Resetting WAL archives" step in copy_xact_xlog_xid().
+	 */
 
 	/*
 	 * Most failures happen in create_new_objects(), which has completed at
@@ -180,6 +263,11 @@ main(int argc, char **argv)
 	 * which for --link will make it unsafe to start the old cluster once the
 	 * new cluster is started, and for --swap will make it unsafe to start the
 	 * old cluster at all.
+	 *
+	 * As in upstream, --link and --swap disable the old cluster while --copy
+	 * and --clone leave it intact.  --wal-upgrade does not change this: the
+	 * upgrade still generates the WAL window regardless, so standbys are
+	 * re-provisioned by streaming it from the upgraded primary.
 	 */
 	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
 		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
@@ -189,19 +277,306 @@ main(int argc, char **argv)
 								 old_cluster.pgdata, new_cluster.pgdata);
 
 	/*
-	 * Assuming OIDs are only used in system tables, there is no need to
-	 * restore the OID counter because we have not transferred any OIDs from
-	 * the old system, but we do it anyway just in case.  We do it late here
-	 * because there is no need to have the schema load use new oids.
+	 * Set the new cluster's next OID (stock upstream step, run with the
+	 * server down and after the restore, which consumes OIDs).  For
+	 * --wal-upgrade it must happen before the end-of-upgrade checkpoint below
+	 * so that checkpoint (CN) records the transplanted OID counter; recovery
+	 * from CN then reproduces the counters.
+	 *
+	 * On the --wal-upgrade streaming path (no archive_command carried
+	 * forward) this reset does double duty: it also positions the new
+	 * cluster's WAL at the old cluster's next segment (nextxlogfile, timeline
+	 * 1) so the reset-written DB_SHUTDOWNED checkpoint -- redo == checkPoint
+	 * == the segment boundary -- becomes a byte-deterministic CN.  A fresh
+	 * standby skeleton can then derive CN LOCALLY from its retained old
+	 * datadir (nextxlogfile) with no anchor round-trip.  A plain pg_resetwal
+	 * -l only floors the start upward (it maxes -l over the current
+	 * checkpoint redo and existing pg_wal/ segments), and after the restore
+	 * the checkpoint is at a high segment, so -l alone would be ignored;
+	 * --wal-upgrade-exact makes the -l target authoritative and forces the
+	 * position DOWN to nextxlogfile (pg_resetwal's own KillExistingXLOG then
+	 * deletes the restore's leftover segments, so no separate pg_wal/
+	 * emptying is needed).  On the archive path CN need not be
+	 * byte-deterministic (PITR locates it by scanning the WAL), so the plain
+	 * reset is used.
 	 */
-	prep_status("Setting next OID for new cluster");
-	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -o %u \"%s\"",
-			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
-			  new_cluster.pgdata);
-	check_ok();
+	if (user_opts.wal_upgrade && old_cluster_archive_command == NULL)
+	{
+		prep_status("Setting next OID and CN log position for new cluster");
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+		/* timeline 1 to match controldata and emit no WAL history file */
+				  "\"%s/pg_resetwal\" --wal-upgrade-exact -o %u -l 00000001%s \"%s\"",
+				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+				  old_cluster.controldata.nextxlogfile + 8,
+				  new_cluster.pgdata);
+		check_ok();
+	}
+	else
+	{
+		prep_status("Setting next OID for new cluster");
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" -o %u \"%s\"",
+				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+				  new_cluster.pgdata);
+		check_ok();
+	}
 
 	migrate_logical_slots = count_old_cluster_logical_slots();
+
+	if (user_opts.wal_upgrade)
+	{
+		PGconn	   *conn;
+
+		/* Window's last segment; the archive barrier waits for it to drain. */
+		char		upgrade_window_last_seg[MAXPGPATH] = {0};
+
+		/*
+		 * The old cluster's archive_command is detected and carried forward
+		 * only on the --initdb path (create_new_cluster_via_initdb).  Without
+		 * it, the upgrade window is generated but never archived, so a PITR
+		 * base backup could not roll across the upgrade boundary, which is
+		 * the purpose of --wal-upgrade, while the run still reported success.
+		 * Emit a warning rather than produce an upgrade that cannot be
+		 * recovered by PITR.
+		 */
+		if (old_cluster_archive_command == NULL)
+			pg_log(PG_WARNING,
+				   "--wal-upgrade did not configure WAL archiving for the new cluster; "
+				   "the upgrade window will not be archived and cannot be recovered by PITR. "
+				   "Use --initdb so the old cluster's archive_command is carried forward, "
+				   "or configure archiving on the new cluster before it is needed.");
+
+		/*
+		 * Restart with a fresh buffer pool for the WAL capture phase.  The
+		 * server now reads the just-transplanted counters from pg_control, so
+		 * the checkpoint we take below captures them.
+		 */
+		start_postmaster(&new_cluster, true);
+		conn = connectToServer(&new_cluster, "template1");
+
+		/*
+		 * The window is emitted after all pg_upgrade work is done, as one
+		 * burst rather than interleaved with the restore.
+		 *
+		 * A streaming standby anchors recovery at CN, so the window must be
+		 * pinned in pg_wal/ by a slot whose restart_lsn is at or before CN.
+		 * Migrating the old cluster's physical slots with immediately_reserve
+		 * reserves each restart_lsn at the current insert position, so this
+		 * loop MUST stay ahead of the emit call below: reserving after CN
+		 * would silently break retention.
+		 *
+		 * Without a physical slot no pin is needed.  Either archiving is
+		 * configured, in which case the window's durable home is the archive
+		 * and the wait-for-archive barrier below gets it there, or the window
+		 * has no consumer at all and is recycled as ordinary WAL.
+		 */
+		for (int slotnum = 0; slotnum < old_cluster.phys_slot_arr.nslots; slotnum++)
+		{
+			PhysicalSlotInfo *slot = &old_cluster.phys_slot_arr.slots[slotnum];
+			PGresult   *slotres;
+
+			pg_log(PG_VERBOSE, "migrating physical replication slot \"%s\"",
+				   slot->slotname);
+
+			/*
+			 * Best-effort: a slot that cannot be recreated (e.g. a name
+			 * collision, or a slot that was invalid on an old major where we
+			 * could not filter it out) must not abort the whole upgrade, so
+			 * warn and continue rather than using executeQueryOrDie(). Losing
+			 * a migrated slot only means that standby must be re-provisioned
+			 * conventionally; it does not affect the primary's upgrade.
+			 */
+			slotres = PQexec(conn,
+							 psprintf("SELECT pg_create_physical_replication_slot('%s', true, false)",
+									  slot->slotname));
+			if (PQresultStatus(slotres) != PGRES_TUPLES_OK)
+			{
+				pg_log(PG_WARNING,
+					   "could not migrate physical replication slot \"%s\": %s",
+					   slot->slotname, PQerrorMessage(conn));
+				pg_log(PG_WARNING,
+					   "The standby that used it must be re-provisioned after the upgrade.");
+			}
+			PQclear(slotres);
+		}
+
+		/*
+		 * Emit the entire window with a single binary-upgrade-gated backend
+		 * call; EmitUpgradeWalWindow() documents the order of the records it
+		 * writes.  The checkpoint it takes first is CN, the recovery anchor,
+		 * so replay starts there and applies only the end-of-upgrade images
+		 * that follow -- never pg_restore's own WAL -- and the cluster
+		 * reconstructs from an empty data directory.
+		 *
+		 * The XID/OID/multixact counters are not emitted separately: they
+		 * were transplanted into pg_control before CN, so the CN checkpoint
+		 * record carries them.  CN's LSN is not recorded either; first
+		 * startup derives it from the WAL (PerformWalUpgradeIfNeeded), which
+		 * is what lets a physical standby find the same anchor in the
+		 * streamed WAL.
+		 *
+		 * wal_upgrade_skip_complete() (assert builds only) suppresses the
+		 * COMPLETE marker to simulate a crash mid-upgrade.
+		 */
+		PQclear(executeQueryOrDie(conn,
+								  "SELECT binary_upgrade_emit_wal_window(%u, %u, %d, %s)",
+								  old_cluster.major_version,
+								  new_cluster.major_version,
+								  (int) user_opts.transfer_mode,
+								  wal_upgrade_skip_complete() ? "true" : "false"));
+
+		/*
+		 * Capture the segment holding PG_UPGRADE_COMPLETE before the switch,
+		 * so the wait-for-archive barrier below targets the window's last
+		 * segment (CN..COMPLETE) rather than a later one.  pg_switch_wal()
+		 * then seals that segment so it is archivable.
+		 */
+		if (old_cluster_archive_command != NULL)
+		{
+			PGresult   *res;
+
+			res = executeQueryOrDie(conn,
+									"SELECT pg_walfile_name(pg_current_wal_lsn())");
+			strlcpy(upgrade_window_last_seg, PQgetvalue(res, 0, 0),
+					sizeof(upgrade_window_last_seg));
+			PQclear(res);
+		}
+
+		PQclear(executeQueryOrDie(conn, "SELECT pg_switch_wal()"));
+
+		/*
+		 * When the window is being archived, wait until the archiver has
+		 * drained the window's last segment (holding PG_UPGRADE_COMPLETE,
+		 * captured above) before shutting the burst server down.  Only
+		 * CN..COMPLETE must reach the archive; pre-CN pg_restore WAL is
+		 * irrelevant and legitimately recycled.  The window is usually
+		 * already archived by now (smart shutdown drains the archiver); this
+		 * barrier makes that explicit.  Mirrors do_pg_backup_stop()'s
+		 * waitforarchive spin on pg_stat_archiver.last_archived_wal.
+		 */
+		if (old_cluster_archive_command != NULL)
+		{
+			PGresult   *res;
+
+			/*
+			 * Distinguish a persistent archiving failure from a transient one
+			 * the archiver retries and recovers from.  pg_stat_archiver's
+			 * last_failed_wal is a sticky high-water mark: it is set on any
+			 * failure and never cleared on a later success, so it cannot tell
+			 * us whether archiving is *currently* failing.  Instead give up
+			 * only when at least one failure has been recorded AND
+			 * last_archived_wal makes no forward progress for a bounded
+			 * number of consecutive polls.  A transient failure (retried and
+			 * drained) advances last_archived and resets the stall counter.
+			 */
+			char		prev_archived[MAXPGPATH] = {0};
+			int64		prev_failed = -1;
+			int			stalled_polls = 0;
+
+			/*
+			 * ~30s of no progress while failures mount -> give up (100ms
+			 * poll)
+			 */
+#define UPGRADE_ARCHIVE_STALL_LIMIT 300
+
+			prep_status("Waiting for the upgrade window to be archived");
+			for (;;)
+			{
+				char		last_archived[MAXPGPATH];
+				int64		failed_count;
+
+				res = executeQueryOrDie(conn,
+										"SELECT coalesce(last_archived_wal, ''), "
+										"failed_count "
+										"FROM pg_stat_archiver");
+				strlcpy(last_archived, PQgetvalue(res, 0, 0), sizeof(last_archived));
+				failed_count = strtoi64(PQgetvalue(res, 0, 1), NULL, 10);
+				PQclear(res);
+
+				/*
+				 * last_archived_wal advances in segment-name order, so once
+				 * it has reached (>=) the window's last segment, CN..COMPLETE
+				 * is archived.
+				 */
+				if (last_archived[0] != '\0' &&
+					strcmp(last_archived, upgrade_window_last_seg) >= 0)
+					break;
+
+				/*
+				 * Persistent-failure detector.  The stall counter is driven
+				 * by ABSENCE OF PROGRESS, not by catching the exact poll on
+				 * which the archiver bumps its failure count: the archiver
+				 * fails far less often than the 100ms poll rate, so keying on
+				 * failed_count > prev_failed would reset the counter on
+				 * almost every poll and never trip.  Instead: increment on
+				 * every poll where last_archived_wal did not advance AND at
+				 * least one archive failure has been recorded (failed_count >
+				 * 0); reset the moment last_archived_wal advances.  A
+				 * transient failure the archiver recovers from advances
+				 * last_archived and clears the counter; a truly stuck
+				 * archive_command makes no progress and trips the fatal after
+				 * UPGRADE_ARCHIVE_STALL_LIMIT polls.  This also covers an
+				 * archive that never produces any segment (fails from the
+				 * first): last_archived stays "" across polls, which is "no
+				 * advance", so the counter still climbs.  prev_failed >= 0
+				 * means we have a prior poll to compare against (skip the
+				 * first).
+				 */
+				if (failed_count > 0 &&
+					prev_failed >= 0 &&
+					strcmp(last_archived, prev_archived) == 0)
+				{
+					if (++stalled_polls >= UPGRADE_ARCHIVE_STALL_LIMIT)
+						pg_fatal("archive_command is persistently failing while "
+								 "archiving the upgrade window (no progress past "
+								 "WAL file %s); the upgrade cannot be made "
+								 "recoverable by PITR",
+								 last_archived[0] != '\0' ? last_archived : "(none)");
+				}
+				else
+					stalled_polls = 0;
+
+				strlcpy(prev_archived, last_archived, sizeof(prev_archived));
+				prev_failed = failed_count;
+
+				pg_usleep(100000);	/* 100ms */
+			}
+			check_ok();
+
+			/*
+			 * No retention slot to drop: pg_upgrade never creates a dedicated
+			 * one.  A migrated physical slot, if any, belongs to the old
+			 * cluster's standby and is preserved so that standby can
+			 * reconnect after the upgrade.  The window (now archived) is free
+			 * to be recycled from pg_wal/ by the auto-served cluster's normal
+			 * checkpointing.
+			 */
+		}
+
+		PQfinish(conn);
+
+		/*
+		 * Clean shutdown (-m smart) so the shutdown checkpoint lands past
+		 * XLOG_UPGRADE_COMPLETE.  The primary is now a normal, fully-upgraded
+		 * cluster keeping its transferred files on disk (not reconstructed
+		 * from WAL): with the control checkpoint past COMPLETE, first
+		 * startup's PerformWalUpgradeIfNeeded() "already applied" guard
+		 * (checkpoint > CN) skips the window replay.
+		 *
+		 * The window (CN..COMPLETE) stays intact in pg_wal/, pinned by the
+		 * retention slot, so a fresh standby skeleton can stream and replay
+		 * it. Revert-and-replay is thus a standby-only mechanism.
+		 */
+		stop_postmaster(false);
+
+		/*
+		 * The durable "window reached COMPLETE" flag in pg_control was
+		 * already set inside binary_upgrade_emit_wal_window() above (on the
+		 * running burst server), which is suppressed by the same
+		 * skip_complete argument -- so a crash-mid-window primary is treated
+		 * as a partial upgrade. Nothing to write here.
+		 */
+	}
 
 	/*
 	 * Migrate replication slots to the new cluster.
@@ -252,7 +627,20 @@ main(int argc, char **argv)
 
 	create_script_for_old_cluster_deletion(&deletion_script_file_name);
 
-	issue_warnings_and_set_wal_level();
+	/*
+	 * For --wal-upgrade, skip issue_warnings_and_set_wal_level(): it
+	 * unconditionally starts/stops the server, which would checkpoint and
+	 * recycle the upgrade WAL still needed in pg_wal/.
+	 *
+	 * pg_control is not stamped here.  First startup runs
+	 * PerformWalUpgradeIfNeeded(), which derives CN from the WAL, arms
+	 * pg_control at CN in-process, and crash-recovers from CN through
+	 * PG_UPGRADE_COMPLETE.  Deriving the anchor from the WAL (rather than
+	 * pre-stamping) lets the same WAL stream drive recovery on a physical
+	 * standby.  The whole upgrade is applied in one pass on next startup.
+	 */
+	if (!user_opts.wal_upgrade)
+		issue_warnings_and_set_wal_level();
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -358,6 +746,263 @@ make_outputdirs(char *pgdata)
 }
 
 
+/*
+ * resolve_new_bindir()
+ *
+ * Idempotent helper: if new_cluster.bindir has not been set by the user via
+ * -B, derive it from the path of the currently executing pg_upgrade binary.
+ * Called early by create_new_cluster_via_initdb() so that the initdb path
+ * is available before verify_directories() runs.
+ */
+static void
+resolve_new_bindir(const char *argv0)
+{
+	if (!new_cluster.bindir)
+	{
+		char		exec_path[MAXPGPATH];
+
+		if (find_my_exec(argv0, exec_path) < 0)
+			pg_fatal("%s: could not find own program executable", argv0);
+		/* Trim off program name and keep just the directory */
+		*last_dir_separator(exec_path) = '\0';
+		canonicalize_path(exec_path);
+		new_cluster.bindir = pg_strdup(exec_path);
+	}
+}
+
+
+/*
+ * create_new_cluster_via_initdb()
+ *
+ * Implements --initdb: run initdb to create the new cluster before upgrading,
+ * deriving WAL segment size, data checksums, encoding, and locale settings
+ * from the old cluster so that check_control_data() passes.
+ *
+ * This runs before the normal verify_directories() / setup() path, so we
+ * use a temporary log directory under the new bindir for the early server
+ * start; make_outputdirs() will replace log_opts.logdir later.
+ */
+static void
+create_new_cluster_via_initdb(const char *argv0)
+{
+	DbLocaleInfo *locale;
+	PQExpBufferData cmd;
+	char		tmp_logdir[MAXPGPATH];
+	char	   *saved_logdir = log_opts.logdir;
+	const char *encoding_name;
+
+	/* Pass argv0 (full path) so find_my_exec can locate the binary */
+	resolve_new_bindir(argv0);
+
+	/*
+	 * Verify that initdb is present and executable before doing any work. The
+	 * normal path checks this later inside verify_directories(), but we run
+	 * before that, so fail early with a useful message.
+	 */
+	{
+		char		initdb_path[MAXPGPATH];
+
+		snprintf(initdb_path, sizeof(initdb_path), "%s/initdb",
+				 new_cluster.bindir);
+		if (validate_exec(initdb_path) != 0)
+			pg_fatal("could not find \"initdb\" in \"%s\": %m\n"
+					 "The --initdb option requires initdb to be present in the new cluster's bin directory.",
+					 new_cluster.bindir);
+	}
+
+	old_cluster.major_version = get_pg_version(old_cluster.pgdata,
+											   &old_cluster.major_version_str);
+
+	/*
+	 * get_control_data() selects pg_resetwal vs. pg_resetxlog via
+	 * bin_version, which check_bindir() normally fills in later.  Seed it now
+	 * so the right binary name is used in this early call.
+	 */
+	if (old_cluster.bin_version == 0)
+		old_cluster.bin_version = old_cluster.major_version;
+
+	/*
+	 * Refuse to clobber an already-populated new data directory.  --initdb is
+	 * meant to create the new cluster from scratch, so an existing PG_VERSION
+	 * there means the operator pointed at the wrong directory or a leftover
+	 * from a previous attempt; either way, silently removing a database
+	 * system is too dangerous.  Fail with pg_upgrade's own clear message (not
+	 * initdb's "directory not empty") so the operator can remove it
+	 * deliberately.
+	 */
+	{
+		char		verfile[MAXPGPATH];
+		struct stat st;
+
+		snprintf(verfile, sizeof(verfile), "%s/PG_VERSION",
+				 new_cluster.pgdata);
+		if (stat(verfile, &st) == 0)
+			pg_fatal("new cluster data directory \"%s\" already contains a database system; "
+					 "--initdb requires an empty or nonexistent directory",
+					 new_cluster.pgdata);
+	}
+
+	get_control_data(&old_cluster);
+
+	/* Set up a temporary log directory for the early server start. */
+	snprintf(tmp_logdir, sizeof(tmp_logdir), "%s/pg_upgrade_initdb.log.d",
+			 new_cluster.bindir);
+	if (mkdir(tmp_logdir, pg_dir_create_mode) < 0 && errno != EEXIST)
+		pg_fatal("could not create temporary log directory \"%s\": %m",
+				 tmp_logdir);
+	log_opts.logdir = tmp_logdir;
+
+	if (!old_cluster.sockdir)
+		old_cluster.sockdir = user_opts.socketdir ? user_opts.socketdir : ".";
+
+	prep_status("Inspecting old cluster locale for new cluster creation");
+	start_postmaster(&old_cluster, true);
+	get_template0_info(&old_cluster);
+
+	/*
+	 * While the old server is up, capture its archive_command so it can be
+	 * carried forward to the new cluster: the upgrade window and post-upgrade
+	 * WAL then flow to the same archive, making the upgrade recoverable by
+	 * ordinary archive-based PITR with no extra operator action.
+	 */
+	if (user_opts.wal_upgrade)
+		old_cluster_archive_command = detect_old_cluster_archive_command();
+	stop_postmaster(false);
+	check_ok();
+
+	locale = old_cluster.template0;
+	encoding_name = pg_encoding_to_char(locale->db_encoding);
+
+	prep_status("Creating new cluster with initdb");
+
+
+	initPQExpBuffer(&cmd);
+	appendPQExpBuffer(&cmd, "\"%s/initdb\" -D \"%s\" -N",
+					  new_cluster.bindir, new_cluster.pgdata);
+	appendPQExpBuffer(&cmd, " -U \"%s\"", os_info.user);
+	appendPQExpBuffer(&cmd, " --wal-segsize=%u",
+					  old_cluster.controldata.walseg / (1024 * 1024));
+
+	/*
+	 * Pass --data-checksums or --no-data-checksums explicitly.  Starting from
+	 * PG18, initdb enables checksums by default, so we must mirror the old
+	 * cluster's setting to avoid a mismatch that check_control_data() would
+	 * reject.
+	 */
+	if (old_cluster.controldata.data_checksum_version != 0)
+		appendPQExpBufferStr(&cmd, " --data-checksums");
+	else
+		appendPQExpBufferStr(&cmd, " --no-data-checksums");
+
+	appendPQExpBuffer(&cmd, " --encoding=%s", encoding_name);
+	appendPQExpBuffer(&cmd, " --locale-provider=%s",
+					  collprovider_name(locale->db_collprovider));
+	appendPQExpBuffer(&cmd, " --lc-collate=\"%s\" --lc-ctype=\"%s\"",
+					  locale->db_collate, locale->db_ctype);
+
+	if (locale->db_locale)
+	{
+		if (locale->db_collprovider == COLLPROVIDER_ICU)
+			appendPQExpBuffer(&cmd, " --icu-locale=\"%s\"",
+							  locale->db_locale);
+		else if (locale->db_collprovider == COLLPROVIDER_BUILTIN)
+			appendPQExpBuffer(&cmd, " --builtin-locale=\"%s\"",
+							  locale->db_locale);
+	}
+
+	if (new_cluster.pgopts)
+		appendPQExpBuffer(&cmd, " %s", new_cluster.pgopts);
+
+	exec_prog(UTILITY_LOG_FILE, NULL, true, true, "%s", cmd.data);
+
+	termPQExpBuffer(&cmd);
+	log_opts.logdir = saved_logdir;
+
+	check_ok();
+
+	/*
+	 * If the old cluster was archiving, enable the same archiving in the new
+	 * cluster's postgresql.conf, so both the burst server and the auto-served
+	 * upgraded cluster archive to the same place.  postgresql.conf (rather
+	 * than -o flags) lets an archive_command with spaces and shell
+	 * metacharacters be quoted correctly.
+	 */
+	if (old_cluster_archive_command != NULL)
+		write_wal_upgrade_archive_conf(old_cluster_archive_command);
+}
+
+/*
+ * Read the old cluster's archive_command over a connection to the running
+ * old server.  Returns a pg_strdup'd copy if archiving was configured
+ * (archive_mode <> off AND archive_command non-empty), else NULL.  Used to
+ * carry the old cluster's archiving forward to the new cluster.
+ */
+static char *
+detect_old_cluster_archive_command(void)
+{
+	PGconn	   *conn = connectToServer(&old_cluster, "template1");
+	PGresult   *res;
+	char	   *mode;
+	char	   *cmd;
+	char	   *result = NULL;
+
+	res = executeQueryOrDie(conn,
+							"SELECT current_setting('archive_mode'), "
+							"current_setting('archive_command')");
+	mode = PQgetvalue(res, 0, 0);
+	cmd = PQgetvalue(res, 0, 1);
+
+	/*
+	 * archive_mode is off/on/always; archive_command defaults to '' (or the
+	 * placeholder "(disabled)" on some builds).  Only carry a real command.
+	 */
+	if (strcmp(mode, "off") != 0 &&
+		cmd[0] != '\0' &&
+		strcmp(cmd, "(disabled)") != 0)
+		result = pg_strdup(cmd);
+
+	PQclear(res);
+	PQfinish(conn);
+	return result;
+}
+
+/*
+ * Append archive settings to the new cluster's postgresql.conf so the
+ * upgrade window and the post-upgrade WAL reach the archive.  archive_command
+ * is the old cluster's command, carried forward.  Only called when the old
+ * cluster was archiving.
+ */
+static void
+write_wal_upgrade_archive_conf(const char *archive_command)
+{
+	char		conf_path[MAXPGPATH];
+	FILE	   *fp;
+	const char *p;
+
+	snprintf(conf_path, sizeof(conf_path), "%s/postgresql.conf",
+			 new_cluster.pgdata);
+
+	fp = fopen(conf_path, "a");
+	if (fp == NULL)
+		pg_fatal("could not open \"%s\" to enable WAL archiving: %m", conf_path);
+
+	/* archive_command is emitted as a single-quoted GUC value; double any '. */
+	fputs("\n# added by pg_upgrade --wal-upgrade (carried from the old cluster)\n"
+		  "archive_mode = on\n"
+		  "archive_command = '", fp);
+	for (p = archive_command; *p; p++)
+	{
+		if (*p == '\'')
+			fputc('\'', fp);
+		fputc(*p, fp);
+	}
+	fputs("'\n", fp);
+
+	if (fclose(fp) != 0)
+		pg_fatal("could not write \"%s\": %m", conf_path);
+}
+
+
 static void
 setup(char *argv0)
 {
@@ -372,17 +1017,7 @@ setup(char *argv0)
 	 * with -B, default to using the path of the currently executed pg_upgrade
 	 * binary.
 	 */
-	if (!new_cluster.bindir)
-	{
-		char		exec_path[MAXPGPATH];
-
-		if (find_my_exec(argv0, exec_path) < 0)
-			pg_fatal("%s: could not find own program executable", argv0);
-		/* Trim off program name and keep just path */
-		*last_dir_separator(exec_path) = '\0';
-		canonicalize_path(exec_path);
-		new_cluster.bindir = pg_strdup(exec_path);
-	}
+	resolve_new_bindir(argv0);
 
 	verify_directories();
 
@@ -598,6 +1233,11 @@ create_new_objects(void)
 	int			dbnum;
 	PGconn	   *conn_new_template1;
 
+	/* LSN snapshot before and after pg_restore to measure WAL generated */
+	PGresult   *lsn_res;
+	uint64		lsn_before = 0,
+				lsn_after = 0;
+
 	prep_status_progress("Restoring database schemas in the new cluster");
 
 	/*
@@ -609,6 +1249,20 @@ create_new_objects(void)
 	 */
 	conn_new_template1 = connectToServer(&new_cluster, "template1");
 	PQclear(executeQueryOrDie(conn_new_template1, "CHECKPOINT"));
+
+	/*
+	 * Snapshot the WAL position before pg_restore to measure the bytes the
+	 * schema restore generates.  Only for --wal-upgrade; otherwise skipped so
+	 * the flow matches stock pg_upgrade.
+	 */
+	if (user_opts.wal_upgrade)
+	{
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_before = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+	}
+
 	PQfinish(conn_new_template1);
 
 	/*
@@ -714,6 +1368,25 @@ create_new_objects(void)
 	end_progress_output();
 	check_ok();
 
+	/*
+	 * Measure WAL bytes generated by pg_restore: read the current WAL
+	 * position and compute the delta since lsn_before.  Only for
+	 * --wal-upgrade; skipped otherwise so the flow matches stock pg_upgrade.
+	 */
+	if (user_opts.wal_upgrade)
+	{
+		conn_new_template1 = connectToServer(&new_cluster, "template1");
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_after = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+		PQfinish(conn_new_template1);
+
+		log_opts.pg_upgrade_wal_bytes = lsn_after - lsn_before;
+		pg_log(PG_VERBOSE, "pg_upgrade_wal_bytes: " UINT64_FORMAT,
+			   log_opts.pg_upgrade_wal_bytes);
+	}
+
 	/* update new_cluster info now that we have objects in the databases */
 	get_db_rel_and_slot_infos(&new_cluster);
 }
@@ -775,7 +1448,8 @@ copy_xact_xlog_xid(void)
 	prep_status("Setting oldest XID for new cluster");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 			  "\"%s/pg_resetwal\" -f -u %u \"%s\"",
-			  new_cluster.bindir, old_cluster.controldata.chkpnt_oldstxid,
+			  new_cluster.bindir,
+			  old_cluster.controldata.chkpnt_oldstxid,
 			  new_cluster.pgdata);
 	check_ok();
 
@@ -783,11 +1457,13 @@ copy_xact_xlog_xid(void)
 	prep_status("Setting next transaction ID and epoch for new cluster");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 			  "\"%s/pg_resetwal\" -f -x %u \"%s\"",
-			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtxid,
+			  new_cluster.bindir,
+			  old_cluster.controldata.chkpnt_nxtxid,
 			  new_cluster.pgdata);
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 			  "\"%s/pg_resetwal\" -f -e %u \"%s\"",
-			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtepoch,
+			  new_cluster.bindir,
+			  old_cluster.controldata.chkpnt_nxtepoch,
 			  new_cluster.pgdata);
 	/* must reset commit timestamp limits also */
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
@@ -863,7 +1539,20 @@ copy_xact_xlog_xid(void)
 		check_ok();
 	}
 
-	/* now reset the wal archives in the new cluster */
+	/*
+	 * Now reset the WAL archives in the new cluster.  This positions the new
+	 * cluster's WAL at the old cluster's next segment.
+	 *
+	 * For --wal-upgrade this reset also (re)assigns the new cluster's system
+	 * identifier, not forced to the old cluster's value.  It rewrites both
+	 * the control file and the fresh WAL segment header from the same
+	 * ControlFile.system_identifier, so pg_control and the burst WAL stay
+	 * consistent -- all that replay requires (recovery validates the WAL's
+	 * xlp_sysid against pg_control, not its numeric value).  A standby is
+	 * re-provisioned from a fresh skeleton stamped with this sysid, so it
+	 * need not match the pre-upgrade cluster.  Same "new cluster gets a new
+	 * sysid" behavior as stock pg_upgrade.
+	 */
 	prep_status("Resetting WAL archives");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 	/* use timeline 1 to match controldata and no WAL history file */

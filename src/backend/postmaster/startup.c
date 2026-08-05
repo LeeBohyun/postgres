@@ -19,6 +19,7 @@
  */
 #include "postgres.h"
 
+#include "access/pgupgrade_wal.h"	/* PerformWalUpgradeIfNeeded */
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -250,6 +251,16 @@ StartupProcessMain(const void *startup_data, size_t startup_data_len)
 	 * Unblock signals (they were blocked when the postmaster forked us)
 	 */
 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+
+	/*
+	 * Detect a pending pg_upgrade --wal-upgrade and, if found, arm the
+	 * control file so the StartupXLOG() below replays the upgrade window (see
+	 * the function for the streaming-standby / local-window / archive-PITR
+	 * paths). A crashed partial upgrade (window began but never reached
+	 * COMPLETE) FATALs here with a re-run instruction rather than serving a
+	 * half-upgraded cluster.
+	 */
+	PerformWalUpgradeIfNeeded();
 
 	/*
 	 * Do what we came for.

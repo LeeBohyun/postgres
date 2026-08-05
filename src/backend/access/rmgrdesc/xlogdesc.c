@@ -218,12 +218,23 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 	{
 		/* no further information to print */
 	}
+	/* Upgrade records are handled by pg_upgrade_desc() via RM_PG_UPGRADE_ID */
 }
 
 const char *
 xlog_identify(uint8 info)
 {
 	const char *id = NULL;
+
+	/*
+	 * Upgrade record types must be checked before masking, since
+	 * 0xC0/0xC1/0xC2 all reduce to 0xC0 after applying ~XLR_INFO_MASK (0xF0).
+	 */
+
+	/*
+	 * Upgrade records are handled by pg_upgrade_identify() via
+	 * RM_PG_UPGRADE_ID
+	 */
 
 	switch (info & ~XLR_INFO_MASK)
 	{

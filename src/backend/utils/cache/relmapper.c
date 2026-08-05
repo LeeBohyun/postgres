@@ -315,6 +315,49 @@ RelationMapCopy(Oid dbid, Oid tsid, char *srcdbpath, char *dstdbpath)
 }
 
 /*
+ * RelationMapLogFromDir
+ *
+ * WAL-log the relation map that already exists in "dbpath" (a PGDATA-relative
+ * directory such as "global" or "base/<dboid>"), without touching the running
+ * server's own mapping state.
+ *
+ * pg_upgrade --wal-upgrade uses this to put the new cluster's maps into the
+ * upgrade window: the map files were written outside the server by pg_upgrade,
+ * so there is nothing in shared memory to log.  Reading the file and emitting
+ * XLOG_RELMAP_UPDATE means the map travels as an ordinary relmap record, whose
+ * redo derives the destination path from (dbid, tsid) -- the same record
+ * CREATE DATABASE uses for a freshly created database.
+ *
+ * "dbid" is InvalidOid for the shared map in global/.  Note relmap_redo()
+ * requires nbytes == sizeof(RelMapFile), so only a map written by this same
+ * major version can be logged this way.
+ */
+void
+RelationMapLogFromDir(Oid dbid, Oid tsid, char *dbpath)
+{
+	RelMapFile	map;
+	xl_relmap_update xlrec;
+	XLogRecPtr	lsn;
+
+	read_relmap_file(&map, dbpath, false, ERROR);
+
+	/*
+	 * Log it without writing anything locally: the file is already in place,
+	 * and this backend's own relmap state must not be disturbed.
+	 */
+	xlrec.dbid = dbid;
+	xlrec.tsid = tsid;
+	xlrec.nbytes = sizeof(RelMapFile);
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, MinSizeOfRelmapUpdate);
+	XLogRegisterData(&map, sizeof(RelMapFile));
+
+	lsn = XLogInsert(RM_RELMAP_ID, XLOG_RELMAP_UPDATE);
+	XLogFlush(lsn);
+}
+
+/*
  * RelationMapUpdateMap
  *
  * Install a new relfilenumber mapping for the specified relation.

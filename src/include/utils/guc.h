@@ -345,6 +345,7 @@ extern PGDLLIMPORT bool optimize_bounded_sort;
 extern PGDLLIMPORT const struct config_enum_entry archive_mode_options[];
 extern PGDLLIMPORT const struct config_enum_entry dynamic_shared_memory_options[];
 extern PGDLLIMPORT const struct config_enum_entry io_method_options[];
+extern PGDLLIMPORT const struct config_enum_entry pg_upgrade_standby_transfer_mode_options[];
 extern PGDLLIMPORT const struct config_enum_entry recovery_target_action_options[];
 extern PGDLLIMPORT const struct config_enum_entry server_message_level_options[];
 extern PGDLLIMPORT const struct config_enum_entry wal_level_options[];

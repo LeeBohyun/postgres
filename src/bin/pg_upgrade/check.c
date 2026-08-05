@@ -560,6 +560,14 @@ check_and_dump_old_cluster(void)
 	 */
 	get_db_rel_and_slot_infos(&old_cluster);
 
+	/*
+	 * On the --wal-upgrade path, also gather the old cluster's physical
+	 * replication slots so they can be recreated on the new cluster (see
+	 * get_old_cluster_physical_slot_infos).  Must run while the old server is
+	 * up.
+	 */
+	get_old_cluster_physical_slot_infos();
+
 	init_tablespaces();
 
 	get_loadable_libraries();
@@ -759,6 +767,12 @@ output_completion_banner(char *deletion_script_file_name)
 		appendShellString(&user_specification, os_info.user);
 		appendPQExpBufferChar(&user_specification, ' ');
 	}
+
+	/* report WAL generated during pg_restore (only for --wal-upgrade) */
+	if (user_opts.wal_upgrade)
+		pg_log(PG_REPORT,
+			   "WAL generated during schema restore: " UINT64_FORMAT " bytes",
+			   log_opts.pg_upgrade_wal_bytes);
 
 	pg_log(PG_REPORT,
 		   "Some statistics are not transferred by pg_upgrade.\n"
@@ -2060,6 +2074,39 @@ check_new_cluster_replication_slots(void)
 	char	   *wal_level;
 	int			i_nslots_on_new;
 	int			i_rdt_slot_on_new;
+
+	/*
+	 * --wal-upgrade migrates the old cluster's physical replication slots and
+	 * recreates them on the new cluster (see
+	 * get_old_cluster_physical_slot_infos / pg_upgrade.c).  Each recreation
+	 * needs a free slot, so the new cluster's max_replication_slots must
+	 * accommodate them.  This is independent of the logical-slot /
+	 * retain_dead_tuples machinery below (which early-returns when there are
+	 * no logical slots and is gated on PG17+), so check it up front and for
+	 * any old major.  Recreation is otherwise best-effort (warn-not-fail), so
+	 * without this a too-small max_replication_slots would silently migrate
+	 * fewer physical slots than expected and quietly break those standbys'
+	 * streaming.
+	 */
+	if (user_opts.wal_upgrade && old_cluster.phys_slot_arr.nslots > 0)
+	{
+		PGconn	   *pconn = connectToServer(&new_cluster, "template1");
+		PGresult   *pres = executeQueryOrDie(pconn,
+											 "SELECT setting FROM pg_settings "
+											 "WHERE name = 'max_replication_slots'");
+		int			max_slots;
+
+		if (PQntuples(pres) != 1)
+			pg_fatal("could not determine \"max_replication_slots\" on the new cluster");
+		max_slots = atoi(PQgetvalue(pres, 0, 0));
+		PQclear(pres);
+		PQfinish(pconn);
+
+		if (old_cluster.phys_slot_arr.nslots > max_slots)
+			pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of "
+					 "physical replication slots (%d) in the old cluster migrated by --wal-upgrade",
+					 max_slots, old_cluster.phys_slot_arr.nslots);
+	}
 
 	/*
 	 * Logical slots can be migrated since PG17 and a physical slot
