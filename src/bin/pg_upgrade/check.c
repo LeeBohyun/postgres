@@ -561,10 +561,9 @@ check_and_dump_old_cluster(void)
 	get_db_rel_and_slot_infos(&old_cluster);
 
 	/*
-	 * On the --wal-upgrade path, also gather the old cluster's physical
-	 * replication slots so they can be recreated on the new cluster (see
-	 * get_old_cluster_physical_slot_infos).  Must run while the old server is
-	 * up.
+	 * For --wal-upgrade, also gather the old cluster's physical replication
+	 * slots so they can be recreated on the new cluster (see
+	 * get_old_cluster_physical_slot_infos).
 	 */
 	get_old_cluster_physical_slot_infos();
 
@@ -2076,17 +2075,10 @@ check_new_cluster_replication_slots(void)
 	int			i_rdt_slot_on_new;
 
 	/*
-	 * --wal-upgrade migrates the old cluster's physical replication slots and
-	 * recreates them on the new cluster (see
-	 * get_old_cluster_physical_slot_infos / pg_upgrade.c).  Each recreation
-	 * needs a free slot, so the new cluster's max_replication_slots must
-	 * accommodate them.  This is independent of the logical-slot /
-	 * retain_dead_tuples machinery below (which early-returns when there are
-	 * no logical slots and is gated on PG17+), so check it up front and for
-	 * any old major.  Recreation is otherwise best-effort (warn-not-fail), so
-	 * without this a too-small max_replication_slots would silently migrate
-	 * fewer physical slots than expected and quietly break those standbys'
-	 * streaming.
+	 * --wal-upgrade recreates the old cluster's physical replication slots on
+	 * the new cluster, one free slot each.  Fail up front if
+	 * max_replication_slots cannot accommodate them, rather than silently
+	 * dropping physical retention slots and breaking those standbys' streaming.
 	 */
 	if (user_opts.wal_upgrade && old_cluster.phys_slot_arr.nslots > 0)
 	{
