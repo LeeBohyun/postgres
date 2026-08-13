@@ -835,21 +835,15 @@ count_old_cluster_logical_slots(void)
  * get_old_cluster_physical_slot_infos()
  *
  * Gather the old cluster's physical replication slots so --wal-upgrade can
- * recreate them on the new cluster.  Stock pg_upgrade does NOT migrate physical
- * slots: before --wal-upgrade a standby could not follow the upgrade at all
- * (it was rebuilt from scratch), so its slot was pointless to carry.  With
- * --wal-upgrade the standby follows by streaming the upgrade window, so its
- * slot becomes meaningful across the boundary -- migrating it preserves both
- * the standby's slot identity (HA tooling / primary_slot_name keep working)
- * and, because the recreated slot is reserved before CN, the window retention
- * itself.  It is the only slot that pins the window; with no physical slot,
- * --wal-upgrade has no streaming consumer and the window is not pinned.
+ * recreate them on the new cluster.  Recreating a slot preserves the standby's
+ * slot identity and, because it is reserved before CN, pins the upgrade window
+ * so the standby can stream it.  (Without --wal-upgrade a standby is rebuilt
+ * from scratch, so its slot is pointless to carry.)
  *
- * Physical slots are cluster-wide (not database-scoped) and carry no decoding
- * state, so a single query over pg_replication_slots suffices.  Temporary and
- * invalidated ("lost") slots are skipped: temporary slots cannot survive the
- * start/stop cycles of the upgrade, and an invalidated slot has no usable
- * restart_lsn to recreate.  Assumes the old server is running.
+ * Physical slots are cluster-wide and carry no decoding state, so a single
+ * query over pg_replication_slots suffices.  Temporary and invalidated slots
+ * are skipped: a temporary slot cannot survive the upgrade's start/stop
+ * cycles, and an invalidated slot has no usable restart_lsn to recreate from.
  */
 void
 get_old_cluster_physical_slot_infos(void)
@@ -869,22 +863,14 @@ get_old_cluster_physical_slot_infos(void)
 	conn = connectToServer(&old_cluster, "template1");
 
 	/*
-	 * Skip invalidated slots so we do not try to recreate a dead one.  The
-	 * pg_replication_slots.invalidation_reason column only exists in PG17+,
-	 * so gate the predicate on the old cluster's version -- otherwise the
-	 * query would error on an older major and abort the whole upgrade.  On
-	 * older majors we simply enumerate all physical slots; recreation below
-	 * is best-effort and warns rather than fails, so a slot that turns out to
-	 * be unusable does not stop the upgrade.
+	 * Skip invalidated slots (the invalidation_reason predicate is gated on the
+	 * old major, which added the column).  Recreation is best-effort -- it
+	 * warns rather than fails, so an unusable slot does not stop the upgrade.
 	 *
-	 * Exclude the internal "pg_conflict_detection" slot: since PG19 the
-	 * conflict-detection slot for retain_dead_tuples subscriptions is a
-	 * cluster-wide (physical) slot, so it shows up here, but its name is
-	 * reserved -- pg_create_physical_replication_slot() rejects it -- and
-	 * pg_upgrade recreates it separately via its own path.  Migrating it here
-	 * would only emit a spurious warning and, if it were the sole physical
-	 * slot, make us believe a standby consumer exists (and try to pin the
-	 * window) when none does.
+	 * Exclude the reserved "pg_conflict_detection" slot (PG19+): it is physical
+	 * so it shows up here, but its name cannot be recreated and pg_upgrade
+	 * migrates it separately; including it would warn and, if it were the only
+	 * physical slot, falsely signal a standby consumer and pin the window.
 	 */
 	res = executeQueryOrDie(conn,
 							"SELECT slot_name "
