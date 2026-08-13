@@ -67,7 +67,7 @@ parseCommandLine(int argc, char *argv[])
 		/* capture the upgrade as WAL and reconstruct it on first startup */
 		{"wal-upgrade", no_argument, NULL, 9},
 
-		/* --wal-upgrade lifecycle subcommand (acts on -d old) */
+		/* before upgrading, signal connected standbys to shut down for the upgrade */
 		{"wal-upgrade-signal-handoff", no_argument, NULL, 14},
 
 		{NULL, 0, NULL, 0}
@@ -249,7 +249,7 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.wal_upgrade = true;
 				break;
 
-				/* --wal-upgrade lifecycle subcommand */
+				/* signal-standby subcommand */
 			case 14:
 				user_opts.revertable_op = REVERTABLE_OP_SIGNAL_HANDOFF;
 				break;
@@ -273,20 +273,9 @@ parseCommandLine(int argc, char *argv[])
 				 "-c/--check", "--initdb");
 
 	/*
-	 * -O is accepted together with --initdb.  create_new_cluster_via_initdb()
-	 * derives initdb's core options from the old cluster's control data, then
-	 * appends -O (new_cluster.pgopts) to the initdb command line; the same -O
-	 * options are also passed to the new cluster's postmaster during the
-	 * server phases.  This is needed for --wal-upgrade -- e.g. "-c
-	 * allow_in_place_tablespaces=on" -- so it is not rejected.
-	 */
-
-	/*
-	 * --swap is compatible with --wal-upgrade.  The WAL window is generated
-	 * regardless of transfer mode, so standbys can still be reconstructed
-	 * from it.  --swap moves the old cluster's data directories into the new
-	 * cluster (do_swap); this is acceptable because --wal-upgrade offers no
-	 * revert-to-old interface that would depend on the old cluster surviving.
+	 * -O is accepted with --initdb: create_new_cluster_via_initdb() appends it
+	 * to the initdb command line, and the same options are passed to the new
+	 * cluster's postmaster during the server phases.
 	 */
 
 	if (!user_opts.sync_method)
@@ -310,13 +299,9 @@ parseCommandLine(int argc, char *argv[])
 		setenv("PGOPTIONS", FIX_DEFAULT_READ_ONLY, 1);
 
 	/*
-	 * --wal-upgrade-signal-handoff acts on a single existing (running) old
-	 * cluster and does not run an upgrade, so it needs only the old cluster's
-	 * data + bin directories, not the full old/new set the normal flow
-	 * requires. It connects to the LIVE old primary, writes the handoff
-	 * trigger into its WAL, and shuts the primary down at that point so no
-	 * transaction can append WAL after the handoff.  The old bin dir is
-	 * needed to run that cluster's pg_ctl for the shutdown.
+	 * --wal-upgrade-signal-handoff connects to the live old primary, writes
+	 * the handoff trigger into its WAL, and shuts the primary down at that
+	 * point so no transaction can append WAL after the handoff.
 	 */
 	if (user_opts.revertable_op == REVERTABLE_OP_SIGNAL_HANDOFF)
 	{
@@ -391,10 +376,8 @@ usage(void)
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
 	printf(_("  --copy                        copy files to new cluster (default)\n"));
 	printf(_("  --copy-file-range             copy files to new cluster with copy_file_range\n"));
-	/* --wal-upgrade usage */
-	printf(_("  --wal-upgrade                 capture the whole upgrade as WAL and reconstruct\n"
-			 "                                the cluster from it on first startup (atomic,\n"
-			 "                                crash-safe, WAL-replayable)\n"));
+	printf(_("  --wal-upgrade                 capture the whole upgrade as WAL, replayable\n"
+			 "                                and streamable to standbys\n"));
 	printf(_("  --wal-upgrade-signal-handoff  signal streaming standbys to stand down for a\n"
 			 "                                --wal-upgrade, then shut the old primary down\n"));
 	printf(_("  --initdb                      create the new cluster with initdb before\n"
