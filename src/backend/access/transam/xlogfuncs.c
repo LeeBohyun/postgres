@@ -699,44 +699,54 @@ EmitUpgradeWalWindow(uint32 old_major, uint32 new_major, uint8 transfer_mode,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("recovery is in progress")));
 
-	/*
-	 * Any migrated physical slot that pins the window was created by
-	 * pg_upgrade before this call.
-	 *
-	 * Step 1: flush SLRU dirty pages durably.
-	 */
-	XLogFlushUpgradeSLRU();
-
-	/*
-	 * Mark the control file "upgrade started" durably before emitting
-	 * START.  If the burst server dies after this point but before
-	 * finalize, the new cluster's control file carries
-	 * upgrade_started && !upgrade_finalized, which
-	 * PerformWalUpgradeIfNeeded() refuses to auto-serve even if the
-	 * START-bearing WAL is no longer present at first boot.
-	 */
-	SetControlFileUpgradeStarted();
-
-	/* 2. START */
-	(void) XLogWritePgUpgrade(true, old_major, new_major);
-
-	/* 3. directory skeleton */
-	(void) XLogWriteUpgradeDirSkel();
-
-	/* 4. relation-file images + RELINK manifest */
-	capture_all_relfiles(old_major, transfer_mode);
-
-	/* 5. SLRU bulk images: pg_xact, multixact offsets, multixact members */
-	(void) XLogWriteUpgradeSlruData(0);
-	(void) XLogWriteUpgradeSlruData(1);
-	(void) XLogWriteUpgradeSlruData(2);
-
-	/* 6. COMPLETE + durable finalized flag (unless suppressed for testing) */
-	if (!skip_complete)
+	/* no automatic checkpoint may displace CN while the window is emitted */
+	SetAutoCheckpointSuppressed(true);
+	PG_TRY();
 	{
-		(void) XLogWritePgUpgrade(false, old_major, new_major);
-		SetControlFileUpgradeFinalized();
+		/*
+		 * Any migrated physical slot that pins the window was created by
+		 * pg_upgrade before this call.
+		 *
+		 * Step 1: flush SLRU dirty pages durably.
+		 */
+		XLogFlushUpgradeSLRU();
+
+		/*
+		 * Mark the control file "upgrade started" durably before emitting
+		 * START.  If the burst server dies after this point but before
+		 * finalize, the new cluster's control file carries
+		 * upgrade_started && !upgrade_finalized, which
+		 * PerformWalUpgradeIfNeeded() refuses to auto-serve even if the
+		 * START-bearing WAL is no longer present at first boot.
+		 */
+		SetControlFileUpgradeStarted();
+
+		/* 2. START */
+		(void) XLogWritePgUpgrade(true, old_major, new_major);
+
+		/* 3. directory skeleton */
+		(void) XLogWriteUpgradeDirSkel();
+
+		/* 4. relation-file images + RELINK manifest */
+		capture_all_relfiles(old_major, transfer_mode);
+
+		/* 5. SLRU bulk images: pg_xact, multixact offsets, multixact members */
+		(void) XLogWriteUpgradeSlruData(0);
+		(void) XLogWriteUpgradeSlruData(1);
+		(void) XLogWriteUpgradeSlruData(2);
+
+		/* 6. COMPLETE + durable finalized flag (unless suppressed for testing) */
+		if (!skip_complete)
+		{
+			(void) XLogWritePgUpgrade(false, old_major, new_major);
+			SetControlFileUpgradeFinalized();
+		}
 	}
+	PG_FINALLY();
+	{
+		SetAutoCheckpointSuppressed(false);
+	}
+	PG_END_TRY();
 }
 
 Datum

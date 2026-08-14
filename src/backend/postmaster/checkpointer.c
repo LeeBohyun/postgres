@@ -409,7 +409,7 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 		 */
 		now = (pg_time_t) time(NULL);
 		elapsed_secs = now - last_checkpoint_time;
-		if (elapsed_secs >= CheckPointTimeout)
+		if (elapsed_secs >= CheckPointTimeout && !AutoCheckpointSuppressed())
 		{
 			if (!do_checkpoint)
 				chkpt_or_rstpt_timed = true;

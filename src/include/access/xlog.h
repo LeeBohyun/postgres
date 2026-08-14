@@ -313,11 +313,13 @@ extern void ArmControlFileForUpgradeRecovery(const struct CheckPoint *cn,
 extern XLogRecPtr GetControlFileCheckPointLSN(void);
 
 /*
- * informational DB_IN_UPGRADE flips during window replay (set at START,
- * cleared back to DB_IN_PRODUCTION at COMPLETE) -- diagnostics only
+ * DB_IN_UPGRADE flips during window replay (set at START, cleared back to
+ * DB_IN_PRODUCTION at COMPLETE); diagnostics only.
  */
 extern void SetControlFileInUpgrade(void);
 extern void ClearControlFileInUpgrade(void);
+extern void SetAutoCheckpointSuppressed(bool suppress);
+extern bool AutoCheckpointSuppressed(void);
 extern void SynthesizeUpgradeStreamControlFile(bool allow_overwrite);
 
 /*

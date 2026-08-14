@@ -488,6 +488,9 @@ typedef struct XLogCtlData
 	XLogRecPtr	asyncXactLSN;	/* LSN of newest async commit/abort */
 	XLogRecPtr	replicationSlotMinLSN;	/* oldest LSN needed by any slot */
 
+	/* skip automatic checkpoints while the --wal-upgrade window is emitted */
+	bool		suppressAutoCheckpoint;
+
 	XLogSegNo	lastRemovedSegNo;	/* latest removed/recycled XLOG segment */
 
 	/* Fake LSN counter, for unlogged relations. */
@@ -2544,7 +2547,8 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 				if (IsUnderPostmaster && XLogCheckpointNeeded(openLogSegNo))
 				{
 					(void) GetRedoRecPtr();
-					if (XLogCheckpointNeeded(openLogSegNo))
+					if (XLogCheckpointNeeded(openLogSegNo) &&
+						!AutoCheckpointSuppressed())
 						RequestCheckpoint(CHECKPOINT_CAUSE_XLOG);
 				}
 			}
@@ -4953,6 +4957,26 @@ ClearControlFileInUpgrade(void)
 		ControlFile->time = (pg_time_t) time(NULL);
 		UpdateControlFile();
 	}
+}
+
+/* Suppress or re-enable automatic checkpoints (see suppressAutoCheckpoint). */
+void
+SetAutoCheckpointSuppressed(bool suppress)
+{
+	SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->suppressAutoCheckpoint = suppress;
+	SpinLockRelease(&XLogCtl->info_lck);
+}
+
+bool
+AutoCheckpointSuppressed(void)
+{
+	bool		result;
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	result = XLogCtl->suppressAutoCheckpoint;
+	SpinLockRelease(&XLogCtl->info_lck);
+	return result;
 }
 
 /*

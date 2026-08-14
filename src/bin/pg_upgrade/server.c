@@ -205,52 +205,18 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 		appendPQExpBufferStr(&pgoptions,
 							 " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");
 
-		/*
-		 * --wal-upgrade additionally has to keep the WAL it just wrote.  Note
-		 * that fsync=off above does not weaken it: the upgrade window's page
-		 * images are registered with REGBUF_FORCE_IMAGE, which XLogInsert
-		 * honours regardless of full_page_writes, and the window is made
-		 * durable by the "Sync data directory to disk" step once this server
-		 * has shut down, not by fsync during the burst.
-		 */
 		if (user_opts.wal_upgrade)
 		{
 			/*
-			 * The end-of-upgrade window (CN checkpoint through
-			 * PG_UPGRADE_COMPLETE) must survive intact in pg_wal/ for first
-			 * startup and standby/PITR replay.  Its full-page images are as
-			 * large as the data (many GB, possibly TB), so checkpoints during
-			 * the burst must not recycle any of it.
-			 *
-			 * The large max_wal_size / checkpoint_timeout below ensure no
-			 * checkpoint fires between CN and shutdown, so nothing recycles
-			 * the window during generation on any path.
-			 *
-			 * For the window to survive AFTER the burst server shuts down, a
-			 * migrated physical slot pins it (see pg_upgrade.c), created
-			 * before CN with immediately_reserve when the old cluster had a
-			 * physical slot -- i.e. a standby was connected.  KeepLogSeg()
-			 * pins every segment at/after its restart_lsn, uncapped while
-			 * max_slot_wal_keep_size is -1; set that here so the pin is
-			 * size-independent.  With no such slot the window is not pinned:
-			 * on the archive-PITR path its durable home is the archive (post-
-			 * shutdown recycling is harmless), and with neither a slot nor
-			 * archiving --wal-upgrade has no window consumer at all, so it is
-			 * recycled as ordinary WAL.
+			 * The upgrade window must survive in pg_wal/ after the burst
+			 * server shuts down so a standby can stream it.  A migrated
+			 * physical slot pins it (see pg_upgrade.c); max_slot_wal_keep_size
+			 * = -1 leaves that pin uncapped so KeepLogSeg() never drops a
+			 * pinned segment by size.  (Automatic checkpoints during emission
+			 * are suppressed in the backend; see EmitUpgradeWalWindow.)
 			 */
 			appendPQExpBufferStr(&pgoptions,
-								 " -c max_slot_wal_keep_size=-1"
-								 " -c max_wal_size=1TB"
-								 " -c checkpoint_timeout=1h");
-
-			/*
-			 * Window archiving (--archive-command) is configured in the new
-			 * cluster's postgresql.conf, not here: an archive_command's
-			 * spaces and shell metacharacters do not survive pg_ctl's "-o"
-			 * string, and postgresql.conf also makes the auto-served cluster
-			 * archive its post-upgrade tail.  See
-			 * write_wal_upgrade_archive_conf().
-			 */
+								 " -c max_slot_wal_keep_size=-1");
 		}
 	}
 
