@@ -1,17 +1,7 @@
 /*
  *	revertable.c
  *
- *	--wal-upgrade lifecycle subcommand (signal-handoff).
- *
- *	A --wal-upgrade new cluster comes up read-write on its first start, as an
- *	ordinary pg_upgrade does.  This file implements the signal-handoff subcommand:
- *
- *	  --wal-upgrade-signal-handoff  -d old   trigger streaming standbys to stand down
- *
- *	(A fresh standby needs no prepare step: with primary_conninfo set it
- *	derives the upgrade window anchor (CN) locally from its retained old datadir
- *	and streams the window -- see ArmFromLocalDerivationIfConfigured in
- *	pgupgrade_wal.c.)
+ *	the --wal-upgrade signal-handoff subcommand
  *
  *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/revertable.c
@@ -27,14 +17,13 @@
 /*
  * --wal-upgrade-signal-handoff: connect to the live old primary and write the
  * streaming-handoff trigger into its (old-format) WAL.  It emits a WAL record
- * that propagates to streaming standbys through the normal replication path,
- * rather than contacting each standby.  On replaying it, a standby shuts down
- * cleanly, ready for the new-version binary swap / re-provision.  Run this
- * before stopping the old
- * primary and running pg_upgrade.
+ * that propagates to streaming standbys through the normal replication path.
+ * A standby replaying it shuts down cleanly, ready for the new-version binary
+ * swap / re-provision.  Run this before stopping the old primary and running
+ * pg_upgrade.
  *
  * Unlike --wal-upgrade itself (which acts on stopped clusters), this one
- * requires the old primary to be RUNNING.  The target major version passed to
+ * requires the old primary to be running.  The target major version passed to
  * the trigger is this pg_upgrade binary's own major (the new version the
  * standby will converge to).
  */
@@ -53,22 +42,14 @@ do_signal_handoff(void)
 				 "(needed to shut the old primary down at the handoff point)");
 
 	/*
-	 * Emit the handoff during the primary's own shutdown, not from a client
-	 * session.  A client-issued handoff cannot be the guaranteed end of the
-	 * old WAL stream: a backend past its commit point, or a fresh connection
-	 * racing the terminate/shutdown, can flush a commit record after the
-	 * marker, so a standby that stopped at the handoff would be missing an
-	 * acknowledged commit.
-	 *
-	 * Instead drop a sentinel and let the server emit the record itself.  On
-	 * a fast shutdown the postmaster drains every backend (flushing their
-	 * commit WAL) before the checkpointer runs ShutdownXLOG(); ShutdownXLOG()
-	 * then emits XLOG_UPGRADE_HANDOFF just before the shutdown checkpoint,
-	 * while WAL senders are still streaming.  By construction all user WAL
-	 * precedes the handoff, which precedes the shutdown checkpoint -- so the
-	 * handoff is the exact, race-free end of the old stream that streaming
-	 * standbys stop at. The sentinel records the target major version (this
-	 * pg_upgrade binary's own major, the version the standby converges to).
+	 * Emit the handoff during the primary's own shutdown.  On a fast shutdown
+	 * the postmaster drains every backend (flushing their commit WAL) before
+	 * the checkpointer runs ShutdownXLOG(); ShutdownXLOG() then emits
+	 * XLOG_UPGRADE_HANDOFF just before the shutdown checkpoint, while WAL
+	 * senders are still streaming.  By construction all user WAL precedes the
+	 * handoff, which precedes the shutdown checkpoint.  The sentinel records the
+	 * target major version (this pg_upgrade binary's own major, the version the
+	 * standby converges to).
 	 */
 	snprintf(sigpath, sizeof(sigpath), "%s/pg_upgrade_handoff.pending",
 			 old_cluster.pgdata);
@@ -84,9 +65,7 @@ do_signal_handoff(void)
 
 	/*
 	 * Fast-stop the old primary; ShutdownXLOG() consumes the sentinel and
-	 * emits the handoff.  system() rather than exec_prog(): the lifecycle
-	 * subcommand runs before make_outputdirs() has set log_opts.logdir, so
-	 * exec_prog() would fail on a "(null)/..." log path.
+	 * emits the handoff.
 	 */
 	prep_status("Shutting down the old primary at the handoff point");
 	snprintf(cmd, sizeof(cmd), "\"%s/pg_ctl\" -w -D \"%s\" -m fast stop",
@@ -112,8 +91,8 @@ do_signal_handoff(void)
 }
 
 /*
- * Dispatch a --wal-upgrade lifecycle subcommand and exit.  Called from main()
- * before the normal upgrade flow when user_opts.revertable_op is set.
+ * Dispatch the --wal-upgrade signal-handoff subcommand and exit.  Called from
+ * main() before the normal upgrade flow when user_opts.revertable_op is set.
  */
 void
 perform_revertable_op(void)
