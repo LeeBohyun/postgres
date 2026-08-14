@@ -98,11 +98,11 @@ static bool char_signedness_given = false;
 static bool char_signedness_val;
 
 /*
- * --wal-upgrade-exact: make the -l/--next-wal-file target authoritative so the
- * new WAL start position can be forced DOWN (not just floored upward over the
- * existing pg_wal/ segments and the current checkpoint).  Intended for internal
- * use by "pg_upgrade --wal-upgrade", which must land the end-of-upgrade
- * checkpoint (CN) at a byte-deterministic segment boundary.
+ * --wal-upgrade-exact: use the -l/--next-wal-file target exactly, even when it
+ * is earlier than pg_resetwal's normal floor (the position is otherwise only
+ * rounded up to the current checkpoint and the highest existing pg_wal/
+ * segment).  For internal use by "pg_upgrade --wal-upgrade", which must land the
+ * end-of-upgrade checkpoint at a byte-deterministic segment boundary.
  */
 static bool wal_upgrade_exact = false;
 
@@ -536,9 +536,10 @@ main(int argc, char *argv[])
 		/*
 		 * The -l target is authoritative: force the new WAL start to exactly
 		 * that segment, overriding the FindEndOfXLOG floor.  This is the only
-		 * way to move the position DOWN (below the current checkpoint / the
+		 * way to move the position below the current checkpoint (or the
 		 * highest existing pg_wal/ segment), which pg_upgrade --wal-upgrade
-		 * needs to land CN at a byte-deterministic boundary.
+		 * needs to land the end-of-upgrade checkpoint at a byte-deterministic
+		 * boundary.
 		 */
 		newXlogSegNo = minXlogSegNo;
 	}
@@ -1272,11 +1273,9 @@ usage(void)
 	printf(_("      --wal-segsize=SIZE           size of WAL segments, in megabytes\n"));
 
 	/*
-	 * --wal-upgrade-exact is intentionally NOT listed here: it is an internal
-	 * implementation detail of pg_upgrade --wal-upgrade (it forces the -l
-	 * target downward so the end-of-upgrade checkpoint lands at a
-	 * byte-deterministic boundary), not a user-facing option.  Kept
-	 * undocumented like other binary-upgrade-only machinery.
+	 * --wal-upgrade-exact is deliberately omitted here: like other
+	 * binary-upgrade-only options it is an internal detail of pg_upgrade
+	 * --wal-upgrade, not user-facing.
 	 */
 
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);

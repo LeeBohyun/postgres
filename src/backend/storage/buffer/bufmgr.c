@@ -5853,9 +5853,9 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 	 * binary-upgrade burst server.
 	 *
 	 * A hint-bit change does not advance the page's pd_lsn, but it DOES mark
-	 * the (permanent) page dirty, so the next checkpoint flushes it and --
-	 * per the WAL-before-data rule in FlushBuffer() -- forces XLogFlush up to
-	 * the page's existing pd_lsn.  Under --wal-upgrade the burst server that
+	 * the (permanent) page dirty, so the next checkpoint flushes it and, per
+	 * the WAL-before-data rule in FlushBuffer(), forces XLogFlush up to the
+	 * page's existing pd_lsn.  Under --wal-upgrade the burst server that
 	 * captures the window runs after pg_resetwal has rewound WAL to CN (the
 	 * old cluster's nextxlogfile), while the restore stamped catalog pages
 	 * with LSNs from BEFORE the rewind (past the current end of WAL).  If a
@@ -5863,12 +5863,10 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 	 * page, its shutdown checkpoint would try to flush WAL that no longer
 	 * exists and FATAL ("xlog flush request ... is not satisfied").
 	 *
-	 * Hint bits are a non-critical optimization -- this function already does
+	 * Hint bits are a non-critical optimization: this function already does
 	 * not guarantee the buffer is marked dirty (e.g. on a hot standby), and
-	 * callers tolerate that -- so skipping them in binary-upgrade mode is
-	 * safe: the new cluster simply re-derives them on first access.  This
-	 * keeps the captured pages clean so the burst server shuts down cleanly
-	 * with WAL rewound to CN.
+	 * callers tolerate that.  Skipping them in binary-upgrade mode is safe:
+	 * the new cluster re-derives them on first access.
 	 */
 	if (IsBinaryUpgrade)
 		return;

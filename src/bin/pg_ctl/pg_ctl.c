@@ -273,14 +273,13 @@ get_pgpid(bool is_status_request)
 		struct stat sigbuf;
 
 		/*
-		 * A --wal-upgrade streaming standby may be staged without initdb -- a
+		 * A --wal-upgrade streaming standby may be staged without initdb: a
 		 * bare directory carrying only config plus the pg_upgrade.signal
-		 * sentinel.  PG_VERSION does not exist yet; the postmaster
-		 * synthesizes it (and pg_control) on start.  So if the sentinel is
-		 * present, do not reject the directory here -- there is simply no
-		 * server running yet, so report "no pid" (0) exactly as for a normal
-		 * not-yet-started cluster and let do_start() launch the postmaster,
-		 * which does the synthesis.
+		 * sentinel.  PG_VERSION does not exist yet; the postmaster synthesizes
+		 * it (and pg_control) at startup.  When the sentinel is present, report
+		 * "no pid" (0) as for any not-yet-started cluster rather than rejecting
+		 * the directory, and let do_start() launch the postmaster to perform
+		 * the synthesis.
 		 */
 		snprintf(sigpath, sizeof(sigpath), "%s/pg_upgrade.signal", pg_data);
 		if (stat(sigpath, &sigbuf) == 0)

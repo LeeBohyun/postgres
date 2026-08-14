@@ -7,9 +7,9 @@
  *   XLOG_UPGRADE_START    (0x00) -- window open, write PG_VERSION
  *   XLOG_UPGRADE_COMPLETE (0x10) -- window close, informational
  *   XLOG_UPGRADE_DIRTREE     (0x40) -- initdb directory + symlink skeleton
- *   XLOG_UPGRADE_RAWFILE     (0x50) -- verbatim non-relation file image, written at
+ *   XLOG_UPGRADE_RAWFILE     (0x50) -- raw non-relation file image, written at
  *                                     a byte offset (PG_VERSION, SLRU segments)
- *   XLOG_UPGRADE_HANDOFF     (0x60) -- stand-down trigger for an old-format standby
+ *   XLOG_UPGRADE_HANDOFF     (0x60) -- shut-down trigger for an old-cluster standby
  *   XLOG_UPGRADE_RELINK      (0x70) -- manifest of user relation files a streaming
  *                                     standby links from its retained old datadir
  *                                     (the window omits their data)
@@ -119,9 +119,7 @@ UpgradeWalPageRead(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 
 /*
  * Parse the WAL in "waldir" and locate the pg_upgrade markers plus the
- * end-of-upgrade checkpoint (CN) that recovery must anchor at.  A real
- * XLogReader is used, not a byte-pattern match: the upgrade WAL is full of
- * arbitrary full-page-image bytes, so any fixed byte pair recurs by chance.
+ * end-of-upgrade checkpoint (CN) that recovery must anchor at.
  *
  * Out-params:
  *   found_start / found_complete -- the START / COMPLETE markers were seen.
@@ -163,9 +161,8 @@ UpgradeWalScanMarkers(const char *waldir, bool *found_start,
 	MemSet(&last_ckpt, 0, sizeof(CheckPoint));
 
 	/*
-	 * First pass over the directory: determine the segment size (all WAL
-	 * segment files are exactly one segment long) and the lowest/highest
-	 * segment numbers present.
+	 * Determine the segment size (all WAL segment files are exactly one
+	 * segment long) and the lowest/highest segment numbers present.
 	 */
 	dir = AllocateDir(waldir);
 	if (dir == NULL)
@@ -213,13 +210,11 @@ UpgradeWalScanMarkers(const char *waldir, bool *found_start,
 
 	/*
 	 * Bound the scan to the contiguous run of TLI-1 segments ending at
-	 * highseg, not from lowseg.  The upgrade window is always the topmost
-	 * contiguous run; when delivered by archive-PITR staging, pg_wal/ can
-	 * also hold unrelated pre-window segments from the restored base backup,
-	 * with a gap between them. Starting at lowseg would make
-	 * XLogFindNextRecord walk into that hole and FATAL.  Walk down from
-	 * highseg while each preceding segment is present.  (On the primary's own
-	 * first start the window is the only content, so runstart == lowseg.)
+	 * highseg, not from lowseg.  When delivered by archive-PITR staging,
+	 * pg_wal/ can also hold unrelated pre-window segments from the restored
+	 * base backup, with a gap before the window.  Starting at lowseg would
+	 * make XLogFindNextRecord walk into that hole and FATAL, so walk down
+	 * from highseg while each preceding segment is present.
 	 */
 	runstart = highseg;
 	{
@@ -244,8 +239,7 @@ UpgradeWalScanMarkers(const char *waldir, bool *found_start,
 	 * xlp_sysid in the run-start segment's long page header.  Recovery
 	 * validates every WAL page's xlp_sysid against
 	 * pg_control->system_identifier, so the arming step stamps pg_control
-	 * with this value -- letting a fresh skeleton adopt the sysid in-process
-	 * from the WAL, exactly as it does CN, with no offline sysid stamping.
+	 * with this value, letting a fresh skeleton adopt the sysid from the WAL.
 	 */
 	{
 		int			fd = OpenTransientFile(runstart_path, O_RDONLY | PG_BINARY);
@@ -299,7 +293,7 @@ UpgradeWalScanMarkers(const char *waldir, bool *found_start,
 		uint8		info;
 
 		if (record == NULL)
-			break;				/* end of WAL or unreadable -- stop */
+			break;				/* end of WAL or unreadable */
 
 		rmid = XLogRecGetRmid(reader);
 		info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
@@ -345,44 +339,36 @@ UpgradeWalScanMarkers(const char *waldir, bool *found_start,
 
 
 /*
- * True once PerformWalUpgradeIfNeeded() has armed the sanctioned upgrade
- * bootstrap for this startup.  The redo handlers consult it to distinguish the
- * bootstrap replay (apply the upgrade images) from an ordinary/standby stream
- * that merely contains these records (stop and require a restart).
- * Startup-process-local.
+ * True once PerformWalUpgradeIfNeeded() has armed the upgrade replay for this
+ * startup.  The redo handlers use it to tell that armed replay (apply the
+ * upgrade images) from an ordinary/standby stream.
  */
 static bool in_upgrade_bootstrap = false;
 
 /*
  * Set when first-startup armed the streaming-standby path (a fresh skeleton
- * auto-armed from the primary), as opposed to the primary's own crash recovery
- * or an archive/PITR restore.  On the streaming path the skeleton is empty of
- * user data, so an XLOG_UPGRADE_RELINK manifest with no old-datadir path to link
- * from is a fatal misconfiguration (the user relations would silently be
- * absent); on the other two paths the files are already on disk, so the same
- * manifest is a legitimate no-op.  Startup-process-local.
+ * auto-armed from the primary), rather than the primary's own crash recovery or
+ * an archive/PITR restore.  On the streaming path the skeleton has no user data,
+ * so an XLOG_UPGRADE_RELINK manifest with no old-datadir path to link from is a
+ * fatal misconfiguration.  On the other two paths the files are already on disk,
+ * so the same manifest is a legitimate no-op.  Startup-process-local.
  */
 static bool armed_streaming_standby = false;
 
 /*
- * The CN LSN the streaming-standby path armed recovery at (locally derived from
- * the retained old datadir; see ArmFromLocalDerivationIfConfigured).  Recorded so
- * the XLOG_UPGRADE_START redo handler can verify the checkpoint recovery actually
- * began at matches the derivation -- turning a wrong derivation into a clear FATAL
- * rather than silent mis-recovery.  InvalidXLogRecPtr on every other path.
- * Startup-process-local.
+ * The CN LSN the streaming-standby path derived from the retained old datadir
+ * and stamped into pg_control as the recovery anchor (see
+ * ArmFromLocalDerivationIfConfigured).  The XLOG_UPGRADE_START redo handler
+ * checks that recovery's redo pointer equals it.  A mismatch means the
+ * derivation picked the wrong CN, so it FATALs rather than mis-recovering
+ * silently.
  */
 static XLogRecPtr armed_cn_lsn = InvalidXLogRecPtr;
 
 /*
- * Is the durable "window reached COMPLETE" flag set in pg_control?  It is set
- * and fsync'd by the XLOG_UPGRADE_COMPLETE redo handler (and by pg_upgrade on
- * the primary, which does not replay) the instant the window reaches COMPLETE,
- * so it distinguishes a completed upgrade from a crashed partial one even when
- * a torn final WAL page hides the COMPLETE record from the scan.  The caller
- * pairs it with a control checkpoint past CN to decide "finalized" (see
- * PerformWalUpgradeIfNeeded).  Reads the control file already loaded by
- * LocalProcessControlFile() before the startup process runs.
+ * Is the durable "window reached COMPLETE" flag set in pg_control?  Set by the
+ * XLOG_UPGRADE_COMPLETE redo handler when the window completes, it distinguishes
+ * a finished upgrade from a crashed partial one.
  */
 static bool
 UpgradeWindowFinalized(void)
@@ -400,13 +386,13 @@ UpgradeWindowFinalized(void)
  *                 highest segment in <old_datadir>/pg_wal ) + 1
  *
  * The scan takes the max segno over all timelines and over partial (.partial)
- * segments, without a timeline filter, exactly as pg_resetwal.c FindEndOfXLOG
+ * segments, without a timeline filter, as pg_resetwal.c FindEndOfXLOG
  * does.  This must match pg_resetwal because the producer's -l target came from
  * the old cluster's own "pg_resetwal -n" result: if the old cluster was ever
  * promoted, a higher-timeline segment could hold the max segno, and a
  * TLI-1-only scan would compute a smaller CN_seg than the producer targeted.
  * (The window itself is on timeline 1, but this is a floor computation, not a
- * window scan.)  The +1 advances into virgin territory, as pg_resetwal does.
+ * window scan.)  The +1 advances to the next unused segment, as pg_resetwal does.
  * Segment math uses the old cluster's segment size.
  */
 static XLogSegNo
@@ -445,7 +431,7 @@ DeriveUpgradeCnSegment(const char *old_datadir, XLogRecPtr old_tail,
 	}
 	FreeDir(dir);
 
-	/* Advance by one into virgin territory (matches pg_resetwal). */
+	/* Advance by one to the next unused segment (matches pg_resetwal). */
 	return maxseg + 1;
 }
 
@@ -472,12 +458,12 @@ UpgradeSignalStaged(void)
  *
  * A fresh vN+1 skeleton with primary_conninfo set arms its control file at CN
  * without asking the primary for the anchor: it derives CN itself from its own
- * retained old data directory, exactly reproducing where the producer's
- * pg_resetwal placed CN.  The one thing it still needs from the primary is the
- * system identifier -- the new cluster's sysid, which the window WAL pages are
- * stamped with -- and that comes from the standard IDENTIFY_SYSTEM command it
- * would run anyway.  Runs in the startup process before StartupXLOG, so no SQL
- * backend is needed.
+ * retained old data directory, reproducing where the producer's pg_resetwal
+ * placed CN.  The one thing it still needs from the primary is the system
+ * identifier: the new cluster's sysid, which the window WAL pages are stamped
+ * with.  That comes from the standard IDENTIFY_SYSTEM command it would run
+ * anyway.  Runs in the startup process before StartupXLOG, so no SQL backend is
+ * needed.
  *
  * Derivation:
  *   1. sysid from IDENTIFY_SYSTEM on the primary (== the new cluster's sysid).
@@ -546,7 +532,7 @@ ArmFromLocalDerivationIfConfigured(void)
 	 * A streamed upgrade standby must also be in standby mode: arming the
 	 * control file at CN commits this node to following the primary's forward
 	 * WAL (which exists only on the primary).  Without standby.signal the
-	 * node would leave recovery and come up read-write at CN -- split-brain
+	 * node would leave recovery and come up read-write at CN, split-brain
 	 * against the real primary.  standby.signal is the operator's
 	 * responsibility (like any standby); if the upgrade sentinel is staged
 	 * with primary_conninfo but without it, refuse to arm rather than risk
@@ -611,8 +597,8 @@ ArmFromLocalDerivationIfConfigured(void)
 	 * Read the retained old cluster's control file to get old_tail (its clean
 	 * shutdown checkpoint redo == checkPoint) and its WAL segment size. Using
 	 * the backend get_controlfile(): it OpenTransientFile()s the file,
-	 * palloc's a copy, and CRC-checks it -- no shared state, safe from the
-	 * startup process before StartupXLOG.
+	 * palloc's a copy, and CRC-checks it, with no shared state, so it is safe
+	 * from the startup process before StartupXLOG.
 	 *
 	 * Pre-check that the control file is present and readable:
 	 * get_controlfile() ereport(ERROR)s with a generic "could not open file"
@@ -785,7 +771,7 @@ PerformWalUpgradeIfNeeded(void)
 		 * window arrives later via restore_command as recovery replays
 		 * forward from a pre-upgrade base backup across the upgrade boundary.
 		 * Recovery starts at the base backup's checkpoint and flows through
-		 * CN organically, so no re-anchoring is needed here; just arm
+		 * CN organically, so no re-anchoring is needed here; arm
 		 * in_upgrade_bootstrap so the XLOG_UPGRADE_START redo does not FATAL
 		 * when the window is reached. (This is the archive path because there
 		 * is no local window and, on this branch, recovery.signal drives the
@@ -826,8 +812,8 @@ PerformWalUpgradeIfNeeded(void)
 	 * set upgrade_started in pg_control just before emitting
 	 * XLOG_UPGRADE_START; the COMPLETE path sets upgrade_finalized.  So
 	 * upgrade_started && !finalized is a partial (crashed) upgrade that must
-	 * never auto-serve its half-built catalog -- even if the START-bearing
-	 * WAL did not survive to first boot (byte- contiguous CN generation can
+	 * never auto-serve its half-built catalog, even if the START-bearing
+	 * WAL did not survive to first boot (byte-contiguous CN generation can
 	 * recycle those segments, so the shutdown checkpoint then hides START
 	 * from the scan above and found_start is false). Refuse before the
 	 * found_start early-return that would otherwise treat this as an ordinary
@@ -864,7 +850,7 @@ PerformWalUpgradeIfNeeded(void)
 	 * A complete window whose checkpoint has not yet advanced past CN is a
 	 * pending or mid-finalization upgrade (first start, or a crash after the
 	 * COMPLETE marker but before the end-of-recovery checkpoint).  Fall
-	 * through to arm and (re-)replay it -- the window images are idempotent.
+	 * through to arm and (re-)replay it.  The window images are idempotent.
 	 * Only a window that never reached COMPLETE is a genuine partial upgrade:
 	 * the catalog is half-built and, since the new cluster auto-serves
 	 * read-write at end of recovery, arming it would serve a corrupt catalog.
@@ -903,7 +889,7 @@ PerformWalUpgradeIfNeeded(void)
 	ArmControlFileForUpgradeRecovery(&cn, cn_lsn, wal_sysid, false);
 
 	/*
-	 * Arm the sanctioned bootstrap so the redo handlers may apply the upgrade
+	 * Arm the bootstrap so the redo handlers may apply the upgrade
 	 * images.  A pg_upgrade record reached without this flag came in through
 	 * an ordinary/standby stream and must not be applied live (see
 	 * pg_upgrade_redo).
@@ -936,14 +922,14 @@ PerformWalUpgradeIfNeeded(void)
  *   SWAP            - rename(), moving the file out of the old datadir.
  *
  * Like the reflink modes in pg_upgrade itself, CLONE/COPY_FILE_RANGE FATAL if the
- * filesystem cannot reflink rather than fall back to a full copy -- so the standby
+ * filesystem cannot reflink rather than fall back to a full copy.  The standby
  * either reproduces the operator's chosen space profile or refuses, never silently
- * costs 2x.  The caller has already unlink()ed any pre-existing dst.
+ * costing 2x.  The caller has already unlink()ed any pre-existing dst.
  *
  * The placed file is fsync'd before returning (the caller fsyncs the parent dir).
  * These files bypass smgr, so the checkpointer has no sync request for them and the
  * end-of-recovery checkpoint would otherwise advance pg_control past CN with the
- * data only in the OS cache -- a crash there would leave a finalized upgrade with
+ * data only in the OS cache.  A crash there would leave a finalized upgrade with
  * missing user relations, never re-replayed.
  */
 static void
@@ -1048,8 +1034,8 @@ RelinkPlaceFile(const char *oldfile, const char *newfile, uint8 mode)
 	 * Make the placed file's contents durable.  copy_file() flushes but does
 	 * not fsync (its bin/ callers fsync separately); the reflink/hardlink
 	 * paths fsync nothing.  Without this the end-of-recovery checkpoint could
-	 * advance the control file past CN with the data still in the OS cache --
-	 * see the function header.  The caller fsyncs the parent directory so the
+	 * advance the control file past CN with the data still in the OS cache.
+	 * See the function header.  The caller fsyncs the parent directory so the
 	 * new dentry itself is durable.
 	 */
 	fsync_fname(newfile, false);
@@ -1059,10 +1045,10 @@ RelinkPlaceFile(const char *oldfile, const char *newfile, uint8 mode)
  * Build the source path of a user relation in the retained old datadir for
  * XLOG_UPGRADE_RELINK redo.
  *
- * For base/ and global/ relations the relpath is version-independent and we
- * just prefix the old datadir.  For a relation in a user-created tablespace the
+ * For base/ and global/ relations the relpath is version-independent, so
+ * prefixing the old datadir is correct.  For a relation in a user-created tablespace the
  * relpath GetRelationPath() produced embeds this (new) binary's
- * TABLESPACE_VERSION_DIRECTORY -- "PG_<newmajor>_<newcat>" -- but the retained
+ * TABLESPACE_VERSION_DIRECTORY ("PG_<newmajor>_<newcat>"), but the retained
  * old datadir's tablespace area only holds the old version's directory
  * ("PG_<oldmajor>_<oldcat>").  Blindly prefixing would name a nonexistent path
  * and the entry would be silently skipped, losing every tablespace relation on
@@ -1158,7 +1144,7 @@ pg_upgrade_redo(XLogReaderState *record)
 		/*
 		 * Standby / ordinary-stream guard.  The upgrade image records carry
 		 * the old cluster's page LSNs and are only safe to apply from the
-		 * sanctioned bootstrap (anchored at CN into a non-serving data
+		 * upgrade bootstrap (anchored at CN into a non-serving data
 		 * directory).  Reaching START without in_upgrade_bootstrap means an
 		 * ordinary/standby stream, so FATAL at the boundary rather than apply
 		 * the window live.
@@ -1451,19 +1437,18 @@ pg_upgrade_redo(XLogReaderState *record)
 		/*
 		 * Manifest of user relation files the window omits.  On a streaming
 		 * standby, link each from this node's retained old datadir into the
-		 * new skeleton at the identical relative path -- pg_upgrade preserves
+		 * new skeleton at the identical relative path.  pg_upgrade preserves
 		 * relfilenumbers and db/tablespace OIDs, so old and new paths match.
 		 * This is the standby's equivalent of the primary's
 		 * transfer_relfile() step, driven by replay.
 		 *
 		 * The old datadir path is standby-local, supplied via the
 		 * pg_upgrade_standby_old_datadir GUC (see
-		 * ArmFromLocalDerivationIfConfigured); read it here.  When it is
-		 * unset -- on the primary (which already has the files) and on
-		 * archive/PITR recovery (the old files arrived with the base backup)
-		 * -- there is nothing to do.  A streaming standby that reaches this
-		 * record with no path cannot materialize user data, so it FATALs (see
-		 * below).
+		 * ArmFromLocalDerivationIfConfigured); read it here.  When it is unset
+		 * there is nothing to do: on the primary the files are already present,
+		 * and on archive/PITR recovery the old files arrived with the base
+		 * backup.  A streaming standby that reaches this record with no path
+		 * cannot materialize user data, so it FATALs (see below).
 		 */
 		char	   *ptr = XLogRecGetData(record);
 		char	   *end = ptr + XLogRecGetDataLen(record);
@@ -1476,12 +1461,12 @@ pg_upgrade_redo(XLogReaderState *record)
 			/*
 			 * A streaming-standby skeleton (armed_streaming_standby) is empty
 			 * of user data, so reaching the manifest with no old-datadir path
-			 * to link from means every user relation would silently be absent
-			 * -- a misconfiguration, not a no-op.  Refuse to continue rather
+			 * to link from means every user relation would silently be absent,
+			 * a misconfiguration rather than a no-op.  Refuse to continue rather
 			 * than bring up a hot standby that is missing all its user data.
 			 * (On the primary's own crash recovery and on archive/PITR the
 			 * files are already on disk, so the same manifest is a legitimate
-			 * no-op and we just move on.)
+			 * no-op.)
 			 */
 			if (armed_streaming_standby)
 				ereport(FATAL,
@@ -1544,7 +1529,7 @@ pg_upgrade_redo(XLogReaderState *record)
 
 				/*
 				 * Effective placement mode.  Only "mirror" consults the
-				 * manifest tuple's transfer_mode -- so only then do we read
+				 * manifest tuple's transfer_mode, so only then do we read
 				 * and bounds-check it (it selects a placement primitive).
 				 * With an operator override the manifest's mode is irrelevant
 				 * and left untouched; forced_mode comes from a validated GUC
@@ -1580,7 +1565,7 @@ pg_upgrade_redo(XLogReaderState *record)
 				 * The destination path is version-stable (this binary built
 				 * both relpath and DataDir), but the source path in the
 				 * retained old datadir uses the old version's tablespace
-				 * directory for a user-tablespace relation -- resolve it (see
+				 * directory for a user-tablespace relation, so resolve it (see
 				 * RelinkBuildOldFile).
 				 */
 				if (!RelinkBuildOldFile(old_datadir, rlocator.spcOid,
@@ -1616,9 +1601,9 @@ pg_upgrade_redo(XLogReaderState *record)
 				 * RelinkPlaceFile for the per-mode taxonomy).
 				 *
 				 * The manifest is authoritative for user data, so a
-				 * destination that already exists -- an empty placeholder a
+				 * destination that already exists (an empty placeholder a
 				 * RELFILE image created for a same-numbered relation, or a
-				 * prior replay of this record -- is removed and replaced.  A
+				 * prior replay of this record) is removed and replaced.  A
 				 * source that has since vanished (ENOENT) is skipped.
 				 */
 				if (stat(oldfile, &oldstat) != 0)
@@ -1653,7 +1638,7 @@ pg_upgrade_redo(XLogReaderState *record)
 	else if (info == XLOG_UPGRADE_RAWFILE)
 	{
 		/*
-		 * Write one chunk of a verbatim non-relation file (PG_VERSION, or an
+		 * Write one chunk of a raw non-relation file (PG_VERSION, or an
 		 * SLRU segment under pg_xact/ or pg_multixact/), creating any missing
 		 * parent directory.  These files are not reachable through the buffer
 		 * manager, so this is the only way to rebuild them from an

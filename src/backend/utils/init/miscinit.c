@@ -416,23 +416,14 @@ checkDataDir(void)
 			/*
 			 * Streaming standby: a fresh new-version skeleton staged with the
 			 * pg_upgrade.signal sentinel and a primary to stream from.  User
-			 * relations are not in the window; they are linked in from the
-			 * retained old datadir (named in pg_upgrade.signal's contents) by
-			 * the RELINK-manifest redo.  Two skeleton shapes are accepted:
+			 * relations are not in the window.  The RELINK-manifest redo links
+			 * them from the retained old datadir named in the sentinel.
 			 *
-			 * - a real initdb skeleton (has a valid new-version pg_control /
-			 * PG_VERSION already): it passes the version gate on its own, so
-			 * nothing to synthesize -- the anchor arm just re-stamps its
-			 * control file at CN. - a bare skeleton (no PG_VERSION yet):
-			 * synthesize a minimal new-version pg_control + PG_VERSION so the
-			 * gate passes.
-			 *
-			 * Either way the skeleton must not be a populated old datadir;
-			 * that is the relink source named in the sentinel, never the
-			 * streaming target.  We cannot verify "new-version skeleton" here
-			 * (ReadControlFile below is what version-checks), but we never
-			 * synthesize OVER an existing control file, so an old datadir
-			 * mistakenly used here fails cleanly at the version gate.
+			 * Two skeleton shapes are accepted: a real initdb skeleton (has a
+			 * new-version pg_control/PG_VERSION, so it passes the version gate
+			 * and only needs re-anchoring at CN), or a bare skeleton (no
+			 * PG_VERSION yet, so synthesize a minimal one).  Either way it must
+			 * not be a populated old datadir.
 			 */
 			if (stat(verpath, &st) != 0)
 				SynthesizeUpgradeStreamControlFile(false);
@@ -441,24 +432,18 @@ checkDataDir(void)
 		{
 			/*
 			 * ARCHIVE-PITR cross-version recovery (Phase 2).  The data
-			 * directory here is a pre-upgrade base backup that Phase 1 (the
-			 * OLD binary) replayed up to the upgrade boundary and shut down,
-			 * so it still carries the OLD major's pg_control/PG_VERSION --
-			 * which this NEW binary would reject at the version gate below.
-			 * This keys off the ordinary recovery.signal (this IS an archive
-			 * restore, and no primary_conninfo, so not the streaming branch
-			 * above) plus the pg_upgrade.signal sentinel dropped alongside
-			 * the staged upgrade window: only a genuine cross-version
-			 * upgrade-PITR has both, so a normal same-version PITR
-			 * (recovery.signal but no sentinel) is never affected.  A plain
-			 * stat() matches how the backend already selects recovery mode
-			 * (see readRecoverySignalFile()); the authoritative check that a
-			 * complete window is really present is left to
-			 * PerformWalUpgradeIfNeeded(), which FATALs on a partial window.
-			 * Synthesize a NEW-version pg_control from this binary's
-			 * constants so the gate passes; recovery then re-anchors at CN,
-			 * adopts the window's sysid, and replays the window + archived
-			 * tail.
+			 * directory is a pre-upgrade base backup that Phase 1 (the OLD
+			 * binary) replayed to the upgrade boundary and shut down, so it
+			 * still carries the OLD major's pg_control/PG_VERSION, which this
+			 * NEW binary would reject at the version gate below.
+			 *
+			 * It is gated on recovery.signal (an archive restore, no
+			 * primary_conninfo, so not the streaming branch above) plus the
+			 * pg_upgrade.signal sentinel: only a genuine cross-version
+			 * upgrade-PITR has both, so a normal same-version PITR is
+			 * unaffected.  Synthesize a new-version pg_control so the gate
+			 * passes; recovery then re-anchors at CN, adopts the window's
+			 * sysid, and replays the window plus the archived tail.
 			 */
 			SynthesizeUpgradeStreamControlFile(true);
 		}

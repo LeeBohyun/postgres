@@ -441,15 +441,12 @@ binary_upgrade_create_conflict_detection_slot(PG_FUNCTION_ARGS)
  * binary_upgrade_emit_wal_window
  *
  * pg_upgrade --wal-upgrade: emit the whole upgrade window (CN..COMPLETE) as WAL
- * in a single call.  The frontend invokes this once, on the burst server it
- * started in binary-upgrade mode; the whole capture runs inside this one call
- * rather than through separate SQL-exposed WAL-injection primitives.  Gated on
- * IsBinaryUpgrade so the WAL-generation machinery is never reachable as SQL on
- * an ordinary cluster.
+ * in a single call.  The frontend invokes this once, on the server pg_upgrade
+ * started in binary-upgrade mode.  Gated on IsBinaryUpgrade so it is never
+ * reachable as SQL on an ordinary cluster.
  *
  * Args: old_major_version int4, new_major_version int4, transfer_mode int4,
- *       skip_complete bool (test-only: omit the COMPLETE marker to simulate a
- *       crash mid-window).
+ *       skip_complete bool.
  */
 Datum
 binary_upgrade_emit_wal_window(PG_FUNCTION_ARGS)

@@ -322,15 +322,12 @@ RelationMapCopy(Oid dbid, Oid tsid, char *srcdbpath, char *dstdbpath)
  * server's own mapping state.
  *
  * pg_upgrade --wal-upgrade uses this to put the new cluster's maps into the
- * upgrade window: the map files were written outside the server by pg_upgrade,
- * so there is nothing in shared memory to log.  Reading the file and emitting
- * XLOG_RELMAP_UPDATE means the map travels as an ordinary relmap record, whose
- * redo derives the destination path from (dbid, tsid) -- the same record
- * CREATE DATABASE uses for a freshly created database.
+ * upgrade window.  Emitting XLOG_RELMAP_UPDATE lets the map travel as an
+ * ordinary relmap record whose redo derives the destination from (dbid, tsid).
  *
- * "dbid" is InvalidOid for the shared map in global/.  Note relmap_redo()
- * requires nbytes == sizeof(RelMapFile), so only a map written by this same
- * major version can be logged this way.
+ * "dbid" is InvalidOid for the shared map in global/.  relmap_redo() requires
+ * nbytes == sizeof(RelMapFile), so only a map written by this same major
+ * version can be logged this way.
  */
 void
 RelationMapLogFromDir(Oid dbid, Oid tsid, char *dbpath)
