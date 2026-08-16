@@ -138,8 +138,8 @@ main(int argc, char **argv)
 	parseCommandLine(argc, argv);
 
 	/*
-	 * A --wal-upgrade lifecycle subcommand acts on the running old cluster
-	 * and exits without running an upgrade.  new_cluster.bindir locates
+	 * The --wal-upgrade signal-handoff subcommand acts on the running old
+	 * cluster and exits without running an upgrade.  new_cluster.bindir locates
 	 * pg_ctl.
 	 */
 	if (user_opts.revertable_op != REVERTABLE_OP_NONE)

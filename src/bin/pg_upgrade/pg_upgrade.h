@@ -266,8 +266,9 @@ typedef enum
 } transferMode;
 
 /*
- * Revertable-upgrade lifecycle subcommands.  When set (not _NONE),
- * pg_upgrade does not run an upgrade. It acts on an existing cluster and exits.
+ * Selects a --wal-upgrade subcommand that acts on an existing cluster instead
+ * of running an upgrade.  When set (not _NONE), pg_upgrade performs that action
+ * and exits.  Currently the only such subcommand is signal-handoff.
  */
 typedef enum
 {
