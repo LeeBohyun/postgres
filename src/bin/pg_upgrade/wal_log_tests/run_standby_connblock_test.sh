@@ -37,8 +37,7 @@ wal_level=replica
 max_wal_senders=8
 CONF
 "$BIN/pg_ctl" -D "$OLD" -l "$W/old.log" -w start >/dev/null 2>&1 || { echo FAIL start; exit 1; }
-# A physical slot marks that a standby is expected; pg_upgrade migrates it and
-# it pins the upgrade window so the skeleton below can stream it.
+# Physical slot pins upgrade window for skeleton streaming.
 "$BIN/psql" -h "$W" -p $PP -U postgres -qtAc \
   "SELECT pg_create_physical_replication_slot('stby_slot', true)" >/dev/null 2>&1 || { echo FAIL create-slot; exit 1; }
 # many relations so the RELINK manifest + system-catalog window are non-trivial
@@ -53,7 +52,7 @@ EXPECT=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*) FROM big")
 log "expected final row count: $EXPECT"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-# The standby's own retained pre-upgrade datadir (relink source).
+# Standby's retained old datadir (relink source).
 cp -a "$OLD" "$STBY_OLD"
 
 log "pg_upgrade --wal-upgrade --initdb --copy; keep the primary live for streaming"
@@ -73,8 +72,8 @@ echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
 
 log "build a fresh skeleton that streams the window; probe connections during replay"
 "$BIN/initdb" -D "$SKEL" -U postgres -N >/dev/null 2>&1 || { echo "FAIL: skeleton initdb"; exit 1; }
-# old-datadir path now comes from the pg_upgrade_standby_old_datadir GUC;
-# pg_upgrade.signal is an empty presence-only sentinel.
+# old-datadir from pg_upgrade_standby_old_datadir GUC; pg_upgrade.signal is a
+# presence-only sentinel.
 echo "pg_upgrade_standby_old_datadir='$STBY_OLD'" >> "$SKEL/postgresql.conf"
 : > "$SKEL/pg_upgrade.signal"
 cat >> "$SKEL/postgresql.conf" <<CONF
@@ -106,9 +105,8 @@ for p in $PP $SP; do lsof -ti :$p 2>/dev/null | xargs kill -9 2>/dev/null; done
 [ "$UP" = 1 ] || { echo "FAIL: standby never converged"; tail -15 "$W/skel.log"; exit 1; }
 
 log "analyze probe results"
-# Each probe outcome must be either a clean rejection while recovering, or the
-# correct final count.  Anything else means a client observed a half-upgraded
-# cluster mid-window.
+# Each probe: clean rejection while recovering, or final count. Anything else =
+# client saw half-upgraded cluster.
 GOOD_FINAL=0; REJECTED=0; BAD=0
 while IFS= read -r line; do
   [ -z "$line" ] && continue
@@ -123,9 +121,7 @@ while IFS= read -r line; do
 done < "$PROBE"
 log "probe results: final-count reads=$GOOD_FINAL  clean-rejections=$REJECTED  anomalies=$BAD"
 [ "$BAD" -eq 0 ] || FAIL=1
-# The guard must actually have blocked something (else the race did not happen):
-# require at least one clean rejection, proving connections were attempted before
-# the window finished replaying.
+# Guard must have blocked something (prove race occurred): require at least one rejection.
 [ "$REJECTED" -ge 1 ] || { echo "WARN: no rejections seen -- replay may have finished before the first probe (not a failure, but the race was not exercised)"; }
 [ "$GOOD_FINAL" -ge 1 ] || { echo "FAIL: never observed the converged count -- standby did not serve"; FAIL=1; }
 

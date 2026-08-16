@@ -267,13 +267,13 @@ typedef enum
 
 /*
  * Revertable-upgrade lifecycle subcommands.  When set (not _NONE),
- * pg_upgrade does not run an upgrade; it acts on an existing cluster and exits.
+ * pg_upgrade does not run an upgrade. It acts on an existing cluster and exits.
  */
 typedef enum
 {
 	REVERTABLE_OP_NONE = 0,		/* normal pg_upgrade run */
 	REVERTABLE_OP_SIGNAL_HANDOFF,	/* emit the handoff trigger into the LIVE
-									 * old primary's WAL; it propagates to
+									 * old primary's WAL. It propagates to
 									 * streaming standbys through the normal
 									 * WAL/replication path, which replay it
 									 * and then stand down before the upgrade */
@@ -365,10 +365,10 @@ typedef struct
 									 * the user to have created it manually */
 
 	/*
-	 * capture the whole upgrade as a WAL-replayable full-page image at the
-	 * end and skip the on-disk data writes, so first startup reconstructs the
-	 * cluster purely from WAL (atomic, crash-safe, recoverable from an empty
-	 * data directory)
+	 * capture the whole upgrade as replayable WAL.  The new cluster's files
+	 * are transferred to disk as in an ordinary upgrade. Recording the upgrade
+	 * in WAL additionally makes the upgraded state streamable, so a standby can
+	 * be re-provisioned by replaying that WAL rather than from a base backup.
 	 */
 	bool		wal_upgrade;
 	/* revertable-upgrade lifecycle subcommand, if any (see enum above) */

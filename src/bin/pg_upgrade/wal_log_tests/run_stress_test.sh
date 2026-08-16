@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Stress test for --wal-upgrade:
-#   * a ~10GB user table (many multi-GB relfile segments -> lots of chunked
-#     RELFILE records spanning many WAL segments), AND
-#   * a bloated system catalog (pg_attribute) driven past 1GB by creating a huge
-#     number of columns/tables, so a CATALOG relfile also exercises multi-segment
-#     chunking (segno 0 + segno 1 + ...).
+#   * ~10GB user table (many multi-GB relfile segments -> lots of chunked RELFILE
+#     records spanning many WAL segments), AND
+#   * bloated system catalog (pg_attribute) driven past 1GB by creating many
+#     columns/tables, so CATALOG relfile exercises multi-segment chunking
+#     (segno 0 + segno 1 + ...).
 #
-# Verifies: pg_upgrade succeeds, the on-disk data is wiped (so recovery is real
-# WAL replay, not leftover files), the cluster reconstructs from WAL, and the
-# data matches.
+# Verifies: pg_upgrade succeeds, on-disk data is wiped (recovery is real WAL
+# replay, not leftover files), cluster reconstructs from WAL, and data matches.
 #
 # Tunables (env): GB (target user-table size, default 10), run on a box with
 # enough disk -- 10GB old + ~10GB WAL + 10GB rebuilt ~= 30GB+ free needed.
@@ -38,7 +37,7 @@ CONF
   "SELECT pg_create_physical_replication_slot('stby_slot', true)" >/dev/null 2>&1 || { echo FAIL create-slot; exit 1; }
 
 # ---- ~${GB}GB user table -------------------------------------------------
-# ~1KB/row -> GB*1e6 rows.  Build in chunks to bound memory.
+# ~1KB/row -> GB*1e6 rows; build in chunks to bound memory.
 ROWS=$(( GB * 1000000 ))
 log "build a ~${GB}GB user table ($ROWS rows) -- this is the slow part"
 "$BIN/psql" -h "$WORK" -U postgres -q >/dev/null 2>&1 <<SQL
@@ -51,10 +50,10 @@ log "big table total size = $BIGSZ bytes"
 
 # ---- bloat pg_attribute past 1GB ----------------------------------------
 # Each pg_attribute row is ~140 bytes, so >1GB needs ~7.7M rows.  Postgres caps
-# a table at 1600 columns, so we use the max width and MANY tables:
-# 5200 tables x 1600 cols ~= 8.3M user attrs (+ system) ~= 1.2GB > 1GB.
-# (Measured earlier: 1600x1000 gave only 227MB -- far too few; hence these
-# numbers.)  Tune WIDE_TABLES/WIDE_COLS up if pg_attribute still lands <1GB.
+# tables at 1600 columns, so use max width and MANY tables:
+# 5200 tables x 1600 cols ~= 8.3M user attrs (+ system) ~= 1.2GB.
+# (Earlier: 1600x1000 gave only 227MB -- too few; these numbers are empirical.)
+# Tune WIDE_TABLES/WIDE_COLS up if pg_attribute still lands <1GB.
 WIDE_TABLES=${WIDE_TABLES:-5200}
 WIDE_COLS=${WIDE_COLS:-1590}   # <1600 to leave room for system + PK columns
 log "bloat pg_attribute past 1GB ($WIDE_TABLES tables x $WIDE_COLS cols)"
@@ -72,13 +71,13 @@ SQL
 PGATTR_SZ=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT pg_relation_size('pg_attribute')")
 PGATTR_PATH=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT pg_relation_filepath('pg_attribute')")
 log "pg_attribute size = $PGATTR_SZ bytes, path = $PGATTR_PATH"
-# Require >1GB so the catalog's relfile spans multiple 1GB segments (base/N,
-# base/N.1, ...) -- the whole point of this test.  A 1GB+ catalog is what forces
-# CATALOG (not just user-table) relfile chunking through the FPI capture.
+# Require >1GB so catalog relfile spans multiple 1GB segments (base/N, base/N.1, ...)
+# -- the whole point of this test.  A 1GB+ catalog forces CATALOG (not just
+# user-table) relfile chunking through FPI capture.
 if [ "${PGATTR_SZ:-0}" -lt 1073741824 ]; then
     echo "FAIL: pg_attribute is under 1GB ($PGATTR_SZ) -- catalog chunking not exercised; raise WIDE_TABLES/WIDE_COLS"; exit 1
 fi
-# Confirm the catalog physically has a second 1GB segment on disk (path.1).
+# Verify catalog physically has a second 1GB segment on disk (path.1).
 [ -f "$OLD/${PGATTR_PATH}.1" ] && log "pg_attribute has multi-segment relfile (${PGATTR_PATH}.1 exists) OK" \
                               || log "note: pg_attribute >1GB but no .1 segment yet (size=$PGATTR_SZ)"
 
@@ -95,20 +94,20 @@ t0=$SECONDS
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -30 "$WORK/up.log"; exit 1; }
 log "pg_upgrade wall time: $((SECONDS - t0))s"
 
-# ---- assert chunking of BOTH a user relfile and the catalog --------------
+# ---- verify chunking of BOTH a user relfile and the catalog -------
 LOSEG=$(ls "$NEW/pg_wal/" | grep -E '^[0-9A-F]{24}$' | sort | head -1)
 LOLSN=$("$BIN/pg_waldump" -p "$NEW/pg_wal" "$LOSEG" -n 1 2>&1 | grep -oE 'lsn: [0-9A-F]+/[0-9A-F]+' | head -1 | awk '{print $2}')
-# Relation pages travel as ordinary FPI records (log_newpages), 32 blocks max
-# per record, so a large catalog produces many of them.
+# Relation pages travel as ordinary FPI records (log_newpages), max 32 blocks
+# per record, so large catalog produces many.
 NREL=$("$BIN/pg_waldump" -p "$NEW/pg_wal" -s "${LOLSN:-0/0}" 2>/dev/null | grep -cE "desc: FPI[^_]")
 log "FPI record count: $NREL"
 [ "${NREL:-0}" -ge 3 ] || { echo "FAIL: expected many FPI records, got $NREL"; exit 1; }
 
-# ---- assert the data was wiped off disk (real WAL replay) ----------------
+# ---- verify data on disk (real WAL replay)
 TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
-# NOTE: user relations are NOT wiped under the RELINK model -- pg_upgrade
-# transfers them to disk as usual and the window carries only their identities,
-# so a populated base/ is expected on the primary.
+# NOTE: user relations are NOT wiped under RELINK -- pg_upgrade transfers them
+# to disk as usual and window carries only their identities, so populated base/
+# is expected on the primary.
 log "base/ data-file bytes on disk after pg_upgrade: $TOTAL_BASE"
 
 # ---- start (WAL replay) + verify -----------------------------------------
@@ -116,9 +115,8 @@ cat >> "$NEW/postgresql.conf" <<CONF
 unix_socket_directories='$WORK'
 port=$PORT
 CONF
-# --wal-upgrade auto-serves the new cluster: the first start applies the WAL
-# window, reconstructs, and comes up read-write -- no quarantine hold, no
-# commit step.
+# --wal-upgrade auto-serves the new cluster: first start applies the WAL window,
+# reconstructs, and comes up read-write.
 log "start new cluster (triggers WAL-replay recovery of ~${GB}GB + >1GB catalog)"
 t0=$SECONDS
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w -t 900 start >/dev/null 2>&1 || { echo FAIL start new; tail -40 "$WORK/new.log"; exit 1; }

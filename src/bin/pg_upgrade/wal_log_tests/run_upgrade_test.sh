@@ -108,14 +108,13 @@ XACT_BYTES=$(find "$NEW/pg_xact" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$
 echo "pg_xact bytes on disk after pg_upgrade: $XACT_BYTES"
 
 # ------------------------------------------------------------------ new cluster
-# Auto-serve: --wal-upgrade now leaves the new cluster ready to come up
-# read-write on first start, exactly like upstream pg_upgrade -- there is NO
-# quarantine hold and no commit step.  The pre-start assertions above
-# (upgrade WAL present, disk wiped) inspect the on-disk state before first start.
+# Auto-serve: --wal-upgrade leaves the new cluster ready to come up read-write
+# on first start, like upstream pg_upgrade.
+# The pre-start assertions above inspect the on-disk state before first start.
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"
 echo "port = $PORT" >> "$NEW/postgresql.conf"
 
-log "start new cluster (auto-serves; no commit step)"
+log "start new cluster (auto-serves on first start)"
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1
 START_RC=$?
 log "new cluster start exit=$START_RC"

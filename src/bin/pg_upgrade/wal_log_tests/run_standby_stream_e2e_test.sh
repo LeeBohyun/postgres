@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # End-to-end standby upgrade by streaming the window (no WAL segment copied into
-# the skeleton).  The fresh new-version skeleton streams the window from the live
-# committed primary over a replication connection, using:
+# the skeleton).  The fresh skeleton streams the window from the live committed
+# primary using:
 #
-#   - the migrated physical slot (created on the old primary, carried over by
-#     pg_upgrade) that pins the window on the primary so it survives the upgrade
-#     and is streamable, and
-#   - local anchor derivation: at first startup the skeleton derives CN LOCALLY
-#     from its retained old datadir (reproducing pg_resetwal's byte-contiguous
-#     placement) and TLI (always 1), taking only the system identifier from the
-#     primary's standard IDENTIFY_SYSTEM, then arms its control file at CN.  No
-#     operator prepare step, no manual WAL copy, and no bespoke replication command.
+#   - the migrated physical slot that pins the window on the primary so it survives
+#     the upgrade and is streamable, and
+#   - local anchor derivation: at first startup the skeleton derives CN from its
+#     retained old datadir (reproducing pg_resetwal's byte-contiguous placement)
+#     and TLI (always 1), taking only the system identifier from the primary's
+#     IDENTIFY_SYSTEM, then arms its control file at CN. No operator prepare step,
+#     no manual WAL copy, no bespoke replication command.
 #
 # A streamed standby continues as an ordinary hot standby following the primary.
 #
@@ -44,9 +43,8 @@ wal_level=replica
 max_wal_senders=8
 CONF
 "$BIN/pg_ctl" -D "$OLD" -l "$W/old.log" -w start >/dev/null 2>&1 || { echo FAIL start; exit 1; }
-# A physical replication slot on the old primary marks that a standby is
-# expected; pg_upgrade migrates it and it (not a dedicated slot) pins the
-# upgrade window so the fresh skeleton below can stream it.
+# A physical slot marks an expected standby; pg_upgrade migrates it to pin
+# the upgrade window so the skeleton can stream it.
 SLOT_NAME=stby_slot
 "$BIN/psql" -h "$W" -p $PP -U postgres -qtAc \
   "SELECT pg_create_physical_replication_slot('$SLOT_NAME', true)" >/dev/null 2>&1 \
@@ -64,19 +62,18 @@ INSERT INTO toast_t SELECT g, repeat(md5(g::text),300) FROM generate_series(1,30
 SELECT lo_from_bytea(0, decode(repeat(md5(g::text), 50), 'hex'))
   FROM generate_series(1, 40) g;
 SQL
-# Fingerprint includes the large-object content (loid + byte length) so a
-# missing/mis-delivered pg_largeobject on the standby is caught by convergence.
+# Fingerprint includes large-object content (loid + byte length) so a
+# missing/mis-delivered pg_largeobject is caught by convergence.
 FP_Q="SELECT count(*),sum(hashtext(v)::bigint),(SELECT count(*) FROM toast_t),(SELECT count(*)||':'||coalesce(sum(length(data))::text,'0') FROM pg_largeobject) FROM t"
 OLD_FP=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "$FP_Q")
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-# A real standby has its OWN retained pre-upgrade data directory (an independent
-# basebackup), separate from the primary's -- the primary can't know or share its
-# path.  Snapshot the old cluster HERE, before the primary upgrade, and let the
-# standby relink from THIS copy.  This matters for --link/--swap: the standby must
-# hardlink into its own retained datadir, never the primary's live files (which
-# --swap moves into $NEW and --link would otherwise share).  Copy-family modes only
-# read the source, so a shared dir would happen to work, but link/swap would not.
+# A real standby has its own retained pre-upgrade data directory (an independent
+# basebackup), separate from the primary's.  Snapshot the old cluster before the
+# primary upgrade; the standby relinks from this copy.  For --link/--swap the
+# standby must hardlink into its own retained datadir, never the primary's live
+# files (which --swap moves into $NEW, --link would share).  Copy-family modes only
+# read the source, so a shared dir would work, but link/swap would not.
 STBY_OLD=$W/stby_old
 cp -a "$OLD" "$STBY_OLD"
 
@@ -93,38 +90,36 @@ listen_addresses='localhost'
 CONF
 echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
 echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
-# Auto-serve: the primary comes up read-write on first start (no commit step).
-# The retention slot keeps the upgrade window streamable for the standby.
+# Auto-serve: primary comes up read-write on first start.
+# Retention slot keeps the upgrade window streamable for the standby.
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/new.log"; exit 1; }
 NEW_FP=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "$FP_Q")
 NEW_ID=$("$BIN/pg_controldata" -D "$NEW" | grep -i 'system identifier' | grep -oE '[0-9]+')
 log "committed primary: fp=$NEW_FP sysid=$NEW_ID"
-# FIRST prove the PRIMARY itself upgraded correctly (data preserved from the old
-# cluster) -- otherwise "standby == primary" would only prove the standby faithfully
-# replicated a broken primary.  OLD_FP and NEW_FP use the identical query.
+# First prove the PRIMARY upgraded correctly (data preserved from old cluster),
+# else "standby == primary" only proves the standby replicated a broken primary.
+# OLD_FP and NEW_FP use the identical query.
 [ "$NEW_FP" = "$OLD_FP" ] || { echo "FAIL: upgraded primary data ($NEW_FP) != old source data ($OLD_FP) -- primary upgrade is wrong"; FAIL=1; }
 log "primary upgrade verified: data preserved from old cluster ($OLD_FP)"
-# confirm the migrated physical slot pinning the window is present.  (CN itself
-# is derived LOCALLY by the standby from its retained old datadir; only the
-# system identifier comes from the primary, via IDENTIFY_SYSTEM.)  pg_upgrade no
-# longer creates a dedicated pg_upgrade_window slot; the migrated standby slot
-# both preserves identity and pins the window.
+# Verify migrated physical slot pinning the window is present. (CN is derived
+# by the standby from its retained old datadir; only the system identifier comes
+# from the primary via IDENTIFY_SYSTEM.)  pg_upgrade no longer creates a dedicated
+# slot; the migrated standby slot preserves identity and pins the window.
 SLOT=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT slot_name FROM pg_replication_slots WHERE slot_name='$SLOT_NAME'")
 log "retention (migrated) slot='$SLOT'"
 [ "$SLOT" = "$SLOT_NAME" ] || { echo "FAIL: migrated retention slot missing on committed primary"; FAIL=1; }
 
 log "3. FRESH SKELETON + relink manifest: stream the window, copy user files from the old datadir"
 # The upgrade window carries only the pg_upgrade-touched system files plus an
-# XLOG_UPGRADE_RELINK manifest naming the user relations -- so it is schema-sized,
-# not data-sized.  The standby is a FRESH new-version initdb skeleton; on redo of
-# the manifest it places the user relations from its OWN retained old datadir
-# ($STBY_OLD, the pre-upgrade snapshot) into the skeleton, reproducing the
-# primary's transfer mode ($XFER): copy=full copy, clone=reflink,
-# copy_file_range=copy_file_range, link/swap=hardlink.  The old datadir's path is
-# supplied by the pg_upgrade_standby_old_datadir GUC in the skeleton's postgresql.conf.
+# XLOG_UPGRADE_RELINK manifest naming user relations (schema-sized, not data-sized).
+# The standby is a fresh initdb skeleton; on manifest redo it places user relations
+# from its retained old datadir ($STBY_OLD, the pre-upgrade snapshot) into the
+# skeleton, reproducing the primary's transfer mode ($XFER): copy=full copy,
+# clone=reflink, copy_file_range=copy_file_range, link/swap=hardlink.  The old
+# datadir path is supplied by the pg_upgrade_standby_old_datadir GUC.
 "$BIN/initdb" -D "$SKEL" -U postgres -N >/dev/null 2>&1 || { echo "FAIL: skeleton initdb"; exit 1; }
-# old-datadir path now comes from the pg_upgrade_standby_old_datadir GUC;
-# pg_upgrade.signal is an empty presence-only sentinel.
+# old-datadir path comes from the pg_upgrade_standby_old_datadir GUC;
+# pg_upgrade.signal is a presence-only sentinel.
 echo "pg_upgrade_standby_old_datadir='$STBY_OLD'" >> "$SKEL/postgresql.conf"
 : > "$SKEL/pg_upgrade.signal"
 cat >> "$SKEL/postgresql.conf" <<CONF
@@ -136,23 +131,22 @@ CONF
 printf 'host all all 127.0.0.1/32 trust\nlocal all all trust\n' >> "$SKEL/pg_hba.conf"
 touch "$SKEL/standby.signal"
 
-# No pre-staged anchor file: CN is derived locally from the retained old datadir.
+# CN is derived locally from the retained old datadir (no pre-staged anchor file).
 [ -f "$SKEL/pg_upgrade_stream.anchor" ] && { echo "FAIL: unexpected pre-staged anchor file"; FAIL=1; }
 [ -f "$SKEL/standby.signal" ]           || { echo "FAIL: no standby.signal written"; FAIL=1; }
 [ -f "$SKEL/pg_upgrade.signal" ]   || { echo "FAIL: no pg_upgrade.signal staged"; FAIL=1; }
 
 log "4. START the skeleton: it STREAMS the window from the live primary and becomes a hot standby"
-# A streamed standby does NOT hold or commit: it streams the window from the
-# already-committed primary, replays COMPLETE, and continues as an ordinary hot
-# standby following the primary.  So start it normally and wait for it to serve
-# read-only queries.
+# A streamed standby streams the window from the live primary, replays COMPLETE,
+# and continues as an ordinary hot standby. Start it normally and wait for it to
+# serve read-only queries.
 "$BIN/pg_ctl" -D "$SKEL" -l "$W/skel.log" -w -t 90 start >/dev/null 2>&1 || true
 UP=0
 for i in $(seq 1 60); do
   "$BIN/psql" -h "$W" -p $SP -U postgres -tAc "SELECT 1" >/dev/null 2>&1 && { UP=1; break; }
   sleep 1
 done
-# Decisive assertions:
+# Verify:
 grep -q "auto-armed streaming standby from locally derived anchor" "$W/skel.log" \
   && log "  skeleton armed from the streaming anchor (sysid+CN+TLI stamped)" \
   || { echo "  FAIL: skeleton did not arm from the streaming anchor"; tail -20 "$W/skel.log"; FAIL=1; }

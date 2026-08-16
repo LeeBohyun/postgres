@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Durability / crash-consistency on the STREAMING-STANDBY path.
 #
-# The RELINK redo places user relation files outside the buffer manager, and the
-# COMPLETE marker + control-file advance past CN follow.  The redo fsyncs each
-# placed file and its parent directory BEFORE COMPLETE, precisely so a crash
-# mid-replay can never leave a "finalized" standby (control file past CN,
-# upgrade_finalized flag set) whose user relations are missing or partial.
+# The RELINK redo places user relations outside the buffer manager, then
+# COMPLETE marker + control-file advance past CN.  The redo fsyncs each
+# placed file and parent directory BEFORE COMPLETE to prevent crash-mid-replay
+# from leaving a finalized standby (control past CN, upgrade_finalized set)
+# with missing/partial relations.
 #
 # This test crashes the streaming standby (SIGKILL) mid-window-replay, then
 # restarts it and asserts it converges byte-identically to the primary.  Two
@@ -36,9 +36,9 @@ wal_level=replica
 max_wal_senders=8
 CONF
 "$BIN/pg_ctl" -D "$OLD" -l "$W/old.log" -w start >/dev/null 2>&1 || { echo FAIL start; exit 1; }
-# A physical slot marks that a standby is expected; pg_upgrade migrates it and
-# it pins the upgrade window so the skeleton below can stream it (and survive a
-# crash-restart mid-stream, which this durability test exercises).
+# A physical slot marks an expected standby; pg_upgrade migrates it to pin
+# the upgrade window so the skeleton can stream it (and survive crash-restart
+# mid-stream, which this test exercises).
 "$BIN/psql" -h "$W" -p $PP -U postgres -qtAc \
   "SELECT pg_create_physical_replication_slot('stby_slot', true)" >/dev/null 2>&1 || { echo FAIL create-slot; exit 1; }
 "$BIN/psql" -h "$W" -p $PP -U postgres -q >/dev/null 2>&1 <<SQL
@@ -74,8 +74,8 @@ echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
 
 log "stage the skeleton, start it, then SIGKILL mid-window-replay"
 "$BIN/initdb" -D "$SKEL" -U postgres -N >/dev/null 2>&1 || { echo "FAIL: skeleton initdb"; exit 1; }
-# old-datadir path now comes from the pg_upgrade_standby_old_datadir GUC;
-# pg_upgrade.signal is an empty presence-only sentinel.
+# old-datadir path comes from the pg_upgrade_standby_old_datadir GUC;
+# pg_upgrade.signal is a presence-only sentinel.
 echo "pg_upgrade_standby_old_datadir='$STBY_OLD'" >> "$SKEL/postgresql.conf"
 : > "$SKEL/pg_upgrade.signal"
 cat >> "$SKEL/postgresql.conf" <<CONF
@@ -87,25 +87,23 @@ CONF
 printf 'host all all 127.0.0.1/32 trust\nlocal all all trust\n' >> "$SKEL/pg_hba.conf"
 touch "$SKEL/standby.signal"
 
-# Start via `postgres` directly (not pg_ctl, which waits for readiness) so we can
-# kill it while the window is still replaying.
+# Start via `postgres` directly (not pg_ctl -w) so we can kill it during replay.
 "$BIN/postgres" -D "$SKEL" >"$W/skel1.log" 2>&1 &
 PM=$!
 # Kill as soon as the standby has ARMED (control file stamped at CN) but is still
-# replaying -- before COMPLETE -- so the crash lands mid-window, exactly the case
-# the relink fsync-ordering protects.  Kill the instant the arm line appears; do
-# NOT wait for "started streaming" (by then replay may already be finishing).
+# replaying -- before COMPLETE -- so the crash lands mid-window: the case
+# the fsync-ordering protects.  Kill when the arm line appears; don't wait
+# for "started streaming" (replay may be finishing).
 for i in $(seq 1 200); do grep -qiE "auto-armed streaming standby from locally derived anchor" "$W/skel1.log" 2>/dev/null && break; sleep 0.02; done
 kill -9 $PM 2>/dev/null
 pkill -9 -f "postgres -D $SKEL" 2>/dev/null
 for p in $SP; do lsof -ti :$p 2>/dev/null | xargs kill -9 2>/dev/null; done
 sleep 1
 
-# Consistency check at the crash point: the standby must NOT be a finalized
-# cluster (control checkpoint past CN) while its user data is missing.  We assert
-# the weaker, decisive form: if the durable upgrade_finalized flag is set, the
-# window fully replayed; if it is unset, replay was not finalized -- either way
-# a restart converges.  (A finalized-but-empty cluster would be the bug.)
+# Consistency check at crash point: the standby must not be finalized
+# (control past CN) with missing user data.  We verify: finalized-flag set =>
+# window fully replayed; unset => replay not finalized.  Either way a restart
+# converges.  (A finalized-but-empty cluster would be the bug.)
 if "$BIN/pg_controldata" -D "$SKEL" 2>/dev/null | grep -q "wal-upgrade window finalized: *yes"; then
   log "  crash happened at/after COMPLETE (finalized flag set) -- restart must still converge"
 else

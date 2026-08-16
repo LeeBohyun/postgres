@@ -38,10 +38,8 @@ CONF
 
 # =========================================================== D0: write gate
 log "D0: signal-handoff drains live CLIENT connections at shutdown (write gate)"
-# Open a long-lived idle client session in the background (sleeps inside a psql
-# connection).  signal-handoff fast-stops the primary, which drains every
-# backend before ShutdownXLOG emits the handoff -- so no user txn can commit past
-# the handoff record.  We record its backend PID first, then confirm it is gone.
+# Long-lived idle client in background; signal-handoff fast-stops primary,
+# draining all backends before ShutdownXLOG (preventing txns past handoff).
 "$BIN/psql" -h "$W" -U postgres -tAc "SELECT pg_sleep(120)" >/dev/null 2>&1 &
 SLEEPER=$!
 # wait until the backend is visible on the server
@@ -59,14 +57,12 @@ log "D1: --wal-upgrade-signal-handoff emits the trigger AND shuts the primary do
 BEFORE=$(count_handoff "$W/old")
 "$BIN/pg_upgrade" --wal-upgrade-signal-handoff -b "$BIN" -d "$W/old" -U postgres >"$W/d1.log" 2>&1 || { cat "$W/d1.log"; fail "D1: signal-handoff failed"; }
 grep -qi "handoff trigger written" "$W/d1.log" || { cat "$W/d1.log"; fail "D1: missing success message"; }
-# the primary must now be STOPPED (signal-handoff shut it down at the handoff point)
+# primary must now be STOPPED (signal-handoff shut it down at the handoff point)
 if "$BIN/psql" -h "$W" -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
     fail "D1: primary still serving after signal-handoff (should have shut down)"
 fi
 [ -f "$W/old/postmaster.pid" ] && fail "D1: postmaster.pid still present (primary not stopped)"
-# D0 follow-up: the pre-opened client backend must be gone (drained by the fast
-# shutdown before the handoff was emitted).  Reap the background psql and confirm
-# it is no longer running.
+# D0 follow-up: pre-opened backend must be gone (drained by fast shutdown).
 wait "$SLEEPER" 2>/dev/null
 kill -0 "$SLEEPER" 2>/dev/null && fail "D0: pre-opened client backend survived signal-handoff (write gate failed)"
 log "PASS D0 (live client backend pid=$GATEPID drained by the shutdown write gate)"
@@ -84,9 +80,9 @@ if "$BIN/pg_upgrade" --wal-upgrade-signal-handoff -b "$BIN" -d "$W/old" -U postg
 fi
 # The primary is down, so the fast-stop step fails; report it as a clean error.
 grep -qiE "could not shut down the old primary|is server running|PID file.*does not exist|could not connect" "$W/d2.log" || { cat "$W/d2.log"; fail "D2: wrong/absent failure message"; }
-# The stray handoff sentinel must be cleaned up when the run aborts.
+# Handoff sentinel must be cleaned up on abort.
 [ -f "$W/old/pg_upgrade_handoff.pending" ] && fail "D2: handoff sentinel left behind after a failed re-run"
-# cluster undamaged and still restartable after the failed re-run
+# cluster undamaged, restartable after failed re-run
 "$BIN/pg_ctl" -D "$W/old" -l "$W/o2.log" -w start >/dev/null 2>&1 || fail "D2: cluster no longer starts after handoff+failed re-run"
 "$BIN/pg_ctl" -D "$W/old" -w stop >/dev/null 2>&1
 log "PASS D2 (clean connection failure; cluster undamaged and restartable)"

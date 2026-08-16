@@ -39,7 +39,7 @@ CREATE TABLE big (id bigint, pad text);
 INSERT INTO big SELECT g, repeat('x', 1000) FROM generate_series(1, 2400000) g;
 SQL
 BIG_FP=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*), sum(hashtext(pad)::bigint) FROM big")
-# confirm it really is multi-segment on disk
+# verify the table is multi-segment on disk
 BIG_RFN=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT relfilenode FROM pg_class WHERE relname='big'")
 BIG_DBOID=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT oid FROM pg_database WHERE datname='postgres'")
 NSEG=$(ls "$W/old/base/$BIG_DBOID/$BIG_RFN" "$W/old/base/$BIG_DBOID/$BIG_RFN".[0-9]* 2>/dev/null | wc -l | tr -d ' ')
@@ -90,8 +90,7 @@ log "base/ bytes on disk after upgrade: $TOTAL_BASE"
 
 echo "unix_socket_directories='$W'">>"$W/new/postgresql.conf"; echo "port=$PORT">>"$W/new/postgresql.conf"
 log "start (auto-serves: reconstruct from WAL, then come up read-write)"
-# --wal-upgrade auto-serves: the first start applies the WAL window,
-# reconstructs, and comes up read-write -- no quarantine hold, no commit step.
+# First start applies the WAL window, reconstructs, and serves read-write.
 "$BIN/pg_ctl" -D "$W/new" -l "$W/new.log" -w -t 600 start >/dev/null 2>&1 || { tail -30 "$W/new.log"; fail "start"; }
 
 log "verify each data shape survived"

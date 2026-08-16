@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# Regression test: a relation in a USER-DEFINED TABLESPACE survives a
-# --wal-upgrade.  A user-tablespace relation lives under
-# pg_tblspc/<spcoid>/PG_*/<dboid>/<relfile> rather than base/<dboid>/, so this
-# exercises that path in the capture walk, the directory/symlink skeleton, and
-# (on a standby) the RELINK redo's tablespace resolution.  A normal-tablespace
-# table is upgraded alongside it to confirm base/ is unaffected.
+# User-tablespace relation survives --wal-upgrade.
+# Tests capture/replay of pg_tblspc/<spcoid>/PG_*/<dboid>/<relfile> path,
+# directory/symlink skeleton, and (on standby) RELINK redo's tablespace
+# resolution.  Normal-tablespace table verifies base/ is unaffected.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"; BIN="${PGBIN:-$ROOT/pginst/bin}"
 W=${WORK:-/tmp/pgu_tblspc}; OLD=$W/old; NEW=$W/new; P=${PORT:-55560}
@@ -15,22 +13,19 @@ rm -rf "$W"; mkdir -p "$W"
 
 log "init old cluster + create a USER TABLESPACE with a table in it"
 "$BIN/initdb" -D "$OLD" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb; exit 1; }
-# allow_in_place_tablespaces lets us use an in-place tablespace (relative path
-# under pg_tblspc/<oid>/), whose path differs between the old and new clusters
-# -- this sidesteps pg_upgrade's "same catalog version + tablespaces" refusal
-# that only triggers for SAME-BUILD tests with absolute-path tablespaces.  The
-# relfile layout we are testing (pg_tblspc/<spcoid>/PG_*/<dboid>/<relfile>) is
-# identical either way.
+# allow_in_place_tablespaces: use in-place tablespace (relative path under
+# pg_tblspc/<oid>/), which differs between old and new clusters; sidesteps
+# pg_upgrade's "same catalog version + tablespaces" refusal for SAME-BUILD tests.
+# Tested relfile layout (pg_tblspc/<spcoid>/PG_*/<dboid>/<relfile>) identical either way.
 echo "unix_socket_directories='$W'">>$OLD/postgresql.conf; echo "port=$P">>$OLD/postgresql.conf
 echo "allow_in_place_tablespaces=on">>$OLD/postgresql.conf
 "$BIN/pg_ctl" -D "$OLD" -l "$W/old.log" -w start >/dev/null 2>&1 || { echo FAIL start; exit 1; }
-# EXTERNAL-location tablespaces are only reachable in a real CROSS-VERSION
-# upgrade: pg_upgrade refuses "same system catalog version + tablespaces" when
-# the tablespace path is identical between clusters (tablespace.c), which is
-# always true for an absolute external path in a same-build test.  In-place
-# tablespaces (relative path, differs per cluster) are allowed, so we drive the
-# capture/wipe path with an in-place tablespace here.  The Q7b symlink
-# capture/replay itself is covered directly by run_tblspc_symlink_test.sh.
+# EXTERNAL-location tablespaces only reachable in real CROSS-VERSION upgrade:
+# pg_upgrade refuses "same system catalog version + tablespaces" when path is
+# identical between clusters (tablespace.c); always true for absolute external
+# path in same-build test.  In-place tablespaces (relative, differs per cluster)
+# allowed, so test drives capture/wipe with in-place.  Q7b symlink capture/replay
+# covered in run_tblspc_symlink_test.sh.
 "$BIN/psql" -h "$W" -U postgres -v ON_ERROR_STOP=1 -q >/dev/null <<SQL
 -- IN-PLACE tablespace (relative, under pg_tblspc/<oid>/)
 CREATE TABLESPACE userts LOCATION '';
@@ -50,26 +45,22 @@ log "old: ts_t=$TS_FP base_t=$BASE_FP ts_idx=$TS_IDX"
 
 cd "$W"
 log "pg_upgrade --wal-upgrade $MODE"
-# -O passes the in-place-tablespaces GUC to the new cluster's server so the
-# restore can recreate the in-place tablespace.
+# -O passes in-place-tablespaces GUC to new cluster for restore to recreate it.
 "$BIN/pg_upgrade" -b "$BIN" -B "$BIN" -d "$OLD" -D "$NEW" -U postgres --initdb --wal-upgrade $MODE \
     -O "-c allow_in_place_tablespaces=on" >"$W/up.log" 2>&1
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -25 "$W/up.log"; exit 1; }
 
-# BOTH tablespaces' data files must be WIPED off disk (like base/), so the match
-# below proves WAL replay, not leftover files.  In-place data lives under
-# $NEW/pg_tblspc/<oid>/PG_*/<dboid>/; external data lives under the external
-# location's PG_*/<dboid>/ (reached via the symlink).
+# Both tablespaces' data files must be WIPED off disk (like base/) to prove
+# WAL replay, not leftover files.  In-place: $NEW/pg_tblspc/<oid>/PG_*/<dboid>/;
+# external: location's PG_*/<dboid>/ (via symlink).
 tsbytes() { find "$1" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}'; }
 IP_BYTES=$(tsbytes "$NEW/pg_tblspc")
-# NOTE: user relations are NOT wiped under the RELINK model -- pg_upgrade
-# transfers them to disk as usual and the window carries only their identities,
-# so a populated base/ is expected on the primary.
+# Under RELINK model: user relations NOT wiped; pg_upgrade transfers to disk
+# and window carries only identities, so populated base/ expected on primary.
 log "tablespace data on disk after pg_upgrade: $IP_BYTES"
 
-# --wal-upgrade auto-serves: the new cluster comes up read-write on the
-# first start (no quarantine hold, no commit).  The wiped-on-disk assertion
-# above ran before first start, so it still reflects the wipe.
+# --wal-upgrade auto-serves: new cluster read-write on first start.  Wiped-on-disk
+# assertion ran before first start; still reflects wipe.
 echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
 log "start new cluster (WAL replay) and verify tablespace table"
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo FAIL start new; tail -30 "$W/new.log"; exit 1; }

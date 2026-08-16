@@ -762,12 +762,12 @@ pg_pwrite_zeros(int fd, size_t size, pgoff_t offset)
  *
  * Uses copyfile(COPYFILE_CLONE_FORCE) where available (macOS), else
  * ioctl(FICLONE) (Linux).  "dst" must not already exist.  Returns
- * PG_REFLINK_UNSUPPORTED when the build has neither primitive,
- * PG_REFLINK_ERROR (with *save_errno set) on a syscall failure -- in which case
- * a partially created "dst" has been unlinked -- and PG_REFLINK_OK on success.
+ * PG_REFLINK_UNSUPPORTED when the build has neither primitive, PG_REFLINK_OK
+ * on success, or PG_REFLINK_ERROR (with *save_errno set) on a syscall failure.
+ * In the error case, any partially created "dst" has been unlinked.
  *
  * Shared by pg_upgrade's file transfer and the backend --wal-upgrade relink
- * replay so the two reproduce identical on-disk results.
+ * replay so the two produce identical on-disk results.
  */
 PGReflinkResult
 pg_clone_file(const char *src, const char *dst, int *save_errno)

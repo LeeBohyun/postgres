@@ -78,17 +78,14 @@ cd "$W"
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -20 "$W/up.log"; exit 1; }
 
 log "4. DETERMINISTIC parse check: upgrade WAL must capture a NON-ZERO members segno"
-# Scan ALL upgrade WAL segments (SLRU records follow the large RELFILE burst,
-# so they are NOT in the first segment).  Must run BEFORE starting the new
-# cluster, which recycles the upgrade WAL after replay.
+# Scan all upgrade WAL segments (SLRU records follow RELFILE burst, not in first
+# segment). Must run before starting new cluster (recycles WAL after replay).
 : > "$W/members_recs.txt"
 # SLRU segments are captured as XLOG_UPGRADE_RAWFILE records carrying the
 # segment's PGDATA-relative PATH verbatim, e.g.
 #   rawfile "pg_multixact/members/000000000000002"; offset 0; bytes 262144
-# The old truncation bug is structurally impossible now: the capture copies the
-# directory entry name straight into the path (no %04x segno conversion), so a
-# 15-hex-digit long name cannot be narrowed.  Assert a non-zero members segment
-# appears with its FULL name.
+# Bug impossible now: capture copies dir name verbatim (no %04x conversion), so
+# 15-hex names preserved. Assert non-zero members segment with full name.
 for seg in $(ls "$W/n/pg_wal" | grep -E '^[0-9A-F]{24}$' | sort); do
   "$BIN/pg_waldump" -p "$W/n/pg_wal" "$seg" 2>/dev/null \
     | grep -iE 'rawfile "pg_multixact/members/' >> "$W/members_recs.txt" || true
@@ -108,10 +105,8 @@ cat >> "$W/n/postgresql.conf" <<CONF
 unix_socket_directories='$W'
 port=$PP
 CONF
-# Primary model: the upgraded new cluster keeps its files on disk (no
-# reconstruct-from-WAL on the primary).  --wal-upgrade auto-serves: it
-# comes up read-write on the first start, exactly like upstream pg_upgrade
-# (no quarantine hold, no commit).  Post-upgrade control state is "shut down".
+# Primary keeps files on disk (no reconstruct-from-WAL). --wal-upgrade auto-serves
+# on first start. Post-upgrade state is "shut down".
 "$BIN/pg_controldata" -D "$W/n" | grep -i 'cluster state' | grep -qi 'shut down' \
   && log "  new cluster in shut down state (good)" || { echo "  FAIL: new cluster not in shut down state after upgrade"; FAIL=1; }
 "$BIN/pg_ctl" -D "$W/n" -l "$W/n.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/n.log"; FAIL=1; }

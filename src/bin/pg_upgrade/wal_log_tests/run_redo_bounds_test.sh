@@ -44,10 +44,8 @@ max_wal_senders=8
 CONF
 "$BIN/pg_ctl" -D "$OLD" -l "$W/old.log" -w start >/dev/null 2>&1 || { echo FAIL start; exit 1; }
 "$BIN/psql" -h "$W" -p $PP -U postgres -qc "CREATE TABLE t(id int); INSERT INTO t SELECT generate_series(1,2000);" >/dev/null
-# A named physical slot on the OLD primary: --wal-upgrade migrates physical slots,
-# so it reappears on the upgraded primary under the same name and PINS the upgrade
-# window in pg_wal/.  Without it the window is recycled before the standby below
-# can stream it, and the standby never reaches the record under test.
+# Physical slot pins upgrade window; without it the window recycles before the
+# standby streams it.
 "$BIN/psql" -h "$W" -p $PP -U postgres -qtAc \
     "SELECT pg_create_physical_replication_slot('redo_bounds_slot', true)" >/dev/null
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
@@ -68,8 +66,7 @@ listen_addresses='localhost'
 CONF
 echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
 echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
-# The primary auto-serves from the transferred files (it never replays its own
-# window), so it comes up fine despite the corrupt record.
+# Primary auto-serves (never replays its own window), comes up fine despite corrupt record.
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL new start"; tail -15 "$W/new.log"; exit 1; }
 [ "$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*) FROM t")" = 2000 ] \
     || { echo "FAIL: primary data wrong"; FAIL=1; }
@@ -77,9 +74,8 @@ log "primary auto-served (does not replay its own window)"
 
 log "3. bare standby skeleton streams the window and REPLAYS it -> must halt"
 mkdir -p "$SKEL"; chmod 700 "$SKEL"
-# pg_upgrade_standby_old_datadir is required: the skeleton derives the upgrade
-# anchor (CN) from its retained pre-upgrade datadir, and the RELINK redo links
-# user relations in from there.  Without it startup refuses to arm.
+# pg_upgrade_standby_old_datadir required: skeleton derives CN locally and RELINK
+# redo copies user relations. Without it startup refuses to arm.
 cat > "$SKEL/postgresql.conf" <<CONF
 port=$SP
 unix_socket_directories='$W'
@@ -91,9 +87,8 @@ CONF
 printf 'host all all 127.0.0.1/32 trust\nlocal all all trust\n' > "$SKEL/pg_hba.conf"
 touch "$SKEL/standby.signal"
 touch "$SKEL/pg_upgrade.signal"
-# Start in the background; the standby streams + replays and should hit the
-# corrupt RAWFILE record in redo and PANIC.  It never converges, so do not wait for
-# a query -- watch the log.
+# Start in background; standby streams + replays, hits corrupt RAWFILE in redo
+# and PANICs (never converges, watch log).
 "$BIN/pg_ctl" -D "$SKEL" -l "$W/standby.log" -w start >/dev/null 2>&1 || true
 
 log "4. the standby must halt with the rawfile bounds-check message"

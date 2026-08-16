@@ -40,11 +40,9 @@ ls "$NEW/pg_wal"/[0-9A-F]* >/dev/null 2>&1 && echo "upgrade WAL present in pg_wa
 FAIL=0
 
 log "start NEW cluster (mid-upgrade, no COMPLETE): must FATAL, never serve"
-# Auto-serve atomicity model: a local window with START but no COMPLETE is a
-# crash-truncated (half-built) upgrade.  Since the new cluster now auto-serves on
-# a good start, PerformWalUpgradeIfNeeded() refuses to arm/replay a partial window
-# and FATALs instead -- it must NOT serve a half-upgraded catalog.  (The old model
-# held it in quarantine; there is no quarantine anymore.)
+# Auto-serve atomicity model: a local window with START but no COMPLETE is
+# incomplete.  PerformWalUpgradeIfNeeded() refuses to arm/replay a partial window
+# and FATALs instead -- must not serve a half-upgraded catalog.
 echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$P">>$NEW/postgresql.conf
 "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1
 if "$BIN/psql" -h "$W" -p $P -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
@@ -78,10 +76,8 @@ OLD_FP2=$("$BIN/psql" -h "$W" -U postgres -tAc "SELECT count(*), sum(hashtext(b)
 log "old cluster after: $OLD_FP2"
 [ "$OLD_FP" = "$OLD_FP2" ] || { echo "FAIL: old cluster damaged (was '$OLD_FP', now '$OLD_FP2')"; FAIL=1; }
 
-# --- Control: a NORMAL (with COMPLETE) upgrade of the same data MUST reach
-# COMPLETE and AUTO-SERVE, recovering the exact data -- proving the FATAL above
-# is specific to the missing COMPLETE, not a general inability to upgrade these
-# clusters.
+# Control: a NORMAL upgrade (with COMPLETE) must reach COMPLETE, recover the
+# data, and auto-serve—proving failure is specific to missing COMPLETE.
 log "control: same upgrade WITH COMPLETE must auto-serve and recover the data"
 rm -rf "$W/new2"
 cd "$W"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$W/new2" -U postgres --initdb --wal-upgrade --copy >"$W/up2.log" 2>&1

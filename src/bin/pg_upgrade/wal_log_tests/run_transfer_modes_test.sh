@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Transfer-mode coverage for --wal-upgrade.
 #
-# --wal-upgrade composes with any transfer mode; there is no revert/adopt
-# interface, so the only thing that differs per mode is what happens to the old
-# cluster:
+# --wal-upgrade composes with any transfer mode; no revert/adopt interface.
+# Only thing differing per mode: what happens to old cluster:
 #   --copy, --clone : duplicate the old cluster's files, leaving it intact (as in
 #         upstream).  The old cluster is removed later by the stock
 #         delete_old_cluster script when the operator is ready.
@@ -67,10 +66,9 @@ run_mode() {
   cd /
 }
 
-# --clone and --copy-file-range need filesystem support (reflinks / FICLONE);
-# on a filesystem without it (e.g. overlayfs) stock pg_upgrade itself fails with
-# "could not clone file between old and new data directories", which is not a
-# --wal-upgrade failure.  Probe once and skip those modes if unsupported.
+# --clone and --copy-file-range need filesystem support (reflinks / FICLONE).
+# Without it, stock pg_upgrade fails with "could not clone file..." (not a
+# --wal-upgrade failure).  Probe once; skip if unsupported.
 reflink_supported() {
   local probe="$W/reflink_probe"
   rm -rf "$probe"; mkdir -p "$probe"

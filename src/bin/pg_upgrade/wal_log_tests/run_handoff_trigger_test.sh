@@ -45,7 +45,7 @@ CONF
 touch "$W/s/standby.signal"
 "$BIN/pg_ctl" -D "$W/s" -l "$W/s.log" -w start >/dev/null 2>&1 || { echo FAIL standby start; tail -10 "$W/s.log"; exit 1; }
 sleep 2
-# confirm streaming + hot standby serving reads
+# verify standby is streaming and accepting read queries
 SB_ROWS=$("$BIN/psql" -h "$W" -p $SP -U postgres -tAc "SELECT count(*) FROM t" 2>&1)
 log "standby streaming, sees $SB_ROWS rows (want 500)"
 [ "$SB_ROWS" = 500 ] || FAIL=1
@@ -61,7 +61,7 @@ HLSN=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT pg_current_wal_lsn()"
 "$BIN/pg_upgrade" --wal-upgrade-signal-handoff -b "$BIN" -d "$W/p" -U postgres >"$W/handoff.log" 2>&1 \
     || { echo "FAIL: --wal-upgrade-signal-handoff"; cat "$W/handoff.log"; FAIL=1; }
 grep -qi "handoff trigger written" "$W/handoff.log" || { echo "FAIL: no handoff success message"; cat "$W/handoff.log"; FAIL=1; }
-# the primary must be STOPPED now (the CLI shut it down at the handoff point)
+# primary must be stopped now (CLI shut it down at handoff point)
 if "$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT 1" >/dev/null 2>&1; then
     echo "FAIL: primary still serving after signal-handoff (should have shut down at the handoff point)"; FAIL=1
 else
@@ -69,7 +69,7 @@ else
 fi
 
 log "3. standby must PAUSE recovery upon replaying the handoff trigger"
-# give the standby time to stream + replay the trigger and pause
+# give the standby time to stream and replay the trigger, then pause
 for i in $(seq 1 20); do
   grep -qiE "reached pg_upgrade handoff on standby" "$W/s.log" && break
   sleep 1

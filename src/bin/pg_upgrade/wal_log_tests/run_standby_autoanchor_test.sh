@@ -38,9 +38,8 @@ printf 'host replication all 127.0.0.1/32 trust\nhost all all 127.0.0.1/32 trust
 "$BIN/psql" -h "$W" -p $PP -U postgres -qc \
     "CREATE TABLE t(v text); INSERT INTO t SELECT 'r'||g FROM generate_series(1,2000) g; CREATE INDEX ON t(v);" >/dev/null 2>&1 || { echo FAIL load; exit 1; }
 WANT=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint) FROM t")
-# A physical slot marks that a standby is expected; pg_upgrade migrates it and it
-# pins the upgrade window so the skeleton below can stream it (no dedicated slot
-# is created without one).
+# Physical slot marks standby expected; pg_upgrade migrates it, pinning the
+# upgrade window for skeleton streaming.
 "$BIN/psql" -h "$W" -p $PP -U postgres -qtAc \
     "SELECT pg_create_physical_replication_slot('stby_slot', true)" >/dev/null 2>&1 || { echo FAIL create-slot; exit 1; }
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
@@ -62,14 +61,12 @@ GOT=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT count(*),sum(hashtext(
 [ "$GOT" = "$WANT" ] || { echo "FAIL: primary data mismatch (want $WANT got $GOT)"; FAIL=1; }
 
 log "3. FRESH SKELETON: stream the window; the relink manifest copies user files from the old datadir"
-# The window carries only pg_upgrade-touched system files plus the relink
-# manifest, not user data.  The standby is a fresh new-version initdb skeleton;
-# on redo it copies the user relations from its retained old datadir (named by
-# the pg_upgrade_standby_old_datadir GUC) into the skeleton.  Here $OLD (left intact by
-# --copy) is that retained old datadir.
+# Window carries only system files + relink manifest, not user data. Standby is
+# fresh skeleton; on redo it copies user relations from retained old datadir
+# (named by pg_upgrade_standby_old_datadir GUC). Here $OLD is that datadir.
 "$BIN/initdb" -D "$SKEL" -U postgres -N >/dev/null 2>&1 || { echo "FAIL: skeleton initdb"; exit 1; }
-# old-datadir path now comes from the pg_upgrade_standby_old_datadir GUC;
-# pg_upgrade.signal is an empty presence-only sentinel.
+# old-datadir from pg_upgrade_standby_old_datadir GUC; pg_upgrade.signal is a
+# presence-only sentinel.
 echo "pg_upgrade_standby_old_datadir='$OLD'" >> "$SKEL/postgresql.conf"
 : > "$SKEL/pg_upgrade.signal"
 cat >> "$SKEL/postgresql.conf" <<CONF
@@ -93,7 +90,7 @@ grep -qiE "started streaming|streaming WAL" "$W/skel.log" \
     || { echo "FAIL: no streaming evidence"; tail -20 "$W/skel.log"; FAIL=1; }
 
 log "5. skeleton is a hot standby serving the upgraded data (converged to primary)"
-# give replay a moment to converge
+# let replay converge
 for i in $(seq 1 20); do
     R=$("$BIN/psql" -h "$W" -p $SP -U postgres -tAc "SELECT count(*),sum(hashtext(v)::bigint) FROM t" 2>/dev/null)
     [ "$R" = "$WANT" ] && break

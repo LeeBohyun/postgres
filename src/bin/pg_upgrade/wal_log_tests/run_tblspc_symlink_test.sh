@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Q7(b) coverage: the XLOG_UPGRADE_DIRTREE record must capture user-tablespace
-# SYMLINKS (pg_tblspc/<spcoid> -> external location) and replay must recreate
-# them.  External-location tablespaces can only be driven through a full
-# pg_upgrade in a real CROSS-version run (pg_upgrade refuses same-catalog-version
-# + tablespaces), so this test exercises the capture+replay directly:
+# Q7(b): XLOG_UPGRADE_DIRTREE captures user-tablespace SYMLINKS
+# (pg_tblspc/<spcoid> -> external location) and replay recreates them.
+# External-location tablespaces only testable via full pg_upgrade in CROSS-version
+# run (pg_upgrade refuses same-catalog-version + tablespaces), so test exercises
+# capture+replay directly:
 #
 #   1. Build a cluster with an EXTERNAL-location tablespace (a real symlink).
 #   2. Emit the upgrade window (binary_upgrade_emit_wal_window(), which includes
@@ -25,12 +25,10 @@ FAIL=0
 log "init cluster with an EXTERNAL-location tablespace (real symlink)"
 "$BIN/initdb" -D "$D" -U postgres -N >/dev/null 2>&1 || { echo FAIL initdb; exit 1; }
 printf "unix_socket_directories='%s'\nport=%s\n" "$W" "$P" >> "$D/postgresql.conf"
-# Setup (CREATE TABLESPACE etc.) must run in NORMAL mode: binary-upgrade mode
-# refuses DDL that would assign an OID without a preset value.  The server is
-# restarted in -b mode later, just for the window-emit call.
+# Setup (CREATE TABLESPACE, etc.) must run in NORMAL mode: binary-upgrade mode
+# refuses DDL without preset OID.  Server restarted in -b mode for window-emit.
 "$BIN/pg_ctl" -D "$D" -l "$W/d.log" -w start >/dev/null 2>&1 || { echo FAIL start; exit 1; }
-# Use a SQL file (not an inline heredoc) so the LOCATION '...' single-quotes are
-# not mangled by nested shell/heredoc quoting.
+# Use SQL file to avoid mangling LOCATION '...' single-quotes in nested shell/heredoc.
 cat > "$W/mk.sql" <<SQL
 CREATE TABLESPACE extts LOCATION '$EXT';
 CREATE TABLE et(id int primary key, v text) TABLESPACE extts;
@@ -45,21 +43,19 @@ log "external tablespace oid=$SPCOID  et=$ET_FP"
                               || { echo "FAIL: expected a symlink at pg_tblspc/$SPCOID"; FAIL=1; }
 
 log "restart in binary-upgrade mode for the gated window-emit call"
-# The window is emitted by the IsBinaryUpgrade-gated
-# binary_upgrade_emit_wal_window(), so the server must run in -b mode (as
-# pg_upgrade's own burst server does).  The tablespace already exists on disk;
-# -b only affects the emit call, not the read below.
+# Window emitted by IsBinaryUpgrade-gated binary_upgrade_emit_wal_window(),
+# so server must run in -b mode (like pg_upgrade's burst server).  Tablespace
+# already exists; -b affects emit only, not the read below.
 MAJ=$(q -tAc "SELECT current_setting('server_version_num')::int")
 "$BIN/pg_ctl" -D "$D" -w stop >/dev/null 2>&1
 "$BIN/pg_ctl" -D "$D" -l "$W/db.log" -o "-b" -w start >/dev/null 2>&1 || { echo FAIL start -b; exit 1; }
 
 log "emit the upgrade window and confirm the DIRTREE record CAPTURES the symlink"
-# binary_upgrade_emit_wal_window() emits the whole window; one of its records is
-# XLOG_UPGRADE_DIRTREE, which captures the tablespace symlinks.  skip_complete=true
-# keeps this a partial window (no COMPLETE / finalize) since we only exercise the
-# DIRTREE capture+replay here, not a full first-startup.  Switch the segment so it
-# is flushed and readable, then dump every segment and read the desc
-# ("... symlinks N ...").  MAJ (captured above) is this server's major version.
+# binary_upgrade_emit_wal_window() emits window; XLOG_UPGRADE_DIRTREE captures
+# tablespace symlinks.  skip_complete=true keeps partial window (no COMPLETE/finalize)
+# since we exercise DIRTREE capture+replay only, not full first-startup.
+# Switch segment for flush/readability, dump all segments, read desc ("... symlinks N ...").
+# MAJ (captured above) is server's major version.
 q -tAc "SELECT binary_upgrade_emit_wal_window($MAJ, $MAJ, 2, true)" >/dev/null 2>&1 || { echo "FAIL: binary_upgrade_emit_wal_window() errored"; FAIL=1; }
 q -tAc "SELECT pg_switch_wal()" >/dev/null 2>&1
 SYMN=$(for s in "$D/pg_wal"/[0-9A-F]*; do "$BIN/pg_waldump" "$s" 2>/dev/null; done | grep "UPGRADE_DIRTREE" | grep -oE "symlinks [0-9]+" | tail -1 | awk '{print $2}')
@@ -68,19 +64,17 @@ log "DIRTREE recorded symlinks=$SYMN"
 "$BIN/pg_ctl" -D "$D" -w stop >/dev/null 2>&1
 
 # ---- replay half: remove symlink + target, crash-recover, expect recreation --
-# Arm crash recovery from a checkpoint BEFORE the dirtree record so replay re-runs
-# it.  Simplest portable approach: use an immediate stop already done; now delete
-# the symlink and target, then restart -- recovery from the last checkpoint will
-# reprocess WAL including the DIRTREE record and recreate the symlink.
+# Arm crash recovery from checkpoint BEFORE dirtree record so replay re-runs it.
+# Simplest: use immediate stop; delete symlink + target; restart; recovery from
+# last checkpoint reprocesses WAL including DIRTREE and recreates symlink.
 log "remove symlink pg_tblspc/$SPCOID and target $EXT, then restart (replay must recreate)"
 rm -f "$D/pg_tblspc/$SPCOID"
 rm -rf "$EXT"
 "$BIN/pg_ctl" -D "$D" -l "$W/d2.log" -w start >/dev/null 2>&1
 RC=$?
 if [ $RC -ne 0 ]; then
-    # Recovery may not have re-run the dirtree record if the checkpoint advanced
-    # past it (a clean stop writes a shutdown checkpoint AFTER dirtree).  Report
-    # honestly rather than claim a pass.
+    # Recovery may not re-run dirtree if checkpoint advanced past it
+    # (clean stop writes shutdown checkpoint AFTER dirtree).  Report honestly.
     log "note: server did not start after removing symlink; recovery did not replay DIRTREE past the last checkpoint"
     log "      (this exercises the CAPTURE guarantee; full replay-recreate is exercised by the primary bootstrap path in run_tablespace_test.sh + the wal-log flow)"
     tail -5 "$W/d2.log" 2>/dev/null

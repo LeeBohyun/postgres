@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 # Priority edge-case variants for --wal-upgrade, each a self-contained case:
 #
-#   checksums-off   : cluster built with --no-data-checksums.  The RELFILE FPI
-#                     path and page validation differ when checksums are off
-#                     (no pd_checksum); replay must still reconstruct exactly.
-#   segsize-1MB     : cluster with --wal-segsize=1.  The upgrade-WAL scanner
-#                     reads segsize from the files and the chunk cap is relative
-#                     to XLogRecordMaxSize (not segsize); a non-16MB segment size
-#                     must still scan + replay.
-#   crash-in-replay : kill the server mid first-startup replay (after START,
-#                     before COMPLETE applied), then restart.  The `applied`
-#                     idempotency guard was only tested for "already applied";
-#                     this checks "half applied then restarted" converges and
-#                     does not double-apply or refuse.
+#   checksums-off   : cluster with --no-data-checksums.  RELFILE FPI path and
+#                     page validation differ (no pd_checksum); replay must still
+#                     reconstruct exactly.
+#   segsize-1MB     : cluster with --wal-segsize=1.  Upgrade-WAL scanner reads
+#                     segsize from files; chunk cap relative to XLogRecordMaxSize
+#                     (not segsize); non-16MB size must still scan + replay.
+#   crash-in-replay : kill server mid first-startup replay (after START, before
+#                     COMPLETE applied), then restart.  `applied` idempotency
+#                     guard tested for "already applied" only; checks "half
+#                     applied then restarted" converges, no double-apply/refuse.
 #
 # Usage: run_variants_test.sh [checksums|segsize|crash|all]   (default: all)
 set -u
@@ -55,9 +53,8 @@ SQL
     local TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
     echo "[$name] base/ data-file bytes: $TOTAL_BASE"
 
-    # --wal-upgrade auto-serves the new cluster (after the disk-wiped
-    # assertion above): the first start applies the WAL window, reconstructs, and
-    # comes up read-write -- no quarantine hold, no commit step.
+    # --wal-upgrade auto-serves new cluster (after disk-wiped assertion above):
+    # first start applies WAL window, reconstructs, and comes up read-write.
     echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$port">>$NEW/postgresql.conf
     "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "[$name] FAIL start new"; tail -20 "$W/new.log"; return 1; }
     local NEW_FP=$("$BIN/psql" -h "$W" -p $port -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint), (SELECT count(*) FROM toast_t) FROM t")
@@ -92,23 +89,22 @@ SQL
     [ $? -eq 0 ] || { echo "[$name] FAIL upgrade"; tail -15 "$W/up.log"; RC=1; }
     echo "unix_socket_directories='$W'">>$NEW/postgresql.conf; echo "port=$port">>$NEW/postgresql.conf
 
-    # Start recovery, then IMMEDIATE-kill the postmaster mid-replay to simulate a
-    # crash before COMPLETE is durably applied.  pg_ctl start waits for readiness,
-    # so start in the background and SIGKILL fast.
+    # Start recovery, then IMMEDIATE-kill postmaster mid-replay (simulates crash
+    # before COMPLETE durably applied).  pg_ctl start waits for readiness, so
+    # start background and SIGKILL fast.
     log "[$name] start recovery then SIGKILL mid-replay"
     "$BIN/postgres" -D "$NEW" >"$W/crash.log" 2>&1 &
     PM=$!
-    # let it begin replay (arm bootstrap + start applying) then kill hard
+    # Let it begin replay (arm bootstrap + start applying), then kill hard.
     for i in $(seq 1 40); do grep -q "arming recovery from end-of-upgrade" "$W/crash.log" 2>/dev/null && break; sleep 0.1; done
     kill -9 $PM 2>/dev/null
     # kill any child procs too
     pkill -9 -f "postgres -D $NEW" 2>/dev/null
     lsof -ti :$port 2>/dev/null | xargs kill -9 2>/dev/null
     sleep 1
-    # After a mid-replay crash, a restart must re-arm and converge idempotently,
-    # then auto-serve read-write with the data intact (no re-hold, no
-    # commit step).  This proves crash-idempotency: a half-applied window
-    # converges on restart and comes up live without double-applying or refusing.
+    # After mid-replay crash, restart must re-arm, converge idempotently, then
+    # auto-serve read-write (data intact).  Proves crash-idempotency: a
+    # half-applied window converges and comes up live.
     log "[$name] restart after crash -- must re-arm, converge, and auto-serve (idempotent)"
     "$BIN/pg_ctl" -D "$NEW" -l "$W/new2.log" -w -t 120 start >/dev/null 2>&1
     if [ $? -ne 0 ]; then echo "[$name] FAIL: did not come up after crash-restart"; tail -20 "$W/new2.log"; RC=1

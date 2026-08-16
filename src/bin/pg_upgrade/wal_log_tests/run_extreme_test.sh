@@ -94,9 +94,8 @@ cd "$WORK"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$OLD" -D "$NEW" -U postgres --
 BASE_BYTES=$(find "$NEW/base" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
 log "on-disk base/ bytes after pg_upgrade (should be ~0): $BASE_BYTES"
 
-# --wal-upgrade auto-serves: the new cluster comes up read-write on the
-# first start (no quarantine hold, no commit).  The on-disk base/ measurement
-# above ran before first start, so it still reflects the wipe.
+# First start applies the WAL window and serves read-write.
+# The on-disk base/ measurement above ran before first start, so it reflects the wipe.
 echo "unix_socket_directories='$WORK'">>$NEW/postgresql.conf; echo "port=$PORT">>$NEW/postgresql.conf
 
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1 || { echo START-FAIL; tail -30 "$WORK/new.log"; exit 1; }

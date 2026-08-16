@@ -30,9 +30,8 @@ run_upgrade() { # $1=variant  $2=extraflag
   cd "$D"; "$BIN/pg_upgrade" -b $BIN -B $BIN -d "$D/old" -D "$D/new" -U postgres --initdb $FLAG --copy >"$D/up.log" 2>&1 \
     || { echo "$V UPGRADE FAILED"; tail -8 "$D/up.log"; exit 1; }
   echo "unix_socket_directories='$W'">>$D/new/postgresql.conf; echo "port=$P">>$D/new/postgresql.conf; echo "autovacuum=off">>$D/new/postgresql.conf
-  # --wal-upgrade now auto-serves: the new cluster comes up read-write on the
-  # first start, exactly like upstream pg_upgrade (no quarantine hold, no commit).
-  # start + clean stop so both go through an identical startup/shutdown cycle
+  # --wal-upgrade auto-serves on first start.
+  # start + clean stop for matching startup/shutdown cycles
   PGPORT=$P "$BIN/pg_ctl" -D "$D/new" -l "$D/new.log" -w start >/dev/null 2>&1 || { echo "$V START FAILED"; tail -20 "$D/new.log"; exit 1; }
   PGPORT=$P "$BIN/pg_ctl" -D "$D/new" -w stop >/dev/null 2>&1
 }
@@ -187,10 +186,8 @@ print("VERDICT:", "PASS - identical modulo page LSN and empty-only files" if ver
 sys.exit(0 if verdict else 1)
 PY
 
-# SLRU compare is INFORMATIONAL ONLY: the two clusters run independent
-# restore+startup cycles, so pg_xact/pg_multixact bookkeeping legitimately
-# differs.  It does not feed the verdict (physical-equivalence is about relation
-# files, checked above; SLRU content is validated logically by run_mxact_test).
+# SLRU differs legitimately (independent restore+startup cycles).
+# Physical equivalence is relation files only; SLRU is validated by run_mxact_test.
 log "SLRU (pg_xact/pg_multixact) exact compare (informational)"
 for d in pg_xact pg_multixact/offsets pg_multixact/members; do
   if diff -r "$NA/$d" "$WB/$d" >/dev/null 2>&1; then echo "  $d: IDENTICAL"; else echo "  $d: DIFFERS"; diff -rq "$NA/$d" "$WB/$d" 2>&1 | head -3; fi

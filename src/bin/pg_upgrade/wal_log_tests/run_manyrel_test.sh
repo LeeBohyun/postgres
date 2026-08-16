@@ -32,10 +32,9 @@ CONF
 "$BIN/pg_ctl" -D "$OLD" -l "$W/old.log" -w start >/dev/null 2>&1 || { echo FAIL start; exit 1; }
 
 log "create $NDBS databases, each with $NTABLES tables (heap/toast/btree/hash/gin)"
-# Unquoted heredoc: bash expands $NTABLES but leaves \$\$ -> $$ and %% intact.
-# Modulo OUTSIDE a format() string is a single '%'; only the '%%' inside the
-# format template is a literal percent.  (ON_ERROR_STOP so a DDL failure is loud,
-# not silently swallowed as it was before.)
+# Unquoted heredoc: bash expands $NTABLES, leaves \$\$ -> $$ and %% intact.
+# Modulo outside a format() string is '%'; '%%' inside template is literal.
+# (ON_ERROR_STOP for loud DDL failures, not silent swallows.)
 for d in $(seq 1 $NDBS); do
   q -qc "CREATE DATABASE db$d" >/dev/null 2>&1
   "$BIN/psql" -h "$W" -p $P -U postgres -d db$d -q -v ON_ERROR_STOP=1 >"$W/ddl_db$d.log" 2>&1 <<SQL
@@ -70,8 +69,8 @@ done
 for pid in $pids; do wait $pid; done
 log "concurrent writes done"
 
-# Robust content fingerprint: a PL/pgSQL function loops every user table t* in
-# the db and accumulates (count, content-hash) into one deterministic string.
+# Content fingerprint: PL/pgSQL function accumulates per-table (count,
+# content-hash) into one deterministic string.
 data_fp() {
   local acc=""
   for d in $(seq 1 $NDBS); do
@@ -103,14 +102,12 @@ cd "$W"
 [ $? -eq 0 ] || { echo FAIL upgrade; tail -30 "$W/up.log"; exit 1; }
 
 TOTAL_BASE=$(find "$NEW/base" -type f -regextype posix-extended -regex '.*/[0-9]+(\.[0-9]+)?' -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
-# NOTE: user relations are NOT wiped under the RELINK model -- pg_upgrade
-# transfers them to disk as usual and the window carries only their identities,
-# so a populated base/ is expected on the primary.
+# NOTE: user relations NOT wiped under RELINK model; transferred to disk, window
+# carries only identities.  Populated base/ expected on primary.
 log "base/ data-file bytes on disk after pg_upgrade: $TOTAL_BASE"
 
-# --wal-upgrade auto-serves: the new cluster comes up read-write on the
-# first start (no quarantine hold, no commit).  The disk-wiped assertion above
-# ran before first start, so it still reflects the wipe.
+# --wal-upgrade auto-serves on first start.
+# Disk-wipe assertions ran before start, still valid.
 cat >> "$NEW/postgresql.conf" <<CONF
 unix_socket_directories='$W'
 port=$P
@@ -122,7 +119,7 @@ NEW_FP=$(data_fp)
 NEW_NREL=$(for d in $(seq 1 $NDBS); do "$BIN/psql" -h "$W" -p $P -U postgres -d db$d -tAc "SELECT count(*) FROM pg_class WHERE relkind IN ('r','i') AND (relname LIKE 't%' OR relname LIKE '%_idx' OR relname LIKE '%pkey')"; done | paste -sd+ | bc)
 log "new: relation-ish count=$NEW_NREL"
 
-# concurrent READERS against the recovered cluster (sanity: it serves)
+# concurrent readers against recovered cluster
 log "$NCLIENTS concurrent readers against recovered cluster"
 rpids=""
 READOK=$W/readok; : > "$READOK"

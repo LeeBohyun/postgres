@@ -340,7 +340,7 @@ sub add_conn_conf
 # simulating a crash after START.  The new cluster must FATAL on first start
 # (never serve a half-built catalog) and the old cluster must stay intact.  The
 # dead-end new cluster carries no state worth keeping (there is no revert
-# interface), so it is simply discarded with rm -rf.
+# interface), so it is discarded with rm -rf.
 #
 # The hook is gated on USE_ASSERT_CHECKING (a production build ignores the env
 # var and can never emit an incomplete window), so this section only runs on a
@@ -394,7 +394,7 @@ SKIP:
 		$old_fp, 'crash: old cluster intact and startable after the failed upgrade');
 	$old->stop;
 
-	# The dead-end new cluster is simply discarded (rm -rf); there is no revert
+	# The dead-end new cluster is discarded (rm -rf); there is no revert
 	# interface, and the old cluster is the source of truth.
 	rmtree($new->data_dir);
 	ok(!-d $new->data_dir,

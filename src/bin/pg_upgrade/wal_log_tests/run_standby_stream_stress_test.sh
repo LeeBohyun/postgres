@@ -2,20 +2,18 @@
 # Streaming-standby STRESS matrix for --wal-upgrade (no manual WAL copy).
 #
 # run_standby_stream_e2e_test proves the streaming path on a small dataset.  This
-# runs the SAME path (upgrade primary -> commit -> live; a fresh skeleton STREAMS
-# the window and copies user files from the retained old datadir; becomes a hot
-# standby) across several harder data SHAPES, to shake out chunking /
+# runs the same path across several harder data shapes to shake out chunking /
 # many-relation / big-catalog issues in the streamed window:
 #
-#   SHAPE manyrel   : many relations across several databases (many RELFILE images)
-#   SHAPE bigcat    : a bloated catalog (thousands of columns -> large pg_attribute)
-#   SHAPE bigdata   : a larger user table (multi-segment relfiles; size via ROWS)
-#   SHAPE toastheavy: heavy TOAST (large out-of-line values)
+#   manyrel   : many relations across several databases (many RELFILE images)
+#   bigcat    : bloated catalog (thousands of columns -> large pg_attribute)
+#   bigdata   : larger user table (multi-segment relfiles; size via ROWS)
+#   toastheavy: heavy TOAST (large out-of-line values)
 #
-# Each shape asserts: the upgraded PRIMARY preserves the old data (NEW_FP==OLD_FP),
-# and the streamed STANDBY converges to it byte-identical (hot standby).  Same
-# version on both ends (the mechanism is version-independent; cross-major is
-# covered by run_standby_xversion_test on CI).
+# Each shape verifies: upgraded PRIMARY preserves old data (NEW_FP==OLD_FP),
+# and streamed STANDBY converges byte-identically (hot standby).  Same version
+# on both ends (mechanism is version-independent; cross-major covered
+# by run_standby_xversion_test).
 #
 # Tunables (env): SHAPES (default "manyrel bigcat bigdata toastheavy"),
 #   ROWS (bigdata rows, default 300000), NDBS/NTAB (manyrel, default 3/60),
@@ -95,7 +93,7 @@ fingerprint() {
 }
 
 for shape in $SHAPES; do
-  log "SHAPE=$shape : upgrade primary -> commit -> live; standby STREAMS the window (no manual WAL copy)"
+  log "SHAPE=$shape : upgrade primary and keep it live; standby STREAMS the window (no manual WAL copy)"
   W=$BASEW/$shape; OLD=$W/old NEW=$W/new SKEL=$W/skel
   for p in $PP $SP; do lsof -ti :$p 2>/dev/null | xargs kill -9 2>/dev/null; done
   rm -rf "$W"; mkdir -p "$W"
@@ -103,12 +101,12 @@ for shape in $SHAPES; do
   "$BIN/initdb" -D "$OLD" -U postgres -N >/dev/null 2>&1 || { echo "FAIL: initdb $shape"; GRC=1; continue; }
   { echo "unix_socket_directories='$W'"; echo "port=$PP"; echo "wal_level=replica"; echo "max_wal_senders=8"; } >> "$OLD/postgresql.conf"
   "$BIN/pg_ctl" -D "$OLD" -l "$W/old.log" -w start >/dev/null 2>&1 || { echo "FAIL: start $shape"; GRC=1; continue; }
-  # A physical slot marks an expected standby; pg_upgrade migrates it and it pins
-  # the window so the skeleton can stream it (no dedicated slot without one).
+  # A physical slot marks an expected standby; pg_upgrade migrates it to pin
+  # the window so the skeleton can stream it.
   "$BIN/psql" -h "$W" -p $PP -U postgres -qtAc \
     "SELECT pg_create_physical_replication_slot('stby_slot', true)" >/dev/null 2>&1 || { echo "FAIL: create-slot $shape"; GRC=1; continue; }
   build_shape "$W" "$shape"
-  # analyze so reltuples is populated for the fingerprint
+  # analyze to populate reltuples for the fingerprint
   "$BIN/psql" -h "$W" -p $PP -U postgres -qc "ANALYZE" >/dev/null 2>&1
   for d in $("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT datname FROM pg_database WHERE datname LIKE 'db%'" 2>/dev/null); do
     "$BIN/psql" -h "$W" -p $PP -U postgres -d "$d" -qc "ANALYZE" >/dev/null 2>&1
@@ -130,7 +128,7 @@ listen_addresses='localhost'
 CONF
   echo "host replication all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
   echo "host all all 127.0.0.1/32 trust" >> "$NEW/pg_hba.conf"
-  # Auto-serve: the primary comes up read-write on first start (no commit step).
+  # Auto-serve: the primary comes up read-write on first start.
   "$BIN/pg_ctl" -D "$NEW" -l "$W/new.log" -w start >/dev/null 2>&1 || { echo "FAIL: $shape new start"; tail "$W/new.log"; GRC=1; cd /; continue; }
   for d in $("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('template0','template1')" 2>/dev/null); do
     "$BIN/psql" -h "$W" -p $PP -U postgres -d "$d" -qc "ANALYZE" >/dev/null 2>&1
@@ -141,15 +139,15 @@ CONF
   [ "$NEW_FP" = "$OLD_FP" ] && log "  primary upgrade verified ($shape): data preserved" \
     || { echo "FAIL: $shape primary data ($NEW_FP) != old ($OLD_FP)"; GRC=1; }
 
-  # FRESH SKELETON + relink manifest, then STREAM the window (no manual WAL copy).  The window
+  # Skeleton + relink manifest: STREAM the window (no manual WAL copy).  Window
   # carries only the system delta plus the relink manifest; user relations
-  # (across ALL databases for the manyrel shape) are copied from the retained old
-  # datadir $OLD (--copy left it intact) by the manifest redo.  The standby is a
-  # fresh initdb skeleton with pg_upgrade_standby_old_datadir set to $OLD.
+  # (across all databases for the manyrel shape) are copied from the retained old
+  # datadir $OLD by the manifest redo.  The standby is a fresh initdb skeleton
+  # with pg_upgrade_standby_old_datadir set to $OLD.
   rm -rf "$SKEL"
   "$BIN/initdb" -D "$SKEL" -U postgres -N >/dev/null 2>&1 || { echo "FAIL: $shape skeleton initdb"; GRC=1; cd /; continue; }
-  # old-datadir path now comes from the pg_upgrade_standby_old_datadir GUC;
-  # pg_upgrade.signal is an empty presence-only sentinel.
+  # old-datadir path comes from the pg_upgrade_standby_old_datadir GUC;
+  # pg_upgrade.signal is a presence-only sentinel.
   echo "pg_upgrade_standby_old_datadir='$OLD'" >> "$SKEL/postgresql.conf"
   : > "$SKEL/pg_upgrade.signal"
   ls "$OLD"/base/*/[0-9]* >/dev/null 2>&1 \
@@ -170,7 +168,7 @@ CONF
   done
   grep -qiE "started streaming|streaming WAL" "$W/skel.log" || { echo "FAIL: $shape no streaming evidence"; tail -15 "$W/skel.log"; GRC=1; }
   [ "$UP" = 1 ] || { echo "FAIL: $shape standby did not come up"; tail -15 "$W/skel.log"; GRC=1; cd /; continue; }
-  # let it catch up to the primary's current LSN
+  # catch up to the primary's current LSN
   PRI_LSN=$("$BIN/psql" -h "$W" -p $PP -U postgres -tAc "SELECT pg_current_wal_lsn()")
   for i in $(seq 1 60); do
     RP=$("$BIN/psql" -h "$W" -p $SP -U postgres -tAc "SELECT pg_last_wal_replay_lsn()" 2>/dev/null)

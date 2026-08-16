@@ -54,8 +54,8 @@ OLD_SUM=$("$BIN/psql" -h "$WORK" -p $PP -U postgres -tAc "SELECT count(*), sum(i
 log "OLD big=$OLD_SUM"
 "$BIN/pg_ctl" -D "$OLD" -w stop >/dev/null 2>&1
 
-# The standby's OWN retained pre-upgrade datadir (independent of the primary's),
-# snapshotted before the upgrade; the relink source for the skeleton below.
+# Standby's pre-upgrade datadir (relink source for skeleton below;
+# independent of primary's).
 cp -a "$OLD" "$STBY_OLD"
 
 log "pg_upgrade --wal-upgrade --initdb --copy (primary keeps its files)"
@@ -74,10 +74,8 @@ BIGFN=$(basename "$RELPATH")           # relfilenumber of table big
 LOSEG=$(ls "$NEW/pg_wal/" | grep -E '^[0-9A-F]{24}$' | sort | head -1)
 LOG=$(hex=${LOSEG:8:8}; seg=${LOSEG:16:8}; printf '%X/%s000028' "$((16#$hex))" "${seg:6:2}")
 DUMP=$("$BIN/pg_waldump" -p "$NEW/pg_wal" -s "$LOG" 2>&1)
-# The desc prints the FIRST manifest entry's rel; the full per-segment coverage
-# is what we assert via the manifest entry count for this relfilenumber.  Emit a
-# waldump that shows every relink entry is not available, so instead assert the
-# manifest exists and the standby (below) reconstructs BOTH segments intact.
+# Verify the RELINK manifest exists; standby redo below proves all segments
+# are reconstructed intact.
 echo "$DUMP" | grep -q "UPGRADE_RELINK" || { echo "FAIL: no RELINK manifest in the window"; FAIL=1; }
 log "  window carries the RELINK manifest (big table relfilenumber=$BIGFN)"
 

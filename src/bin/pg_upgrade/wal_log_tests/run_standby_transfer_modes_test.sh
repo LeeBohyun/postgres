@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Standby RELINK redo: assert every transfer mode reproduces the PRIMARY's
-# on-disk RESULT, not just that the standby converges.
+# Standby RELINK redo: verify every transfer mode reproduces the PRIMARY's
+# on-disk result, not just that the standby converges.
 #
 # run_standby_stream_e2e_test proves a standby STREAMS the window and converges
-# for one mode (default --copy).  This test drives that same end-to-end path once
-# per transfer mode and, for each, inspects the placed user relation file to prove
-# the standby's RELINK redo used the RIGHT primitive -- reproducing exactly what
+# for one mode (default --copy).  This test drives that end-to-end path once
+# per transfer mode and inspects the placed user relation file to verify
+# the standby's RELINK redo used the correct primitive -- reproducing what
 # pg_upgrade's transfer step did on the primary:
 #
 #   copy            -> independent full copy   : distinct inode, source intact
@@ -16,18 +16,18 @@
 #   link            -> per-file hardlink         : SHARED inode, source intact
 #   swap            -> rename() (move)           : source MOVED OUT of stby_old
 #
-# The standby relinks from its OWN retained pre-upgrade datadir ($W/stby_old,
+# The standby relinks from its retained pre-upgrade datadir ($W/stby_old,
 # staged by the e2e script), so the inode/extent/existence checks below compare
-# the skeleton's placed file against that retained source.
+# the skeleton's placed file against the retained source.
 #
 # Env:
-#   PGBIN  new (20devel) bin dir (default <repo>/pginst/bin)
+#   PGBIN  bin dir (default <repo>/pginst/bin)
 #   MODES  space-separated subset to run (default: all the platform supports)
 #   WORK   parent work dir.  clone REQUIRES a reflink-capable filesystem (XFS
-#          with reflink=1, Btrfs, APFS); on ext4/overlayfs the primary's own
+#          with reflink=1, Btrfs, APFS); on ext4/overlayfs the primary's
 #          pg_upgrade --clone refuses first, so clone is auto-skipped there.
 #
-# A single user table's first relfilenode segment is the probe; the e2e script
+# Probe: a single user table's first relfilenode segment. The e2e script
 # seeds table t at a stable OID, whose base fork is checked as base/<db>/<relfn>.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
@@ -38,8 +38,8 @@ export PGDATABASE=postgres
 log(){ echo "=== $* ==="; }
 GRC=0
 
-# Does the work filesystem support reflink? (clone needs it, and the PRIMARY's
-# own --clone would refuse otherwise, so skip clone where it can't work.)
+# Reflink capability of work filesystem (clone needs it; primary's --clone
+# would refuse otherwise, so skip clone where unavailable).
 reflink_ok() {
   local dir=$1
   local probe="$dir/.reflink_probe"
@@ -53,11 +53,10 @@ reflink_ok() {
   return $rc
 }
 
-# Is copy_file_range actually available in this build?  The --copy-file-range
-# FLAG is always advertised, but the syscall is gated on HAVE_COPY_FILE_RANGE
-# (undefined on e.g. macOS); without it both the primary transfer and the standby
-# redo hard-fail.  Probe the installed pg_config.h, which sits at
-# <prefix>/include/{server/,}pg_config.h relative to the bin dir.
+# copy_file_range availability in this build.  The --copy-file-range flag is
+# advertised, but the syscall is gated on HAVE_COPY_FILE_RANGE (undefined on e.g.
+# macOS); without it both primary transfer and standby redo hard-fail.  Probe the
+# installed pg_config.h at <prefix>/include/{server/,}pg_config.h relative to bin.
 cfr_ok() {
   local inc
   for inc in "$BIN/../include/server/pg_config.h" \
@@ -88,8 +87,8 @@ if [ -z "${MODES:-}" ]; then
 fi
 log "transfer modes to check:$MODES"
 
-# Locate the probe user relation file (table t) in a datadir.  Returns the path
-# to its base-fork segment 0, or empty if absent.
+# Locate probe user relation file (table t) in a datadir; return path to its
+# base-fork segment 0, or empty if absent.
 probe_file() {
   local dd=$1 f
   for f in "$dd"/base/*/[0-9]*; do
@@ -102,8 +101,8 @@ probe_file() {
   done | xargs -r ls -S 2>/dev/null | head -1
 }
 
-# Count extents flagged "shared" (reflink) via filefrag; 0 if filefrag is absent
-# (e.g. macOS) or the file has none.  Always prints a single integer.
+# Count shared extents (reflink) via filefrag; 0 if filefrag is absent (e.g. macOS)
+# or the file has none.  Always prints a single integer.
 shared_extents() {
   command -v filefrag >/dev/null 2>&1 || { echo 0; return; }
   filefrag -v "$1" 2>/dev/null | grep -c 'shared'
@@ -113,8 +112,8 @@ for m in $MODES; do
   echo "############################################################"
   log "MODE=--$m"
   W="$BASEW/$m"
-  # Run the full streaming e2e for this mode; it stages stby_old + skeleton and
-  # asserts convergence.  We add the on-disk placement checks afterward.
+  # Run full streaming e2e for this mode (stages stby_old + skeleton, verifies
+  # convergence).  Add on-disk placement checks afterward.
   if XFER="--$m" WORK="$W" PGBIN="$BIN" bash "$E2E" >"$BASEW/$m.log" 2>&1; then
     log "  e2e (--$m): standby streamed + converged"
   else
@@ -123,8 +122,8 @@ for m in $MODES; do
 
   src=$(probe_file "$W/stby_old")     # the retained pre-upgrade source
   dst=$(probe_file "$W/skel")         # what the standby placed
-  # For swap the source is MOVED, so probe_file on stby_old yields nothing; the
-  # skeleton still has the file.  Resolve dst by its relfilenumber if needed.
+  # For swap the source is MOVED, so probe_file on stby_old yields nothing;
+  # skeleton still has the file.  Resolve dst by relfilenumber if needed.
   if [ -z "$dst" ]; then echo "  FAIL: no user relation placed in the skeleton"; GRC=1; continue; fi
 
   di=$(stat -c%i "$dst" 2>/dev/null || stat -f%i "$dst")
@@ -142,8 +141,8 @@ for m in $MODES; do
       if [ "$si" != "$di" ] && [ "$dsh" -gt 0 ] && [ "$ssh_" -gt 0 ]; then
         log "  OK(clone): reflink (distinct inodes $si/$di, shared extents src=$ssh_ dst=$dsh)"
       elif [ "$si" != "$di" ]; then
-        # filefrag may be unavailable (e.g. APFS): distinct inode + convergence
-        # is still consistent with a clone; note the weaker check.
+        # filefrag unavailable (e.g. APFS): distinct inode + convergence still
+        # consistent with a clone; note the weaker check.
         log "  OK(clone): distinct inodes ($si/$di); extent-sharing not verifiable here"
       else
         echo "  FAIL(clone): expected distinct inode reflink, got shared inode"; GRC=1

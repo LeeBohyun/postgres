@@ -51,13 +51,10 @@ unix_socket_directories='$W'
 hot_standby=on
 CONF
 
-# The upgrade replay happens on the FIRST start: --wal-upgrade now auto-serves,
-# so the single start reconstructs the cluster from WAL and comes up read-write --
-# no quarantine hold, no commit step.  During that reconstruction the cluster
-# is in crash recovery (dark), so no connection may observe a half-upgraded
-# cluster.  Hammer connections THROUGH the auto-serving start -- every probe must
-# either be cleanly rejected (recovering / not accepting) or return the correct
-# final count once the cluster is live; never a partial count.
+# On first start: --wal-upgrade reconstructs from WAL and serves read-write.
+# During reconstruction (crash recovery), no connection may observe a half-upgraded
+# cluster.  Every probe during startup must either be cleanly rejected or return
+# the final count once live; never a partial count.
 log "issue rapid connection attempts while the new cluster replays the upgrade"
 PROBE="$W/probe.out"; : > "$PROBE"
 (
@@ -98,8 +95,8 @@ if [ "$BAD" -ne 0 ]; then
   echo "FAIL: $BAD connection(s) observed a partial/inconsistent cluster during upgrade replay"
   FAIL=1
 fi
-# Sanity: we must have actually raced the window (seen at least one rejection),
-# otherwise the test proved nothing.
+# We must have raced the window (at least one rejection observed),
+# otherwise the test is inconclusive.
 if [ "$REJECTED" -eq 0 ]; then
   echo "WARNING: no rejections captured — replay finished before any probe landed;"
   echo "         the block was not actually exercised (test inconclusive, not a failure)."

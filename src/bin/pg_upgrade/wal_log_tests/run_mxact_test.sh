@@ -45,10 +45,8 @@ done
 wait "$MXA_PID" 2>/dev/null
 
 MX_OFF=$(find "$OLD/pg_multixact/offsets" -type f | wc -l)
-# CHECKPOINT FIRST so pg_control_checkpoint() reflects the live nextMulti: the
-# multixact just formed lives in shared memory and only lands in pg_control at a
-# checkpoint, so reading pg_control_checkpoint() before checkpointing would still
-# show the pre-multixact value.
+# CHECKPOINT first; multixact lives in shared memory, lands in pg_control only
+# at checkpoint.
 "$BIN/psql" -h "$WORK" -U postgres -qc "CHECKPOINT" >/dev/null
 MX_NEXT=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT next_multixact_id FROM pg_control_checkpoint()")
 # Assert a multixact actually formed (next_multixact_id advanced past the initial
@@ -65,38 +63,29 @@ cd "$WORK"
 
 MXOFF_BYTES=$(find "$NEW/pg_multixact/offsets" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
 MXMEM_BYTES=$(find "$NEW/pg_multixact/members" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1}END{print s+0}')
-# pg_upgrade copies the multixact SLRUs to the new cluster itself
-# (copy_subdir_files in pg_upgrade.c), so they are present on disk here; the
-# window ALSO carries them as XLOG_UPGRADE_RAWFILE records, which is what a
-# standby or PITR replays.  The multixact correctness check below is what
-# actually proves the values survived.
+# pg_upgrade copies multixact SLRUs to disk here; window also carries them as
+# XLOG_UPGRADE_RAWFILE records for standby/PITR replay.
 log "after pg_upgrade: pg_multixact offsets=$MXOFF_BYTES members=$MXMEM_BYTES bytes on disk"
 
-# --wal-upgrade auto-serves: the new cluster comes up read-write on the
-# first start (no quarantine hold, no commit).  The skipped-on-disk assertion
-# above ran before first start, so it still reflects the wipe.
+# --wal-upgrade auto-serves on first start.
+# Skipped-on-disk assertions valid (ran before start).
 echo "unix_socket_directories = '$WORK'" >> "$NEW/postgresql.conf"; echo "port=$PORT" >> "$NEW/postgresql.conf"
 
 "$BIN/pg_ctl" -D "$NEW" -l "$WORK/new.log" -w start >/dev/null 2>&1 || { echo FAIL start; tail -30 "$WORK/new.log"; exit 1; }
 NEW_SUM=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*), sum(hashtext(v)::bigint) FROM m")
 NEW_NEXT=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT next_multixact_id FROM pg_control_checkpoint()")
-# Confirm the multixact state is actually USABLE after replay: the row that was
-# multixact-locked in the old cluster must be readable and updatable now (the
-# stored multixact in its xmax must resolve against the reconstructed SLRU
-# without error).  This is the real correctness property -- NOT the on-disk byte
-# count of pg_multixact/offsets, which is just an SLRU flush-timing artifact the
-# code never promises at any particular instant.
+# Confirm multixact state is usable: row xmax must resolve against reconstructed SLRU.
+# (Real correctness property, not on-disk byte-count artifact.)
 "$BIN/psql" -h "$WORK" -U postgres -qc "UPDATE m SET v = v WHERE id<=500" >/dev/null 2>&1
 MX_USABLE=$("$BIN/psql" -h "$WORK" -U postgres -tAc "SELECT count(*) FROM m WHERE id<=500" 2>&1)
 log "after startup: data=$NEW_SUM next_multixact_id=$NEW_NEXT multixact-locked rows updatable=$MX_USABLE"
 "$BIN/pg_ctl" -D "$NEW" -w stop >/dev/null 2>&1
 
 FAIL=0
-# Correctness properties (semantic, not implementation-detail):
+# Semantic correctness properties:
 #  - user data round-trips
-#  - the multixact counter survived the upgrade
-#  - the previously multixact-locked rows are still resolvable/updatable (the
-#    reconstructed SLRU answers correctly)
+#  - multixact counter survived upgrade
+#  - previously multixact-locked rows remain resolvable/updatable
 [ "$OLD_SUM" = "$NEW_SUM" ] || { echo "MISMATCH data: old=$OLD_SUM new=$NEW_SUM"; FAIL=1; }
 [ "$MX_NEXT" = "$NEW_NEXT" ] || { echo "MISMATCH next_multixact_id: old=$MX_NEXT new=$NEW_NEXT"; FAIL=1; }
 [ "$MX_USABLE" = "500" ] || { echo "MISMATCH: multixact-locked rows not resolvable after replay (got '$MX_USABLE')"; FAIL=1; }
