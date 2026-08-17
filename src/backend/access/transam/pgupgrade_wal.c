@@ -385,15 +385,12 @@ UpgradeWindowFinalized(void)
  *   CN_seg = max( XLByteToSeg(old_tail, old_seg_size),
  *                 highest segment in <old_datadir>/pg_wal ) + 1
  *
- * The scan takes the max segno over all timelines and over partial (.partial)
- * segments, without a timeline filter, as pg_resetwal.c FindEndOfXLOG
- * does.  This must match pg_resetwal because the producer's -l target came from
- * the old cluster's own "pg_resetwal -n" result: if the old cluster was ever
- * promoted, a higher-timeline segment could hold the max segno, and a
- * TLI-1-only scan would compute a smaller CN_seg than the producer targeted.
- * (The window itself is on timeline 1, but this is a floor computation, not a
- * window scan.)  The +1 advances to the next unused segment, as pg_resetwal does.
- * Segment math uses the old cluster's segment size.
+ * Like FindEndOfXLOG, the scan takes the max segno over all timelines and
+ * partial (.partial) segments, without a timeline filter.  This must match
+ * pg_resetwal: if the old cluster was ever promoted, a higher-timeline segment
+ * could hold the max segno, and a TLI-1-only scan would compute a smaller
+ * CN_seg than the producer targeted.  The +1 advances to the next unused
+ * segment.
  */
 static XLogSegNo
 DeriveUpgradeCnSegment(const char *old_datadir, XLogRecPtr old_tail,
@@ -740,15 +737,10 @@ PerformWalUpgradeIfNeeded(void)
 
 	/*
 	 * LOCAL-WINDOW PATH.  Scan pg_wal/ for the START/COMPLETE markers and CN.
-	 * A completed --wal-upgrade run leaves a START..COMPLETE window in
-	 * pg_wal/ (no rename).  Cases:
-	 *
-	 * pending (not finalized) -> derive CN from the WAL, arm pg_control
-	 * in-process, and let StartupXLOG() recover the window. already applied
-	 * (COMPLETE marker present, or control checkpoint > CN) -> normal
-	 * startup; a prior startup finalized the upgrade. START, no COMPLETE and
-	 * not finalized -> crash mid-upgrade; FATAL (see below). no START -> not
-	 * an upgrade; normal startup.
+	 * A completed --wal-upgrade run leaves the window in pg_wal/.  A pending
+	 * window is armed and replayed here.  An already-finalized one
+	 * falls through to a normal start, and a crash mid-upgrade (START but no
+	 * COMPLETE, not finalized) FATALs (see below).
 	 *
 	 * Deriving CN here (rather than a prior offline pg_resetwal stamp) lets
 	 * the same WAL stream drive recovery on the primary and on a physical
@@ -758,23 +750,19 @@ PerformWalUpgradeIfNeeded(void)
 							   &cn, &cn_lsn, &wal_sysid))
 	{
 		/*
-		 * ARCHIVE-PITR PATH.  No local window, but a cross-version
-		 * upgrade-PITR restore stages the pg_upgrade.signal sentinel (the
-		 * same marker checkDataDir() keys the control-file synthesis on): the
-		 * window arrives later via restore_command as recovery replays
-		 * forward from a pre-upgrade base backup across the upgrade boundary.
-		 * Recovery starts at the base backup's checkpoint and flows through
-		 * CN organically, so no re-anchoring is needed here; arm
-		 * in_upgrade_bootstrap so the XLOG_UPGRADE_START redo does not FATAL
-		 * when the window is reached. (This is the archive path because there
-		 * is no local window and, on this branch, recovery.signal drives the
-		 * restore rather than primary_conninfo.)
+		 * ARCHIVE-PITR PATH.  No local window: a cross-version upgrade-PITR
+		 * restore stages the pg_upgrade.signal sentinel, and the window arrives
+		 * later via restore_command as recovery replays forward from a
+		 * pre-upgrade base backup across the upgrade boundary.  Recovery starts
+		 * at the base backup's checkpoint and flows through CN organically, so
+		 * no re-anchoring is needed here.  Arm in_upgrade_bootstrap so the
+		 * XLOG_UPGRADE_START redo does not FATAL when the window is reached.
 		 *
-		 * Gate on the sentinel (not raw recovery.signal/standby.signal): an
-		 * ordinary archive PITR or a plain streaming standby must not arm the
-		 * bootstrap, or the standby-safety FATAL-halt guard is defeated. This
-		 * keeps all three detection sites (here, checkDataDir, and the
-		 * streaming path) on the one pg_upgrade.signal sentinel.
+		 * Gate on the sentinel, not raw recovery.signal/standby.signal: an
+		 * ordinary archive PITR or plain streaming standby must not arm the
+		 * bootstrap, or the standby-safety FATAL-halt guard is defeated.  This
+		 * keeps all three detection sites (here, checkDataDir, the streaming
+		 * path) on the one pg_upgrade.signal sentinel.
 		 */
 		if (UpgradeSignalStaged())
 		{
@@ -908,22 +896,21 @@ PerformWalUpgradeIfNeeded(void)
  * pg_upgrade's transfer step produced on the primary for the given mode:
  *
  *   COPY            - independent full byte copy (copy_file()).
- *   CLONE           - reflink/COW clone: copyfile(COPYFILE_CLONE_FORCE) on macOS,
- *                     ioctl(FICLONE) on Linux (same primitives as cloneFile()).
+ *   CLONE           - reflink/COW clone (same primitives as cloneFile()).
  *   COPY_FILE_RANGE - copy_file_range().
  *   LINK            - per-file hardlink, sharing the old inode.
  *   SWAP            - rename(), moving the file out of the old datadir.
  *
- * Like the reflink modes in pg_upgrade itself, CLONE/COPY_FILE_RANGE FATAL if the
- * filesystem cannot reflink rather than fall back to a full copy.  The standby
- * either reproduces the operator's chosen space profile or refuses, never silently
- * costing 2x.  The caller has already unlink()ed any pre-existing dst.
+ * Like pg_upgrade's own reflink modes, CLONE/COPY_FILE_RANGE FATAL if the
+ * filesystem cannot reflink rather than fall back to a full copy, so the standby
+ * reproduces the operator's chosen space profile or refuses.  The caller has
+ * already unlink()ed any pre-existing dst.
  *
- * The placed file is fsync'd before returning (the caller fsyncs the parent dir).
- * These files bypass smgr, so the checkpointer has no sync request for them and the
- * end-of-recovery checkpoint would otherwise advance pg_control past CN with the
- * data only in the OS cache.  A crash there would leave a finalized upgrade with
- * missing user relations, never re-replayed.
+ * The placed file is fsync'd before returning (the caller fsyncs the parent
+ * dir).  These files bypass smgr, so the checkpointer has no sync request for
+ * them.  Without the fsync the end-of-recovery checkpoint could advance
+ * pg_control past CN with the data still in the OS cache, and a crash there
+ * would leave a finalized upgrade missing user relations, never re-replayed.
  */
 static void
 RelinkPlaceFile(const char *oldfile, const char *newfile, uint8 mode)

@@ -159,7 +159,7 @@ $old->safe_psql(
 	INSERT INTO toasted
 	  SELECT g, repeat('abcdef0123456789', 3000) FROM generate_series(1, 300) g;
 	-- Large objects live in pg_largeobject[_metadata], which pg_upgrade
-	-- transfers verbatim as user data.  Under --wal-upgrade those catalogs are
+	-- transfers as user data.  Under --wal-upgrade those catalogs are
 	-- excluded from the window and named in the RELINK manifest instead, so the
 	-- standby links them from its own retained old datadir like any user
 	-- relation; seed some to exercise that path.

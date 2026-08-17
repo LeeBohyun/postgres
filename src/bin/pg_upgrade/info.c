@@ -837,13 +837,12 @@ count_old_cluster_logical_slots(void)
  * Gather the old cluster's physical replication slots so --wal-upgrade can
  * recreate them on the new cluster.  Recreating a slot preserves the standby's
  * slot identity and, because it is reserved before CN, pins the upgrade window
- * so the standby can stream it.  (Without --wal-upgrade a standby is rebuilt
- * from scratch, so its slot is pointless to carry.)
+ * so the standby can stream it.
  *
  * Physical slots are cluster-wide and carry no decoding state, so a single
- * query over pg_replication_slots suffices.  Temporary and invalidated slots
- * are skipped: a temporary slot cannot survive the upgrade's start/stop
- * cycles, and an invalidated slot has no usable restart_lsn to recreate from.
+ * query over pg_replication_slots suffices.  Temporary slots (which cannot
+ * survive the upgrade's start/stop cycles) and invalidated ones (no usable
+ * restart_lsn) are skipped.
  */
 void
 get_old_cluster_physical_slot_infos(void)

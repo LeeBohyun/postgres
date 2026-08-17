@@ -55,7 +55,7 @@ INSERT INTO t SELECT g,'v'||g FROM generate_series(1,2000) g;
 CREATE TABLE toast_t(id int, big text);
 INSERT INTO toast_t SELECT g, repeat(md5(g::text),300) FROM generate_series(1,300) g;
 -- Large objects live in pg_largeobject[_metadata], which pg_upgrade transfers
--- verbatim as user data.  Under --wal-upgrade those catalogs are excluded from
+-- as user data.  Under --wal-upgrade those catalogs are excluded from
 -- the window and instead named in the relink manifest, so the standby copies
 -- them from the old datadir; seeding LOs exercises that path exactly (see
 -- is_transferred_user_data_catalog).

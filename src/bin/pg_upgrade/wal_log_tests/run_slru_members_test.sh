@@ -82,9 +82,9 @@ log "4. DETERMINISTIC parse check: upgrade WAL must capture a NON-ZERO members s
 # segment). Must run before starting new cluster (recycles WAL after replay).
 : > "$W/members_recs.txt"
 # SLRU segments are captured as XLOG_UPGRADE_RAWFILE records carrying the
-# segment's PGDATA-relative PATH verbatim, e.g.
+# segment's PGDATA-relative path, e.g.
 #   rawfile "pg_multixact/members/000000000000002"; offset 0; bytes 262144
-# Bug impossible now: capture copies dir name verbatim (no %04x conversion), so
+# Bug impossible now: capture copies the dir name unchanged (no %04x conversion), so
 # 15-hex names preserved. Assert non-zero members segment with full name.
 for seg in $(ls "$W/n/pg_wal" | grep -E '^[0-9A-F]{24}$' | sort); do
   "$BIN/pg_waldump" -p "$W/n/pg_wal" "$seg" 2>/dev/null \
