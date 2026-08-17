@@ -457,30 +457,23 @@ UpgradeSignalStaged(void)
  * Automatic streaming-standby arming, deriving CN locally.
  *
  * A fresh vN+1 skeleton with primary_conninfo set arms its control file at CN
- * without asking the primary for the anchor: it derives CN itself from its own
+ * without asking the primary for the anchor: it derives CN from its own
  * retained old data directory, reproducing where the producer's pg_resetwal
- * placed CN.  The one thing it still needs from the primary is the system
- * identifier: the new cluster's sysid, which the window WAL pages are stamped
- * with.  That comes from the standard IDENTIFY_SYSTEM command it would run
- * anyway.  Runs in the startup process before StartupXLOG, so no SQL backend is
- * needed.
+ * placed it.  From the primary it needs only the system identifier (via the
+ * standard IDENTIFY_SYSTEM).  Runs in the startup process before StartupXLOG.
  *
  * Derivation:
- *   1. sysid from IDENTIFY_SYSTEM on the primary (== the new cluster's sysid).
- *   2. old_tail = old cluster's checkPointCopy.redo, from its control file.
+ *   1. sysid from IDENTIFY_SYSTEM on the primary.
+ *   2. old_tail = old cluster's checkPointCopy.redo.
  *   3. CN_seg = FindEndOfXLOG rule over the old datadir (DeriveUpgradeCnSegment).
- *   4. CN is the DB_SHUTDOWNED checkpoint at the start of CN_seg on timeline 1:
- *      cn_lsn = segment-boundary LSN just past the long page header, and because
- *      CN is a shutdown checkpoint, redo == cn_lsn.
+ *   4. CN is the DB_SHUTDOWNED checkpoint at the start of CN_seg on timeline 1
+ *      (redo == cn_lsn == the segment-boundary LSN past the long page header).
  *
- * Gated on the pg_upgrade.signal sentinel: only a skeleton staged for
- * --wal-upgrade recovery carries it, so an ordinary streaming standby
- * (primary_conninfo set, but no sentinel) is left entirely untouched and starts
- * normally.  The streaming mode is inferred from primary_conninfo being set (vs.
- * the recovery.signal-driven archive path).  Returns false (caller falls back to
- * the local-window path) when the sentinel is absent or no primary is configured.
- * A missing old datadir GUC, a connection failure, or an unreadable old control
- * file while armed is a hard FATAL.
+ * Gated on the pg_upgrade.signal sentinel, so an ordinary standby without it is
+ * untouched.  Returns false (caller falls back to the local-window path) when
+ * the sentinel is absent or no primary is configured.  Once armed, a missing
+ * old-datadir GUC, a connection failure, or an unreadable old control file is a
+ * hard FATAL.
  */
 static bool
 ArmFromLocalDerivationIfConfigured(void)

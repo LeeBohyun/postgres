@@ -16,16 +16,15 @@
 
 /*
  * --wal-upgrade-signal-handoff: connect to the live old primary and write the
- * streaming-handoff trigger into its (old-format) WAL.  It emits a WAL record
- * that propagates to streaming standbys through the normal replication path.
- * A standby replaying it shuts down cleanly, ready for the new-version binary
- * swap / re-provision.  Run this before stopping the old primary and running
+ * streaming-handoff trigger into its (old-format) WAL, a record that propagates
+ * to streaming standbys through the normal replication path.  A standby
+ * replaying it shuts down cleanly, ready for the new-version binary swap /
+ * re-provision.  Run this before stopping the old primary and running
  * pg_upgrade.
  *
- * Unlike --wal-upgrade itself (which acts on stopped clusters), this one
- * requires the old primary to be running.  The target major version passed to
- * the trigger is this pg_upgrade binary's own major (the new version the
- * standby will converge to).
+ * Unlike --wal-upgrade itself (which acts on stopped clusters), this requires
+ * the old primary to be running.  The trigger carries this pg_upgrade binary's
+ * own major version (the version the standby converges to).
  */
 static void
 do_signal_handoff(void)

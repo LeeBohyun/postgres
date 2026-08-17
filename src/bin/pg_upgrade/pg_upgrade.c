@@ -252,16 +252,13 @@ main(int argc, char **argv)
 	if (user_opts.wal_upgrade && old_cluster_archive_command == NULL)
 	{
 		/*
-		 * Streaming path (no archive_command carried to the new cluster): the
+		 * Streaming path (no archive_command carried to the new cluster).  The
 		 * reset also positions the new cluster's WAL at the old cluster's next
-		 * segment (nextxlogfile, timeline 1), so the reset-written
-		 * DB_SHUTDOWNED checkpoint lands on a byte-deterministic segment
-		 * boundary (redo == checkPoint == CN) that a fresh standby skeleton can
-		 * derive locally from its retained old datadir.  Plain pg_resetwal -l
-		 * only floors the start upward, so after the restore (whose checkpoint
-		 * is at a high segment) it would be ignored; --wal-upgrade-exact makes
-		 * the -l target authoritative and forces the position down to
-		 * nextxlogfile.
+		 * segment (nextxlogfile, timeline 1), so the reset-written DB_SHUTDOWNED
+		 * checkpoint lands on a byte-deterministic segment boundary
+		 * (redo == checkPoint == CN) that a fresh standby skeleton can derive
+		 * locally from its retained old datadir.  --wal-upgrade-exact forces the
+		 * position down to nextxlogfile (plain pg_resetwal -l only floors it up).
 		 */
 		prep_status("Setting next OID and CN log position for new cluster");
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
@@ -318,18 +315,13 @@ main(int argc, char **argv)
 		conn = connectToServer(&new_cluster, "template1");
 
 		/*
-		 * The window is emitted after all pg_upgrade work is done, as one
-		 * burst rather than interleaved with the restore.
-		 *
 		 * A streaming standby anchors recovery at CN, so the window must be
 		 * pinned in pg_wal/ by a slot whose restart_lsn is at or before CN.
 		 * Migrating the old cluster's physical slots with immediately_reserve
-		 * reserves each restart_lsn at the current insert position, so this
-		 * loop must stay ahead of the emit call below: reserving after CN
-		 * would silently break retention.
-		 *
-		 * Without a physical slot no pin is needed: the absence of one means
-		 * no standby is connected.
+		 * reserves each restart_lsn at the current insert position, so this loop
+		 * must run before the emit call below.  Reserving after CN would silently
+		 * break retention.  With no physical slot no pin is needed (none means no
+		 * standby was connected).
 		 */
 		for (int slotnum = 0; slotnum < old_cluster.phys_slot_arr.nslots; slotnum++)
 		{
@@ -363,16 +355,16 @@ main(int argc, char **argv)
 
 		/*
 		 * Emit the entire window with a single binary-upgrade-gated backend
-		 * call; EmitUpgradeWalWindow() documents the order of the records it
-		 * writes.  The checkpoint it takes first is CN, the recovery anchor, so
-		 * replay starts there and applies only the end-of-upgrade images that
-		 * follow, never pg_restore's own WAL.
+		 * call.  EmitUpgradeWalWindow() documents the record order.  The
+		 * checkpoint it takes first is CN, the recovery anchor, so replay starts
+		 * there and applies only the end-of-upgrade images, never pg_restore's
+		 * own WAL.
 		 *
-		 * The XID/OID/multixact counters are not emitted separately: they were
-		 * transplanted into pg_control before CN, so the CN checkpoint record
-		 * carries them.  CN's LSN is not recorded either; first startup derives
-		 * it from the WAL (PerformWalUpgradeIfNeeded), which is what lets a
-		 * physical standby find the same anchor in the streamed WAL.
+		 * The XID/OID/multixact counters were transplanted into pg_control
+		 * before CN, so the CN checkpoint carries them.  CN's LSN is not
+		 * recorded; first startup derives it from the WAL
+		 * (PerformWalUpgradeIfNeeded), which lets a physical standby find the
+		 * same anchor in the streamed WAL.
 		 */
 		PQclear(executeQueryOrDie(conn,
 								  "SELECT binary_upgrade_emit_wal_window(%u, %u, %d, %s)",
