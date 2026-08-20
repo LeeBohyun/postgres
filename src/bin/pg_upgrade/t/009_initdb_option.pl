@@ -188,8 +188,31 @@ command_checks_all(
 	[qr/^$/],
 	'--initdb fails early when initdb is missing from the new bindir');
 
-# --initdb creates the new cluster, which --check (read-only) must not do, so
-# the combination is rejected during option parsing.
+# --check --initdb performs validation without creating anything.
+command_checks_all(
+	[
+		'pg_upgrade', '--no-sync',
+		'--old-datadir' => $oldnode->data_dir,
+		'--new-datadir' => $newnode->data_dir . '_dry_run',
+		'--old-bindir' => $oldbindir,
+		'--new-bindir' => $newbindir,
+		'--socketdir' => $newnode->host,
+		'--old-port' => $oldnode->port,
+		'--new-port' => $newnode->port,
+		'--initdb',
+		'--check',
+	],
+	0,
+	[qr/created with settings matching the old cluster/],
+	[qr/^$/],
+	'--check --initdb validates without creating the cluster');
+
+# Verify that --check --initdb didn't create anything.
+ok(!-d $newnode->data_dir . '_dry_run',
+	'--check --initdb does not create the new cluster directory');
+
+# -O passes postmaster-only options, which initdb does not accept, so the
+# combination is rejected during option parsing rather than forwarded.
 command_checks_all(
 	[
 		'pg_upgrade', '--no-sync',
@@ -201,18 +224,11 @@ command_checks_all(
 		'--old-port' => $oldnode->port,
 		'--new-port' => $newnode->port,
 		'--initdb',
-		'--check',
+		'--new-options' => '-c work_mem=1MB',
 	],
 	1,
-	[qr/options -c\/--check and --initdb cannot be used together/],
+	[qr/options -O\/--new-options and --initdb cannot be used together/],
 	[qr/^$/],
-	'--initdb and --check cannot be used together');
-
-# NOTE: unlike upstream's standalone --initdb, this (--wal-upgrade) tree does
-# NOT reject -O/--new-options with --initdb.  create_new_cluster_via_initdb()
-# derives initdb's options from the old cluster's control data and never
-# forwards -O to initdb; -O reaches only the new cluster's postmaster, which the
-# --wal-upgrade flow legitimately needs (e.g. -c allow_in_place_tablespaces=on).
-# So there is no -O/--initdb rejection to test here.
+	'--initdb and -O cannot be used together');
 
 done_testing();

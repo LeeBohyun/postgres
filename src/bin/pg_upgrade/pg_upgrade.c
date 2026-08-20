@@ -72,7 +72,9 @@ static void set_frozenxids(void);
 static void make_outputdirs(char *pgdata);
 static void setup(char *argv0);
 static void resolve_new_bindir(const char *argv0);
-static void create_new_cluster_via_initdb(const char *argv0);
+static void build_new_cluster_initdb_cmd(PQExpBuffer cmd);
+static void create_new_cluster_via_initdb(void);
+static void check_new_cluster_via_initdb(void);
 static char *detect_old_cluster_archive_command(void);
 static void write_wal_upgrade_archive_conf(const char *archive_command);
 static void create_logical_replication_slots(void);
@@ -81,6 +83,10 @@ static void create_conflict_detection_slot(void);
 ClusterInfo old_cluster,
 			new_cluster;
 OSInfo		os_info;
+
+/* --initdb: track whether initdb created the new cluster, for atexit cleanup */
+static bool new_cluster_created_by_initdb = false;
+static bool initdb_cleanup_registered = false;
 
 /*
  * For --wal-upgrade, the old cluster's archive_command carried forward to the
@@ -153,11 +159,12 @@ main(int argc, char **argv)
 	get_restricted_token();
 
 	adjust_data_dir(&old_cluster);
-
-	if (user_opts.initdb_new_cluster)
-		create_new_cluster_via_initdb(argv[0]);
-
 	adjust_data_dir(&new_cluster);
+
+	if (user_opts.check && user_opts.initdb_new_cluster)
+		check_new_cluster_via_initdb();		/* exits(0), never returns */
+	else if (user_opts.initdb_new_cluster)
+		create_new_cluster_via_initdb();
 
 	/*
 	 * Set mask based on PGDATA permissions, needed for the creation of the
@@ -200,6 +207,9 @@ main(int argc, char **argv)
 
 	check_new_cluster();
 	report_clusters_compatible();
+
+	/* Disarm orphan cleanup once we reach the point of no easy return. */
+	new_cluster_created_by_initdb = false;
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -674,115 +684,172 @@ resolve_new_bindir(const char *argv0)
 
 
 /*
- * create_new_cluster_via_initdb()
+ * new_cluster_cleanup_atexit()
  *
- * Implements --initdb: run initdb to create the new cluster before upgrading,
- * deriving WAL segment size, data checksums, encoding, and locale settings
- * from the old cluster so that check_control_data() passes.
- *
- * This runs before the normal verify_directories() / setup() path, so we
- * use a temporary log directory under the new bindir for the early server
- * start; make_outputdirs() will replace log_opts.logdir later.
+ * atexit() handler: remove the new cluster's data directory if --initdb
+ * created it but the run failed before reaching the point of no return.
+ * Does nothing unless new_cluster_created_by_initdb is set.
  */
 static void
-create_new_cluster_via_initdb(const char *argv0)
+new_cluster_cleanup_atexit(void)
+{
+	if (!new_cluster_created_by_initdb)
+		return;
+	(void) rmtree(new_cluster.pgdata, true);
+}
+
+
+/*
+ * build_new_cluster_initdb_cmd()
+ *
+ * Shared helper for both the real --initdb path and the --check --initdb
+ * dry-run path.  Starts the old cluster (in binary-upgrade mode, which
+ * disables autovacuum), queries template0 for encoding/locale settings, reads
+ * old cluster pg_control via get_control_data(), stops the old cluster, and
+ * populates 'cmd' with the initdb command-string needed to create the new
+ * cluster with matching settings.
+ *
+ * This helper does not execute the command; callers decide whether to
+ * exec_prog() it (real upgrade) or just report it (dry-run).
+ *
+ * Both callers must have already called adjust_data_dir(&new_cluster) and
+ * resolve_new_bindir() before calling this, to ensure new_cluster.pgdata
+ * and new_cluster.bindir are set.
+ *
+ * On return, log_opts.logdir points at a temporary directory used for the
+ * old-cluster start/stop and the later initdb run.  Callers save and restore
+ * it around this helper.
+ */
+static void
+build_new_cluster_initdb_cmd(PQExpBuffer cmd)
 {
 	DbLocaleInfo *locale;
-	PQExpBufferData cmd;
-	char		tmp_logdir[MAXPGPATH];
-	char	   *saved_logdir = log_opts.logdir;
 	const char *encoding_name;
+	char		initdb_path[MAXPGPATH];
+	char		verfile[MAXPGPATH];
+	char		tmp_logdir[MAXPGPATH];
+	struct stat st;
+	DIR		   *dir;
+	struct dirent *de;
 
-	/* Pass argv0 (full path) so find_my_exec can locate the binary */
-	resolve_new_bindir(argv0);
+	/* Verify initdb is present in the new cluster's bin directory. */
+	snprintf(initdb_path, sizeof(initdb_path), "%s/initdb", new_cluster.bindir);
+	if (validate_exec(initdb_path) != 0)
+		pg_fatal("could not find \"initdb\" in \"%s\": %m\n"
+				 "The --initdb option requires initdb to be present in the new cluster's bin directory.",
+				 new_cluster.bindir);
 
 	/*
-	 * Verify that initdb is present and executable before doing any work. The
-	 * normal path checks this later inside verify_directories(), but we run
-	 * before that, so fail early with a useful message.
+	 * Refuse to run initdb into a directory that already exists and is not
+	 * empty.  If a later step fails, the cleanup handler removes the entire
+	 * new data directory.  Requiring it to be empty first ensures the cleanup
+	 * never destroys files the user already had there.
 	 */
+	snprintf(verfile, sizeof(verfile), "%s/PG_VERSION", new_cluster.pgdata);
+	if (stat(verfile, &st) == 0)
+		pg_fatal("new cluster data directory \"%s\" already contains a database system; "
+				 "--initdb requires an empty or nonexistent directory",
+				 new_cluster.pgdata);
+	dir = opendir(new_cluster.pgdata);
+	if (dir)
 	{
-		char		initdb_path[MAXPGPATH];
-
-		snprintf(initdb_path, sizeof(initdb_path), "%s/initdb",
-				 new_cluster.bindir);
-		if (validate_exec(initdb_path) != 0)
-			pg_fatal("could not find \"initdb\" in \"%s\": %m\n"
-					 "The --initdb option requires initdb to be present in the new cluster's bin directory.",
-					 new_cluster.bindir);
+		while (errno = 0, (de = readdir(dir)) != NULL)
+		{
+			if (strcmp(de->d_name, ".") != 0 &&
+				strcmp(de->d_name, "..") != 0)
+				pg_fatal("new cluster data directory \"%s\" is not empty; "
+						 "--initdb requires an empty or nonexistent directory",
+						 new_cluster.pgdata);
+		}
+		if (errno)
+			pg_fatal("could not read directory \"%s\": %m", new_cluster.pgdata);
+		closedir(dir);
 	}
+	else if (errno != ENOENT)
+		pg_fatal("could not open directory \"%s\": %m", new_cluster.pgdata);
+
+	/*
+	 * Validate the new binaries' version before touching disk, so a wrong
+	 * --new-bindir fails before the new cluster is created and there is
+	 * nothing to clean up.
+	 */
+	if (new_cluster.bin_version == 0)
+		get_bin_version(&new_cluster);
+	if (GET_PG_MAJORVERSION_NUM(new_cluster.bin_version) !=
+		GET_PG_MAJORVERSION_NUM(PG_VERSION_NUM))
+		pg_fatal("new cluster binaries are version %d, but pg_upgrade is version %d",
+				 GET_PG_MAJORVERSION_NUM(new_cluster.bin_version),
+				 GET_PG_MAJORVERSION_NUM(PG_VERSION_NUM));
 
 	old_cluster.major_version = get_pg_version(old_cluster.pgdata,
 											   &old_cluster.major_version_str);
 
 	/*
-	 * get_control_data() selects pg_resetwal vs. pg_resetxlog via
-	 * bin_version, which check_bindir() normally fills in later.  Seed it now
-	 * so the right binary name is used in this early call.
+	 * The normal output directory does not exist yet, so use a temporary log
+	 * directory next to the new data directory (writable, unlike the new bin
+	 * directory) for initdb and the brief old-server start.
 	 */
-	if (old_cluster.bin_version == 0)
-		old_cluster.bin_version = old_cluster.major_version;
-
-	/*
-	 * Refuse to clobber an already-populated new data directory.  --initdb is
-	 * meant to create the new cluster from scratch, so an existing PG_VERSION
-	 * there means the operator pointed at the wrong directory or a leftover
-	 * from a previous attempt; either way, silently removing a database
-	 * system is too dangerous.  Fail with pg_upgrade's own clear message (not
-	 * initdb's "directory not empty") so the operator can remove it
-	 * deliberately.
-	 */
-	{
-		char		verfile[MAXPGPATH];
-		struct stat st;
-
-		snprintf(verfile, sizeof(verfile), "%s/PG_VERSION",
-				 new_cluster.pgdata);
-		if (stat(verfile, &st) == 0)
-			pg_fatal("new cluster data directory \"%s\" already contains a database system; "
-					 "--initdb requires an empty or nonexistent directory",
-					 new_cluster.pgdata);
-	}
-
-	get_control_data(&old_cluster);
-
-	/* Set up a temporary log directory for the early server start. */
-	snprintf(tmp_logdir, sizeof(tmp_logdir), "%s/pg_upgrade_initdb.log.d",
-			 new_cluster.bindir);
+	snprintf(tmp_logdir, sizeof(tmp_logdir), "%s.initdb_log", new_cluster.pgdata);
 	if (mkdir(tmp_logdir, pg_dir_create_mode) < 0 && errno != EEXIST)
-		pg_fatal("could not create temporary log directory \"%s\": %m",
-				 tmp_logdir);
-	log_opts.logdir = tmp_logdir;
+		pg_fatal("could not create log directory \"%s\": %m", tmp_logdir);
+	log_opts.logdir = pg_strdup(tmp_logdir);
 
 	if (!old_cluster.sockdir)
 		old_cluster.sockdir = user_opts.socketdir ? user_opts.socketdir : ".";
 
-	prep_status("Inspecting old cluster locale for new cluster creation");
+	/*
+	 * The old server must be shut down.  The template0 read below starts a
+	 * postmaster on the old cluster, and get_control_data() runs pg_resetwal,
+	 * both of which need exclusive access to the old data directory.  A stale
+	 * lock file is tolerated as setup() does.
+	 */
+	if (pid_lock_file_exists(old_cluster.pgdata))
+	{
+		if (start_postmaster(&old_cluster, false))
+			stop_postmaster(false);
+		else
+			pg_fatal("There seems to be a postmaster servicing the old cluster.\n"
+					 "Please shutdown that postmaster and try again.");
+	}
+
+	get_control_data(&old_cluster);
+
+	prep_status("Examining old cluster settings");
 	start_postmaster(&old_cluster, true);
 	get_template0_info(&old_cluster);
 
 	/*
-	 * While the old server is up, capture its archive_command so it can be
-	 * carried forward to the new cluster: the upgrade window and post-upgrade
-	 * WAL then flow to the same archive, making the upgrade recoverable by
-	 * ordinary archive-based PITR with no extra operator action.
+	 * For --wal-upgrade, capture the old cluster's archive_command while the
+	 * old server is up, so the upgrade window and post-upgrade WAL can be
+	 * carried to the same archive and PITR can span the upgrade.
 	 */
 	if (user_opts.wal_upgrade)
 		old_cluster_archive_command = detect_old_cluster_archive_command();
+
 	stop_postmaster(false);
 	check_ok();
 
 	locale = old_cluster.template0;
 	encoding_name = pg_encoding_to_char(locale->db_encoding);
 
-	prep_status("Creating new cluster with initdb");
+	prep_status("Constructing new cluster initdb command");
 
+	initPQExpBuffer(cmd);
 
-	initPQExpBuffer(&cmd);
-	appendPQExpBuffer(&cmd, "\"%s/initdb\" -D \"%s\" -N",
-					  new_cluster.bindir, new_cluster.pgdata);
-	appendPQExpBuffer(&cmd, " -U \"%s\"", os_info.user);
-	appendPQExpBuffer(&cmd, " --wal-segsize=%u",
+	/*
+	 * Build the command with appendShellString() for every value that comes
+	 * from outside our control: the username is from the command line, and
+	 * the encoding and locale strings are read from the old cluster's
+	 * template0. This prevents shell metacharacters in any of them from
+	 * breaking out of their argument when the command is run through the
+	 * shell.
+	 */
+	appendShellString(cmd, initdb_path);
+	appendPQExpBufferStr(cmd, " -N -D ");
+	appendShellString(cmd, new_cluster.pgdata);
+	appendPQExpBufferStr(cmd, " -U ");
+	appendShellString(cmd, os_info.user);
+	appendPQExpBuffer(cmd, " --wal-segsize=%u",
 					  old_cluster.controldata.walseg / (1024 * 1024));
 
 	/*
@@ -792,34 +859,66 @@ create_new_cluster_via_initdb(const char *argv0)
 	 * reject.
 	 */
 	if (old_cluster.controldata.data_checksum_version != 0)
-		appendPQExpBufferStr(&cmd, " --data-checksums");
+		appendPQExpBufferStr(cmd, " --data-checksums");
 	else
-		appendPQExpBufferStr(&cmd, " --no-data-checksums");
+		appendPQExpBufferStr(cmd, " --no-data-checksums");
 
-	appendPQExpBuffer(&cmd, " --encoding=%s", encoding_name);
-	appendPQExpBuffer(&cmd, " --locale-provider=%s",
-					  collprovider_name(locale->db_collprovider));
-	appendPQExpBuffer(&cmd, " --lc-collate=\"%s\" --lc-ctype=\"%s\"",
-					  locale->db_collate, locale->db_ctype);
+	appendPQExpBufferStr(cmd, " --encoding=");
+	appendShellString(cmd, encoding_name);
+	appendPQExpBufferStr(cmd, " --locale-provider=");
+	appendShellString(cmd, collprovider_name(locale->db_collprovider));
+	appendPQExpBufferStr(cmd, " --lc-collate=");
+	appendShellString(cmd, locale->db_collate);
+	appendPQExpBufferStr(cmd, " --lc-ctype=");
+	appendShellString(cmd, locale->db_ctype);
 
 	if (locale->db_locale)
 	{
 		if (locale->db_collprovider == COLLPROVIDER_ICU)
-			appendPQExpBuffer(&cmd, " --icu-locale=\"%s\"",
-							  locale->db_locale);
+		{
+			appendPQExpBufferStr(cmd, " --icu-locale=");
+			appendShellString(cmd, locale->db_locale);
+		}
 		else if (locale->db_collprovider == COLLPROVIDER_BUILTIN)
-			appendPQExpBuffer(&cmd, " --builtin-locale=\"%s\"",
-							  locale->db_locale);
+		{
+			appendPQExpBufferStr(cmd, " --builtin-locale=");
+			appendShellString(cmd, locale->db_locale);
+		}
 	}
 
-	if (new_cluster.pgopts)
-		appendPQExpBuffer(&cmd, " %s", new_cluster.pgopts);
+	check_ok();
+}
 
+
+/*
+ * create_new_cluster_via_initdb()
+ *
+ * Create the new cluster for --initdb: build the initdb command with
+ * build_new_cluster_initdb_cmd() and execute it.  The atexit cleanup is
+ * enabled just before execution, so a failure after initdb runs (but before
+ * the point of no return) removes the new directory.
+ */
+static void
+create_new_cluster_via_initdb(void)
+{
+	PQExpBufferData cmd;
+	char	   *saved_logdir = log_opts.logdir;
+
+	resolve_new_bindir(os_info.progname);
+	build_new_cluster_initdb_cmd(&cmd);
+
+	prep_status("Creating new cluster with initdb");
+
+	if (!initdb_cleanup_registered)
+	{
+		atexit(new_cluster_cleanup_atexit);
+		initdb_cleanup_registered = true;
+	}
+	new_cluster_created_by_initdb = true;
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true, "%s", cmd.data);
 
 	termPQExpBuffer(&cmd);
 	log_opts.logdir = saved_logdir;
-
 	check_ok();
 
 	/*
@@ -830,6 +929,29 @@ create_new_cluster_via_initdb(const char *argv0)
 	 */
 	if (old_cluster_archive_command != NULL)
 		write_wal_upgrade_archive_conf(old_cluster_archive_command);
+}
+
+
+/*
+ * check_new_cluster_via_initdb()
+ *
+ * Dry-run --check --initdb path: build the initdb command with
+ * build_new_cluster_initdb_cmd() but do not execute it.  Report the command
+ * and the checks it performed, then exit.  Lighter than plain --check, which
+ * queries an already-created new cluster.
+ */
+static void
+check_new_cluster_via_initdb(void)
+{
+	PQExpBufferData cmd;
+
+	resolve_new_bindir(os_info.progname);
+	build_new_cluster_initdb_cmd(&cmd);
+
+	pg_log(PG_REPORT, _("The following initdb command would be run to create the new cluster:\n  %s"), cmd.data);
+	pg_log(PG_REPORT, _("The new cluster would be created with settings matching the old cluster.  Run pg_upgrade --check afterward for the full compatibility check."));
+	termPQExpBuffer(&cmd);
+	exit(0);
 }
 
 /*

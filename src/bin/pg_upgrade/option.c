@@ -265,18 +265,15 @@ parseCommandLine(int argc, char *argv[])
 		pg_fatal("too many command-line arguments (first is \"%s\")", argv[optind]);
 
 	/*
-	 * --check is read-only and may run against a live old cluster, while
-	 * --initdb creates the new cluster on disk.  Reject the combination.
+	 * -O passes options to the new cluster's postmaster, but with --initdb
+	 * the new cluster is created by initdb, which accepts a different option
+	 * set.  Rather than guess which -O options initdb also understands, reject
+	 * the combination and let the user create the cluster manually (without
+	 * --initdb) if they need postmaster-only options.
 	 */
-	if (user_opts.check && user_opts.initdb_new_cluster)
+	if (new_cluster.pgopts && user_opts.initdb_new_cluster)
 		pg_fatal("options %s and %s cannot be used together",
-				 "-c/--check", "--initdb");
-
-	/*
-	 * -O is accepted with --initdb: create_new_cluster_via_initdb() appends it
-	 * to the initdb command line, and the same options are passed to the new
-	 * cluster's postmaster during the server phases.
-	 */
+				 "-O/--new-options", "--initdb");
 
 	if (!user_opts.sync_method)
 		user_opts.sync_method = pg_strdup("fsync");
