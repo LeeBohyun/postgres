@@ -356,15 +356,15 @@ main(int argc, char **argv)
 		/*
 		 * Emit the entire window with a single binary-upgrade-gated backend
 		 * call.  EmitUpgradeWalWindow() documents the record order.  The
-		 * checkpoint it takes first is CN, the recovery anchor, so replay starts
-		 * there and applies only the end-of-upgrade images, never pg_restore's
-		 * own WAL.
+		 * checkpoint it takes first is CN, the recovery anchor, so replay
+		 * starts there and applies only the end-of-upgrade images, never
+		 * pg_restore's own WAL.
 		 *
-		 * The XID/OID/multixact counters were transplanted into pg_control
-		 * before CN, so the CN checkpoint carries them.  CN's LSN is not
-		 * recorded; first startup derives it from the WAL
-		 * (PerformWalUpgradeIfNeeded), which lets a physical standby find the
-		 * same anchor in the streamed WAL.
+		 * The XID/OID/multixact counters were copied into pg_control before
+		 * CN, so the CN checkpoint carries them.  CN's LSN is not recorded.
+		 * First startup derives it from the WAL (PerformWalUpgradeIfNeeded),
+		 * which lets a physical standby find the same anchor in the streamed
+		 * WAL.
 		 */
 		PQclear(executeQueryOrDie(conn,
 								  "SELECT binary_upgrade_emit_wal_window(%u, %u, %d, %s)",
