@@ -404,15 +404,19 @@ main(int argc, char **argv)
 			PGresult   *res;
 
 			/*
-			 * Distinguish a persistent archiving failure from a transient one
-			 * the archiver retries and recovers from.
-			 * pg_stat_archiver.last_failed_wal is a sticky high-water mark: set
-			 * on any failure and never cleared on a later success, so it cannot
-			 * show whether archiving is currently failing.  Give up only once a
-			 * failure has been recorded and last_archived_wal makes no forward
-			 * progress for a bounded number of consecutive polls; a transient
-			 * failure that drains advances last_archived and resets the stall
-			 * counter.
+			 * The purpose here is to give up waiting for the upgrade window to
+			 * be archived when archive_command is persistently failing, rather
+			 * than waiting forever, while still tolerating a failure the
+			 * archiver retries and recovers from.
+			 *
+			 * Neither pg_stat_archiver field reflects the current state on its
+			 * own.  failed_count changes far less often than we poll, and
+			 * last_failed_wal is set on a failure and never cleared on a later
+			 * success.  So watch forward progress instead, and give up only
+			 * once a failure has been recorded and last_archived_wal has not
+			 * advanced for a bounded number of consecutive polls.  Once the
+			 * archiver recovers and catches up, last_archived advances and the
+			 * stall counter resets.
 			 */
 			char		prev_archived[MAXPGPATH] = {0};
 			int64		prev_failed = -1;
@@ -445,24 +449,10 @@ main(int argc, char **argv)
 					break;
 
 				/*
-				 * Persistent-failure detector.  The stall counter is driven
-				 * by ABSENCE OF PROGRESS, not by catching the exact poll on
-				 * which the archiver bumps its failure count: the archiver
-				 * fails far less often than the 100ms poll rate, so keying on
-				 * failed_count > prev_failed would reset the counter on
-				 * almost every poll and never trip.  Instead: increment on
-				 * every poll where last_archived_wal did not advance AND at
-				 * least one archive failure has been recorded (failed_count >
-				 * 0); reset the moment last_archived_wal advances.  A
-				 * transient failure the archiver recovers from advances
-				 * last_archived and clears the counter; a truly stuck
-				 * archive_command makes no progress and trips the fatal after
-				 * UPGRADE_ARCHIVE_STALL_LIMIT polls.  This also covers an
-				 * archive that never produces any segment (fails from the
-				 * first): last_archived stays "" across polls, which is "no
-				 * advance", so the counter still climbs.  prev_failed >= 0
-				 * means we have a prior poll to compare against (skip the
-				 * first).
+				 * No forward progress while a failure is on record, so
+				 * bump the stall counter and trip the fatal once it reaches
+				 * the limit.  prev_failed >= 0 skips the first poll, which
+				 * has nothing to compare against.
 				 */
 				if (failed_count > 0 &&
 					prev_failed >= 0 &&
@@ -1451,18 +1441,19 @@ copy_xact_xlog_xid(void)
 	}
 
 	/*
-	 * Now reset the WAL archives in the new cluster.  This positions the new
-	 * cluster's WAL at the old cluster's next segment.
+	 * Reset the new cluster's WAL archives, positioning its WAL at the old
+	 * cluster's next segment.
 	 *
-	 * For --wal-upgrade this reset also (re)assigns the new cluster's system
-	 * identifier, not forced to the old cluster's value.  It rewrites both
-	 * the control file and the fresh WAL segment header from the same
-	 * ControlFile.system_identifier, so pg_control and the burst WAL stay
-	 * consistent -- all that replay requires (recovery validates the WAL's
-	 * xlp_sysid against pg_control, not its numeric value).  A standby is
-	 * re-provisioned from a fresh skeleton stamped with this sysid, so it
-	 * need not match the pre-upgrade cluster.  Same "new cluster gets a new
-	 * sysid" behavior as stock pg_upgrade.
+	 * The new cluster keeps the fresh system identifier initdb gave it.  We
+	 * deliberately do not force it to the old cluster's value.  pg_resetwal
+	 * writes that identifier into both the control file and the new WAL
+	 * segment header, so pg_control and the burst WAL agree -- which is all
+	 * replay needs, since recovery only checks that the WAL's xlp_sysid
+	 * matches pg_control, not that it equals any particular value.  A standby
+	 * is re-provisioned from a fresh skeleton stamped with this identifier, so
+	 * it need not match the pre-upgrade cluster.  This is the same "the
+	 * upgraded cluster gets a new system identifier" behavior as stock
+	 * pg_upgrade.
 	 */
 	prep_status("Resetting WAL archives");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
