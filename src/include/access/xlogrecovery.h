@@ -61,6 +61,18 @@ typedef enum RecoveryPauseState
 } RecoveryPauseState;
 
 /*
+ * PENDING spans HANDOFF replay, local restartpoint verification, and durable
+ * persistence of each physical slot's receipt LSN. DURABLE_PAUSE retains WAL
+ * from HANDOFF until replay resume cancels the handoff.
+ */
+typedef enum PgUpgradeHandoffPhase
+{
+	PG_UPGRADE_HANDOFF_NONE,
+	PG_UPGRADE_HANDOFF_PENDING,
+	PG_UPGRADE_HANDOFF_DURABLE_PAUSE,
+}			PgUpgradeHandoffPhase;
+
+/*
  * Shared-memory state for WAL recovery.
  */
 typedef struct XLogRecoveryCtlData
@@ -124,12 +136,25 @@ typedef struct XLogRecoveryCtlData
 	TimestampTz currentChunkStartTime;
 	/* Recovery pause state */
 	RecoveryPauseState recoveryPauseState;
+	/* HANDOFF WAL remains retained until its durable pause is resumed. */
+	PgUpgradeHandoffPhase pgUpgradeHandoffPhase;
+	XLogRecPtr	pgUpgradeHandoffRetainLSN;
+	/* True if HANDOFF issued the most recent recovery pause request. */
+	bool		pgUpgradeHandoffOwnsPause;
+	/* Set by pg_wal_replay_resume() while HANDOFF is pending or paused. */
+	bool		pgUpgradeHandoffCancelRequested;
 	ConditionVariable recoveryNotPausedCV;
 
 	slock_t		info_lck;		/* locks shared variables shown above */
 } XLogRecoveryCtlData;
 
 extern PGDLLIMPORT XLogRecoveryCtlData *XLogRecoveryCtl;
+
+extern void BeginPgUpgradeHandoff(XLogRecPtr lsn);
+extern void CompletePgUpgradeHandoff(void);
+extern void CancelPgUpgradeHandoff(void);
+extern XLogRecPtr GetPgUpgradeHandoffRetention(void);
+extern bool PgUpgradeHandoffCancellationRequested(void);
 
 /* User-settable GUC parameters */
 extern PGDLLIMPORT bool recoveryTargetInclusive;
@@ -156,9 +181,13 @@ extern PGDLLIMPORT TimeLineID recoveryTargetTLI;
 /* Have we already reached a consistent database state? */
 extern PGDLLIMPORT bool reachedConsistency;
 
+/* True while upgrade replay is armed or awaits its completion restartpoint. */
+extern PGDLLIMPORT bool pgUpgradeReplayInProgress;
+
 /* Are we currently in standby mode? */
 extern PGDLLIMPORT bool StandbyMode;
 
+extern void InitWalRecoverySettings(TimeLineID default_tli);
 extern void InitWalRecovery(ControlFileData *ControlFile,
 							bool *wasShutdown_ptr, bool *haveBackupLabel_ptr,
 							bool *haveTblspcMap_ptr);
@@ -217,6 +246,8 @@ extern void RemovePromoteSignalFiles(void);
 
 extern bool HotStandbyActive(void);
 extern XLogRecPtr GetXLogReplayRecPtr(TimeLineID *replayTLI);
+extern void EnsurePgUpgradeHandoffWalReceiver(TimeLineID tli,
+											  XLogRecPtr recptr);
 extern RecoveryPauseState GetRecoveryPauseState(void);
 extern void SetRecoveryPause(bool recoveryPause);
 extern void GetXLogReceiptTime(TimestampTz *rtime, bool *fromStream);
@@ -233,7 +264,8 @@ extern void WakeupRecovery(void);
 extern void StartupRequestWalReceiverRestart(void);
 extern void XLogRequestWalReceiverReply(void);
 
-extern void RecoveryRequiresIntParameter(const char *param_name, int currValue, int minValue);
+extern void RecoveryRequiresIntParameter(const char *param_name,
+										 int currValue, int minValue);
 
 extern void xlog_outdesc(StringInfo buf, XLogReaderState *record);
 

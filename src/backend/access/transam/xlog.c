@@ -47,6 +47,8 @@
 #include <unistd.h>
 
 #include "access/clog.h"
+#include "access/pgupgrade_wal.h"
+#include "access/slru.h"
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
@@ -67,6 +69,7 @@
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
+#include "catalog/storage_xlog.h"
 #include "common/controldata_utils.h"
 #include "common/file_utils.h"
 #include "executor/instrument.h"
@@ -86,6 +89,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/copydir.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
@@ -98,9 +102,11 @@
 #include "storage/spin.h"
 #include "storage/subsystems.h"
 #include "storage/sync.h"
+#include "utils/builtins.h"
 #include "utils/guc_hooks.h"
 #include "utils/guc_tables.h"
 #include "utils/injection_point.h"
+#include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/ps_status.h"
 #include "utils/relmapper.h"
@@ -109,10 +115,6 @@
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 #include "utils/wait_event.h"
-
-#ifdef WAL_DEBUG
-#include "utils/memutils.h"
-#endif
 
 /* timeline ID to be used when bootstrapping */
 #define BootstrapTimeLineID		1
@@ -142,6 +144,9 @@ int			wal_retrieve_retry_interval = 5000;
 int			max_slot_wal_keep_size_mb = -1;
 int			wal_decode_buffer_size = 512 * 1024;
 bool		track_wal_io_timing = false;
+
+int			pg_upgrade_standby_transfer_mode = PG_UPGRADE_XFER_MIRROR;
+char	   *pg_upgrade_standby_old_datadir = NULL;
 
 #ifdef WAL_DEBUG
 bool		XLOG_DEBUG = false;
@@ -207,6 +212,27 @@ const struct config_enum_entry archive_mode_options[] = {
 	{"0", ARCHIVE_MODE_OFF, true},
 	{NULL, 0, false}
 };
+
+const struct config_enum_entry pg_upgrade_standby_transfer_mode_options[] = {
+	{"mirror", PG_UPGRADE_XFER_MIRROR, false},
+	{"clone", PG_UPGRADE_XFER_CLONE, false},
+	{"copy", PG_UPGRADE_XFER_COPY, false},
+	{"copy_file_range", PG_UPGRADE_XFER_COPY_FILE_RANGE, false},
+	{"link", PG_UPGRADE_XFER_LINK, false},
+	{"swap", PG_UPGRADE_XFER_SWAP, false},
+	{NULL, 0, false}
+};
+
+StaticAssertDecl((int) PG_UPGRADE_XFER_CLONE == UPGRADE_RELINK_MODE_CLONE,
+				 "PG_UPGRADE_XFER_CLONE must match UPGRADE_RELINK_MODE_CLONE");
+StaticAssertDecl((int) PG_UPGRADE_XFER_COPY == UPGRADE_RELINK_MODE_COPY,
+				 "PG_UPGRADE_XFER_COPY must match UPGRADE_RELINK_MODE_COPY");
+StaticAssertDecl((int) PG_UPGRADE_XFER_COPY_FILE_RANGE == UPGRADE_RELINK_MODE_COPY_FILE_RANGE,
+				 "PG_UPGRADE_XFER_COPY_FILE_RANGE must match UPGRADE_RELINK_MODE_COPY_FILE_RANGE");
+StaticAssertDecl((int) PG_UPGRADE_XFER_LINK == UPGRADE_RELINK_MODE_LINK,
+				 "PG_UPGRADE_XFER_LINK must match UPGRADE_RELINK_MODE_LINK");
+StaticAssertDecl((int) PG_UPGRADE_XFER_SWAP == UPGRADE_RELINK_MODE_SWAP,
+				 "PG_UPGRADE_XFER_SWAP must match UPGRADE_RELINK_MODE_SWAP");
 
 /*
  * Statistics for current checkpoint are collected in this global struct.
@@ -458,6 +484,10 @@ typedef struct XLogCtlData
 {
 	XLogCtlInsert Insert;
 
+	/* Old-major source saved before archive startup replaces pg_control. */
+	OldUpgradeControlData archiveUpgradeSource;
+	bool		archiveUpgradeSourceValid;
+
 	/* Protected by info_lck: */
 	XLogwrtRqst LogwrtRqst;
 	XLogRecPtr	RedoRecPtr;		/* a recent copy of Insert->RedoRecPtr */
@@ -567,6 +597,9 @@ typedef struct XLogCtlData
 	XLogRecPtr	data_checksum_lsn;
 	bool		data_checksum_is_local;
 
+	/* COMPLETE record end to finalize at the next shutdown checkpoint. */
+	XLogRecPtr	upgradeCompleteLSN;
+
 	slock_t		info_lck;		/* locks shared variables shown above */
 
 	/*
@@ -598,6 +631,8 @@ static WALInsertLockPadded *WALInsertLocks = NULL;
  */
 static ControlFileData *LocalControlFile = NULL;
 static ControlFileData *ControlFile = NULL;
+static OldUpgradeControlData LocalArchiveUpgradeSource;
+static bool LocalArchiveUpgradeSourceValid;
 
 static void XLOGShmemRequest(void *arg);
 static void XLOGShmemInit(void *arg);
@@ -705,6 +740,17 @@ static TimeLineID openLogTLI = 0;
 static XLogRecPtr LocalMinRecoveryPoint;
 static bool updateMinRecoveryPoint = true;
 
+/* Retain checkpoint WAL payloads until pg_control RAWFILE matches one. */
+typedef struct UpgradeControlCheckpoint
+{
+	XLogRecPtr	lsn;
+	CheckPoint	checkpoint;
+	struct UpgradeControlCheckpoint *next;
+}			UpgradeControlCheckpoint;
+
+static MemoryContext upgradeControlCheckpointContext;
+static UpgradeControlCheckpoint * upgradeControlCheckpoints;
+
 /*
  * Local state for ControlFile data_checksum_version.  After initialization
  * this is only updated when absorbing a procsignal barrier during interrupt
@@ -776,6 +822,7 @@ static void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force);
 static bool PerformRecoveryXLogAction(void);
 static void CheckReplayedDataChecksumState(uint32 replayed_state);
 static void AdoptReplayedDataChecksumState(uint32 new_version, XLogRecPtr lsn);
+static XLogRecPtr EmitPgUpgradeHandoffIfArmed(void);
 static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
@@ -4466,6 +4513,211 @@ WriteControlFile(void)
 						XLOG_CONTROL_FILE)));
 }
 
+bool
+GetArchiveUpgradeSource(OldUpgradeControlData * result)
+{
+	if (!XLogCtl->archiveUpgradeSourceValid)
+		return false;
+	*result = XLogCtl->archiveUpgradeSource;
+	return true;
+}
+
+/*
+ * Create startup files for upgrade recovery.  Read the WAL segment size from
+ * the retained old standby or staged archive WAL.  When replacing old-version
+ * files, keep any valid same-version pg_control.
+ */
+void
+SynthesizeUpgradeStreamControlFile(bool allow_overwrite)
+{
+	ControlFileData *cf;
+	OldUpgradeControlData old_control;
+	char		buffer[PG_CONTROL_FILE_SIZE];	/* need not be aligned */
+	char		verpath[MAXPGPATH];
+	char		globaldir[MAXPGPATH];
+	char		ctlpath[MAXPGPATH];
+	int			fd;
+	char		mock_auth_nonce[MOCK_AUTH_NONCE_LEN];
+	int			upgrade_wal_segment_size;
+
+	snprintf(globaldir, sizeof(globaldir), "%s/global", DataDir);
+	snprintf(ctlpath, sizeof(ctlpath), "%s/%s", DataDir, XLOG_CONTROL_FILE);
+	LocalArchiveUpgradeSourceValid = false;
+
+	if (allow_overwrite)
+	{
+		struct stat st;
+
+		if (stat(ctlpath, &st) == 0)
+		{
+			bool		existing_crc_ok = false;
+			ControlFileData *existing = get_controlfile(DataDir, &existing_crc_ok);
+
+			if (existing != NULL)
+			{
+				bool		usable = (existing_crc_ok &&
+									  existing->pg_control_version == PG_CONTROL_VERSION &&
+									  existing->catalog_version_no == CATALOG_VERSION_NO);
+				char		opts_path[MAXPGPATH];
+
+				/* Save old-major fields before replacing its startup files. */
+				snprintf(opts_path, sizeof(opts_path), "%s/postmaster.opts", DataDir);
+				if (GetUpgradeRecoveryMode() == UPGRADE_RECOVERY_ARCHIVE &&
+					(!usable || existing->system_identifier != 0) &&
+					!(usable && existing->upgrade_started && !existing->upgrade_finalized) &&
+					(!usable || existing->state == DB_SHUTDOWNED ||
+					 existing->state == DB_SHUTDOWNED_IN_RECOVERY) &&
+					stat(opts_path, &st) == 0)
+				{
+					ReadArchiveUpgradeControlData(DataDir, &LocalArchiveUpgradeSource);
+					LocalArchiveUpgradeSourceValid = true;
+				}
+
+				pfree(existing);
+				if (usable)
+				{
+					ereport(LOG,
+							(errmsg("keeping the existing new-version control file for upgrade-stream recovery"),
+							 errdetail("A valid same-version pg_control is present; not synthesizing over it (preserves its data checksum state).")));
+					return;
+				}
+			}
+		}
+	}
+
+	if (GetUpgradeRecoveryMode() == UPGRADE_RECOVERY_STANDBY)
+	{
+		if (pg_upgrade_standby_old_datadir == NULL ||
+			pg_upgrade_standby_old_datadir[0] == '\0')
+			ereport(FATAL,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("streaming pg_upgrade skeleton requires \"pg_upgrade_standby_old_datadir\"")));
+		ReadOldUpgradeControlData(pg_upgrade_standby_old_datadir, &old_control);
+		upgrade_wal_segment_size = old_control.wal_segment_size;
+	}
+	else
+		upgrade_wal_segment_size = GetUpgradeArchiveWalSegmentSize();
+
+	cf = (ControlFileData *) palloc0(sizeof(ControlFileData));
+
+	if (!pg_strong_random(mock_auth_nonce, MOCK_AUTH_NONCE_LEN))
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not generate secret authorization token")));
+
+	cf->system_identifier = 0;
+	memcpy(cf->mock_authentication_nonce, mock_auth_nonce, MOCK_AUTH_NONCE_LEN);
+	cf->state = DB_SHUTDOWNED;
+	cf->unloggedLSN = FirstNormalUnloggedLSN;
+
+	cf->MaxConnections = MaxConnections;
+	cf->max_worker_processes = max_worker_processes;
+	cf->max_wal_senders = max_wal_senders;
+	cf->max_prepared_xacts = max_prepared_xacts;
+	cf->max_locks_per_xact = max_locks_per_xact;
+	cf->wal_level = wal_level;
+	cf->wal_log_hints = wal_log_hints;
+	cf->track_commit_timestamp = track_commit_timestamp;
+	cf->data_checksum_version = 0;
+
+	cf->pg_control_version = PG_CONTROL_VERSION;
+	cf->catalog_version_no = CATALOG_VERSION_NO;
+	cf->maxAlign = MAXIMUM_ALIGNOF;
+	cf->floatFormat = FLOATFORMAT_VALUE;
+	cf->blcksz = BLCKSZ;
+	cf->relseg_size = RELSEG_SIZE;
+	cf->slru_pages_per_segment = SLRU_PAGES_PER_SEGMENT;
+	cf->xlog_blcksz = XLOG_BLCKSZ;
+	cf->xlog_seg_size = upgrade_wal_segment_size;
+	cf->nameDataLen = NAMEDATALEN;
+	cf->indexMaxKeys = INDEX_MAX_KEYS;
+	cf->toast_max_chunk_size = TOAST_OID_MAX_CHUNK_SIZE;
+	cf->loblksize = LOBLKSIZE;
+	cf->float8ByVal = true;		/* vestigial */
+	cf->default_char_signedness = true;
+
+	INIT_CRC32C(cf->crc);
+	COMP_CRC32C(cf->crc, cf, offsetof(ControlFileData, crc));
+	FIN_CRC32C(cf->crc);
+
+	memset(buffer, 0, PG_CONTROL_FILE_SIZE);
+	memcpy(buffer, cf, sizeof(ControlFileData));
+
+	{
+		static const char *const subdirs[] = {
+			"global", "base", "pg_wal", "pg_wal/archive_status", "pg_wal/summaries",
+			"pg_commit_ts", "pg_dynshmem", "pg_notify", "pg_serial",
+			"pg_snapshots", "pg_subtrans", "pg_twophase",
+			"pg_multixact", "pg_multixact/members", "pg_multixact/offsets",
+			"pg_replslot", "pg_tblspc", "pg_stat", "pg_stat_tmp", "pg_xact",
+			"pg_logical", "pg_logical/snapshots", "pg_logical/mappings"
+		};
+
+		for (int s = 0; s < (int) lengthof(subdirs); s++)
+		{
+			char		dpath[MAXPGPATH];
+
+			snprintf(dpath, sizeof(dpath), "%s/%s", DataDir, subdirs[s]);
+			if (MakePGDirectory(dpath) != 0 && errno != EEXIST)
+				ereport(FATAL,
+						(errcode_for_file_access(),
+						 errmsg("could not create directory \"%s\": %m", dpath)));
+		}
+	}
+
+	fd = BasicOpenFile(ctlpath,
+					   O_RDWR | O_CREAT | PG_BINARY |
+					   (allow_overwrite ? O_TRUNC : O_EXCL));
+	if (fd < 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", ctlpath)));
+	errno = 0;
+	if (write(fd, buffer, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE)
+	{
+		if (errno == 0)
+			errno = ENOSPC;
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not write to file \"%s\": %m", ctlpath)));
+	}
+	if (pg_fsync(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync file \"%s\": %m", ctlpath)));
+	if (close(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", ctlpath)));
+
+	snprintf(verpath, sizeof(verpath), "%s/PG_VERSION", DataDir);
+	fd = BasicOpenFile(verpath, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", verpath)));
+	if (write(fd, PG_MAJORVERSION "\n", strlen(PG_MAJORVERSION) + 1) !=
+		(int) (strlen(PG_MAJORVERSION) + 1))
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not write to file \"%s\": %m", verpath)));
+	if (pg_fsync(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync file \"%s\": %m", verpath)));
+	if (close(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", verpath)));
+
+	pfree(cf);
+
+	ereport(LOG,
+			(errmsg("synthesized a fresh pg_control and PG_VERSION for an upgrade-stream standby"),
+			 errdetail("The standby will stream and replay the upgrade window from its primary; no initdb was required.")));
+}
+
+
 static void
 ReadControlFile(void)
 {
@@ -4698,6 +4950,397 @@ static void
 UpdateControlFile(void)
 {
 	update_controlfile(DataDir, ControlFile, true);
+}
+
+/*
+ * Write the replay-start checkpoint and incoming WAL identity to pg_control.
+ * Set replica WAL level and the streaming or archive startup state.
+ */
+void
+ArmControlFileForUpgradeRecovery(const struct CheckPoint *replay_start_checkpoint,
+								 XLogRecPtr replay_start_lsn, uint64 wal_sysid,
+								 bool for_streaming)
+{
+	Assert(ControlFile != NULL);
+	Assert(upgradeControlCheckpointContext == NULL);
+
+	upgradeControlCheckpointContext = AllocSetContextCreate(TopMemoryContext,
+															"WAL upgrade control checkpoints", ALLOCSET_SMALL_SIZES);
+	upgradeControlCheckpoints = NULL;
+
+	ControlFile->checkPoint = replay_start_lsn;
+	ControlFile->checkPointCopy = *replay_start_checkpoint;
+	ControlFile->wal_level = WAL_LEVEL_REPLICA;
+	ControlFile->minRecoveryPointTLI = replay_start_checkpoint->ThisTimeLineID;
+	ControlFile->upgrade_started = false;
+	ControlFile->upgrade_finalized = false;
+
+	ControlFile->state = for_streaming ? DB_SHUTDOWNED : DB_IN_ARCHIVE_RECOVERY;
+	ControlFile->minRecoveryPoint = replay_start_lsn;
+
+	if (wal_sysid != 0)
+		ControlFile->system_identifier = wal_sysid;
+
+	UpdateControlFile();
+}
+
+static bool
+UpgradeCheckPointMatches(const CheckPoint *left, const CheckPoint *right)
+{
+	return left->redo == right->redo &&
+		left->ThisTimeLineID == right->ThisTimeLineID &&
+		left->PrevTimeLineID == right->PrevTimeLineID &&
+		left->fullPageWrites == right->fullPageWrites &&
+		left->wal_level == right->wal_level &&
+		left->logicalDecodingEnabled == right->logicalDecodingEnabled &&
+		FullTransactionIdEquals(left->nextXid, right->nextXid) &&
+		left->nextOid == right->nextOid &&
+		left->nextMulti == right->nextMulti &&
+		left->nextMultiOffset == right->nextMultiOffset &&
+		left->oldestXid == right->oldestXid &&
+		left->oldestXidDB == right->oldestXidDB &&
+		left->oldestMulti == right->oldestMulti &&
+		left->oldestMultiDB == right->oldestMultiDB &&
+		left->time == right->time &&
+		left->oldestCommitTsXid == right->oldestCommitTsXid &&
+		left->newestCommitTsXid == right->newestCommitTsXid &&
+		left->oldestActiveXid == right->oldestActiveXid &&
+		left->dataChecksumState == right->dataChecksumState;
+}
+
+static void
+RememberUpgradeControlCheckpoint(XLogRecPtr lsn, const CheckPoint *checkpoint)
+{
+	UpgradeControlCheckpoint *entry;
+
+	if (upgradeControlCheckpointContext == NULL)
+		return;
+	if (upgradeControlCheckpoints != NULL && upgradeControlCheckpoints->lsn == lsn)
+	{
+		if (!UpgradeCheckPointMatches(checkpoint,
+									  &upgradeControlCheckpoints->checkpoint))
+			elog(PANIC, "pg_upgrade recovery checkpoint changed during replay");
+		return;
+	}
+	entry = MemoryContextAlloc(upgradeControlCheckpointContext, sizeof(*entry));
+	entry->lsn = lsn;
+	entry->checkpoint = *checkpoint;
+	entry->next = upgradeControlCheckpoints;
+	upgradeControlCheckpoints = entry;
+}
+
+/*
+ * Validate the control image against its remembered checkpoint WAL payload.
+ * Adopt settings and checksum state without replacing local recovery progress
+ * or upgrade flags.
+ */
+void
+AdoptUpgradeControlFile(const char *data, Size len)
+{
+	ControlFileData image;
+	pg_crc32c	crc;
+	bool		old_track_commit_timestamp;
+	uint32		old_checksum_state;
+	bool		checksum_changed;
+	UpgradeControlCheckpoint *checkpoint;
+
+	if (len != PG_CONTROL_FILE_SIZE)
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_control image in pg_upgrade WAL has size %zu, expected %d",
+						len, PG_CONTROL_FILE_SIZE)));
+
+	memcpy(&image, data, sizeof(image));
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &image, offsetof(ControlFileData, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, image.crc))
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("incorrect checksum in pg_control image from pg_upgrade WAL")));
+
+#define CHECK_UPGRADE_CONTROL_FIELD(field) \
+	do { \
+		if (image.field != ControlFile->field) \
+			ereport(PANIC, \
+					(errcode(ERRCODE_DATA_CORRUPTED), \
+					 errmsg("pg_control image in pg_upgrade WAL has incompatible field \"%s\"", \
+							#field))); \
+	} while (0)
+
+	CHECK_UPGRADE_CONTROL_FIELD(system_identifier);
+	CHECK_UPGRADE_CONTROL_FIELD(pg_control_version);
+	CHECK_UPGRADE_CONTROL_FIELD(catalog_version_no);
+	CHECK_UPGRADE_CONTROL_FIELD(maxAlign);
+	CHECK_UPGRADE_CONTROL_FIELD(floatFormat);
+	CHECK_UPGRADE_CONTROL_FIELD(blcksz);
+	CHECK_UPGRADE_CONTROL_FIELD(relseg_size);
+	CHECK_UPGRADE_CONTROL_FIELD(slru_pages_per_segment);
+	CHECK_UPGRADE_CONTROL_FIELD(xlog_blcksz);
+	CHECK_UPGRADE_CONTROL_FIELD(xlog_seg_size);
+	CHECK_UPGRADE_CONTROL_FIELD(nameDataLen);
+	CHECK_UPGRADE_CONTROL_FIELD(indexMaxKeys);
+	CHECK_UPGRADE_CONTROL_FIELD(toast_max_chunk_size);
+	CHECK_UPGRADE_CONTROL_FIELD(loblksize);
+	CHECK_UPGRADE_CONTROL_FIELD(float8ByVal);
+
+#undef CHECK_UPGRADE_CONTROL_FIELD
+
+	for (checkpoint = upgradeControlCheckpoints; checkpoint != NULL;
+		 checkpoint = checkpoint->next)
+		if (checkpoint->lsn == image.checkPoint)
+			break;
+	if (checkpoint == NULL ||
+		!UpgradeCheckPointMatches(&image.checkPointCopy, &checkpoint->checkpoint))
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_control image in pg_upgrade WAL does not match the recovery checkpoint")));
+
+	if (!image.upgrade_started || image.upgrade_finalized ||
+		!ControlFile->upgrade_started || ControlFile->upgrade_finalized)
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_control image in pg_upgrade WAL has invalid upgrade state")));
+
+	if (image.wal_level < WAL_LEVEL_MINIMAL ||
+		image.wal_level > WAL_LEVEL_LOGICAL)
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_control image in pg_upgrade WAL has invalid WAL level %d",
+						image.wal_level)));
+
+	if (image.data_checksum_version_init != PG_DATA_CHECKSUM_OFF &&
+		image.data_checksum_version_init != PG_DATA_CHECKSUM_VERSION)
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_control image in pg_upgrade WAL has invalid initial checksum state %u",
+						image.data_checksum_version_init)));
+
+	switch (image.data_checksum_version)
+	{
+		case PG_DATA_CHECKSUM_OFF:
+		case PG_DATA_CHECKSUM_VERSION:
+		case PG_DATA_CHECKSUM_INPROGRESS_OFF:
+		case PG_DATA_CHECKSUM_INPROGRESS_ON:
+			break;
+		default:
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("pg_control image in pg_upgrade WAL has invalid checksum state %u",
+							image.data_checksum_version)));
+	}
+
+	if (image.data_checksum_version !=
+		checkpoint->checkpoint.dataChecksumState)
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_control image checksum state does not match the recovery checkpoint")));
+
+	/*
+	 * Require local recovery settings to support the primary's recorded
+	 * limits.
+	 */
+	if (ArchiveRecoveryRequested && image.wal_level == WAL_LEVEL_MINIMAL)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("WAL was generated with \"wal_level=minimal\", cannot continue recovering")));
+	if (ArchiveRecoveryRequested && EnableHotStandby)
+	{
+		RecoveryRequiresIntParameter("max_connections", MaxConnections,
+									 image.MaxConnections);
+		RecoveryRequiresIntParameter("max_worker_processes",
+									 max_worker_processes,
+									 image.max_worker_processes);
+		RecoveryRequiresIntParameter("max_wal_senders", max_wal_senders,
+									 image.max_wal_senders);
+		RecoveryRequiresIntParameter("max_prepared_transactions",
+									 max_prepared_xacts,
+									 image.max_prepared_xacts);
+		RecoveryRequiresIntParameter("max_locks_per_transaction",
+									 max_locks_per_xact,
+									 image.max_locks_per_xact);
+	}
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	old_track_commit_timestamp = ControlFile->track_commit_timestamp;
+	old_checksum_state = ControlFile->data_checksum_version;
+
+	ControlFile->wal_level = image.wal_level;
+	ControlFile->wal_log_hints = image.wal_log_hints;
+	ControlFile->MaxConnections = image.MaxConnections;
+	ControlFile->max_worker_processes = image.max_worker_processes;
+	ControlFile->max_wal_senders = image.max_wal_senders;
+	ControlFile->max_prepared_xacts = image.max_prepared_xacts;
+	ControlFile->max_locks_per_xact = image.max_locks_per_xact;
+	CommitTsParameterChange(image.track_commit_timestamp,
+							old_track_commit_timestamp);
+	ControlFile->track_commit_timestamp = image.track_commit_timestamp;
+	ControlFile->data_checksum_version_init =
+		image.data_checksum_version_init;
+	ControlFile->data_checksum_version = image.data_checksum_version;
+	ControlFile->default_char_signedness = image.default_char_signedness;
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->data_checksum_version = image.data_checksum_version;
+	SetLocalDataChecksumState(image.data_checksum_version);
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+
+	checksum_changed = old_checksum_state != image.data_checksum_version;
+	if (checksum_changed)
+		EmitAndWaitDataChecksumsBarrier(image.data_checksum_version);
+
+	CheckRequiredParameterValues();
+	MemoryContextDelete(upgradeControlCheckpointContext);
+	upgradeControlCheckpointContext = NULL;
+	upgradeControlCheckpoints = NULL;
+}
+
+void
+VerifyUpgradeRestartPoint(XLogRecPtr checkpoint_lsn,
+						  TimeLineID checkpoint_tli)
+{
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	if (ControlFile->checkPoint != checkpoint_lsn ||
+		ControlFile->checkPointCopy.redo != checkpoint_lsn ||
+		ControlFile->checkPointCopy.ThisTimeLineID != checkpoint_tli)
+	{
+		LWLockRelease(ControlFileLock);
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not persist the final pg_upgrade checkpoint on the standby")));
+	}
+	LWLockRelease(ControlFileLock);
+}
+
+void
+SetControlFileUpgradeFinalized(void)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (!ControlFile->upgrade_started)
+		elog(PANIC, "cannot finalize a pg_upgrade window that was not started");
+	if (!ControlFile->upgrade_finalized)
+	{
+		ControlFile->upgrade_finalized = true;
+		UpdateControlFile();
+	}
+	LWLockRelease(ControlFileLock);
+}
+
+/* Advance minRecoveryPoint through COMMIT, leaving finalization pending. */
+void
+SetControlFileUpgradeComplete(XLogRecPtr end_lsn, TimeLineID replay_tli)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (!ControlFile->upgrade_started)
+		elog(PANIC, "cannot complete a pg_upgrade window that was not started");
+
+	if (ControlFile->state == DB_IN_UPGRADE)
+		ControlFile->state = DB_IN_ARCHIVE_RECOVERY;
+	if (ControlFile->minRecoveryPoint < end_lsn)
+	{
+		ControlFile->minRecoveryPoint = end_lsn;
+		ControlFile->minRecoveryPointTLI = replay_tli;
+	}
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+}
+
+/*
+ * After COMMIT, save COMPLETE's end LSN for the primary's shutdown
+ * checkpoint.
+ */
+void
+ArmUpgradeCompletionCheckpoint(XLogRecPtr complete_lsn)
+{
+	bool		already_armed;
+
+	Assert(!XLogRecPtrIsInvalid(complete_lsn));
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	already_armed = !XLogRecPtrIsInvalid(XLogCtl->upgradeCompleteLSN);
+	if (!already_armed)
+		XLogCtl->upgradeCompleteLSN = complete_lsn;
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	if (already_armed)
+		elog(PANIC, "pg_upgrade completion checkpoint is already armed");
+}
+
+static XLogRecPtr
+GetUpgradeCompletionLSN(void)
+{
+	XLogRecPtr	complete_lsn;
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	complete_lsn = XLogCtl->upgradeCompleteLSN;
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	return complete_lsn;
+}
+
+static void
+ClearUpgradeCompletionLSN(void)
+{
+	SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->upgradeCompleteLSN = InvalidXLogRecPtr;
+	SpinLockRelease(&XLogCtl->info_lck);
+}
+
+bool
+GetControlFileUpgradeFinalized(void)
+{
+	Assert(ControlFile != NULL);
+	return ControlFile->upgrade_finalized;
+}
+
+void
+SetControlFileUpgradeStarted(void)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (!ControlFile->upgrade_started)
+	{
+		ControlFile->upgrade_started = true;
+		ControlFile->state = DB_IN_UPGRADE;
+		ControlFile->time = (pg_time_t) time(NULL);
+		UpdateControlFile();
+	}
+	LWLockRelease(ControlFileLock);
+}
+
+/* Persist upgrade_started and reject reuse of the window-emission target. */
+void
+BeginControlFileUpgrade(void)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (ControlFile->upgrade_started || ControlFile->upgrade_finalized)
+	{
+		LWLockRelease(ControlFileLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("an upgrade WAL window has already been started for this target"),
+				 errhint("Use a fresh target for another upgrade attempt.")));
+	}
+	ControlFile->upgrade_started = true;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+}
+
+bool
+GetControlFileUpgradeStarted(void)
+{
+	Assert(ControlFile != NULL);
+	return ControlFile->upgrade_started;
 }
 
 /*
@@ -5587,6 +6230,8 @@ XLOGShmemInit(void *arg)
 #endif
 
 	memset(XLogCtl, 0, sizeof(XLogCtlData));
+	XLogCtl->archiveUpgradeSource = LocalArchiveUpgradeSource;
+	XLogCtl->archiveUpgradeSourceValid = LocalArchiveUpgradeSourceValid;
 
 	/*
 	 * Already have read control file locally, unless in bootstrap mode. Move
@@ -6155,10 +6800,28 @@ StartupXLOG(void)
 									 timebuf, sizeof(timebuf)))));
 			break;
 
+		case DB_IN_UPGRADE:
+
+			ereport(LOG,
+					(errmsg("database system was interrupted while replaying a pg_upgrade window (last known up at %s)",
+							str_time(ControlFile->time,
+									 timebuf, sizeof(timebuf)))));
+			break;
+
 		default:
 			ereport(FATAL,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("control file contains invalid database cluster state")));
+	}
+
+	/* Remove an armed HANDOFF request after an interrupted shutdown. */
+	if (ControlFile->state != DB_SHUTDOWNED &&
+		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY &&
+		PgUpgradeHandoffIsArmed())
+	{
+		durable_unlink(PG_UPGRADE_HANDOFF_SIGNAL_FILE, FATAL);
+		ereport(LOG,
+				(errmsg("removed stale pg_upgrade handoff request after server crash")));
 	}
 
 	/* This is just to allow attaching to startup process with a debugger */
@@ -6214,6 +6877,8 @@ StartupXLOG(void)
 	InitWalRecovery(ControlFile, &wasShutdown,
 					&haveBackupLabel, &haveTblspcMap);
 	checkPoint = ControlFile->checkPointCopy;
+	/* Retain this checkpoint for later pg_control RAWFILE validation. */
+	RememberUpgradeControlCheckpoint(ControlFile->checkPoint, &checkPoint);
 
 	/* initialize shared memory variables from the checkpoint record */
 	TransamVariables->nextXid = checkPoint.nextXid;
@@ -6384,6 +7049,7 @@ StartupXLOG(void)
 	lastFullPageWrites = checkPoint.fullPageWrites;
 
 	RedoRecPtr = XLogCtl->RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
+	PreparePgUpgradeStandbySlots(checkPoint.redo);
 	doPageWrites = lastFullPageWrites;
 
 	/* REDO */
@@ -7637,6 +8303,251 @@ update_checkpoint_display(int flags, bool restartpoint, bool reset)
 }
 
 
+typedef struct PgUpgradeHandoffSlot
+{
+	ReplicationSlot *slot;
+	NameData	name;
+	bool		confirmed;
+}			PgUpgradeHandoffSlot;
+
+static bool pg_upgrade_handoff_slots_prepared = false;
+static PgUpgradeHandoffSlot * pg_upgrade_handoff_slots = NULL;
+static int	pg_upgrade_handoff_nslots = 0;
+
+static PgUpgradeHandoffSlot *
+snapshot_pg_upgrade_handoff_slots(int *nslots)
+{
+	PgUpgradeHandoffSlot *slots;
+	int			max_slots = max_replication_slots + max_repack_replication_slots;
+
+	*nslots = 0;
+	if (max_slots == 0)
+		return NULL;
+
+	slots = palloc0_array(PgUpgradeHandoffSlot, max_slots);
+
+	/*
+	 * Serialize this snapshot with persistent physical slot creation,
+	 * removal, and restart-LSN changes.
+	 */
+	LWLockAcquire(ReplicationSlotAllocationLock, LW_EXCLUSIVE);
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+
+	for (int i = 0; i < max_slots; i++)
+	{
+		ReplicationSlot *slot = &ReplicationSlotCtl->replication_slots[i];
+
+		if (!slot->in_use)
+			continue;
+
+		SpinLockAcquire(&slot->mutex);
+		if (SlotIsPhysical(slot) &&
+			slot->data.persistency == RS_PERSISTENT &&
+			namestrcmp(&slot->data.name, CONFLICT_DETECTION_SLOT) != 0)
+		{
+			if (slot->data.invalidated != RS_INVAL_NONE ||
+				!XLogRecPtrIsValid(slot->data.restart_lsn))
+			{
+				SpinLockRelease(&slot->mutex);
+				ereport(FATAL,
+						(errmsg("physical replication slot \"%s\" is invalid during pg_upgrade handoff",
+								NameStr(slot->data.name))));
+			}
+			slots[*nslots].slot = slot;
+			memcpy(&slots[*nslots].name, &slot->data.name, sizeof(NameData));
+			(*nslots)++;
+		}
+		SpinLockRelease(&slot->mutex);
+	}
+
+	LWLockRelease(ReplicationSlotControlLock);
+	LWLockRelease(ReplicationSlotAllocationLock);
+	return slots;
+}
+
+/* Snapshot persistent physical slots before the HANDOFF checkpoint. */
+void
+PreparePgUpgradeHandoffSlots(void)
+{
+	if (pg_upgrade_handoff_slots_prepared)
+		elog(PANIC, "pg_upgrade handoff slots already prepared");
+
+	pg_upgrade_handoff_slots =
+		snapshot_pg_upgrade_handoff_slots(&pg_upgrade_handoff_nslots);
+	pg_upgrade_handoff_slots_prepared = true;
+}
+
+void
+CancelPgUpgradeHandoffSlots(void)
+{
+	if (pg_upgrade_handoff_slots != NULL)
+		pfree(pg_upgrade_handoff_slots);
+	pg_upgrade_handoff_slots = NULL;
+	pg_upgrade_handoff_nslots = 0;
+	pg_upgrade_handoff_slots_prepared = false;
+}
+
+static void
+pg_upgrade_handoff_check_interrupts(void)
+{
+	if (AmStartupProcess())
+	{
+		ProcessStartupProcInterrupts();
+		if (IsPromoteSignaled())
+			ereport(FATAL,
+					(errmsg("cannot promote while waiting for physical standbys to receive the pg_upgrade handoff checkpoint")));
+	}
+	else
+		CHECK_FOR_INTERRUPTS();
+}
+
+static bool
+wait_for_pg_upgrade_handoff_slots(PgUpgradeHandoffSlot * slots, int nslots,
+								  XLogRecPtr checkpoint_end_lsn)
+{
+	int			remaining = nslots;
+
+	if (remaining > 0)
+		ereport(LOG,
+				(errmsg("waiting for %d physical standbys to durably receive the pg_upgrade handoff checkpoint through %X/%X",
+						nslots, LSN_FORMAT_ARGS(checkpoint_end_lsn))));
+
+	for (;;)
+	{
+		pg_upgrade_handoff_check_interrupts();
+		if (PgUpgradeHandoffCancellationRequested())
+			return false;
+		if (AmStartupProcess())
+		{
+			TimeLineID	replay_tli;
+			XLogRecPtr	replay_lsn = GetXLogReplayRecPtr(&replay_tli);
+
+			EnsurePgUpgradeHandoffWalReceiver(replay_tli, replay_lsn);
+		}
+		if (remaining > 0)
+		{
+			LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+			for (int i = 0; i < nslots; i++)
+			{
+				ReplicationSlot *slot = slots[i].slot;
+				bool		invalidated;
+				bool		matches;
+				bool		received;
+				XLogRecPtr	restart_lsn;
+
+				if (slots[i].confirmed)
+					continue;
+				if (!slot->in_use)
+					ereport(FATAL,
+							(errmsg("physical replication slot \"%s\" was removed during pg_upgrade handoff",
+									NameStr(slots[i].name))));
+
+				SpinLockAcquire(&slot->mutex);
+				matches = SlotIsPhysical(slot) &&
+					slot->data.persistency == RS_PERSISTENT &&
+					namestrcmp(&slot->data.name, NameStr(slots[i].name)) == 0;
+				invalidated = slot->data.invalidated != RS_INVAL_NONE;
+				restart_lsn = slot->data.restart_lsn;
+				received = matches && !invalidated &&
+					XLogRecPtrIsValid(restart_lsn) &&
+					restart_lsn >= checkpoint_end_lsn;
+				if (received)
+				{
+					if (!XLogRecPtrIsValid(slot->handoff_restart_lsn_floor) ||
+						slot->handoff_restart_lsn_floor < checkpoint_end_lsn)
+						slot->handoff_restart_lsn_floor = checkpoint_end_lsn;
+					slot->just_dirtied = true;
+					slot->dirty = true;
+				}
+				SpinLockRelease(&slot->mutex);
+				if (!matches)
+					ereport(FATAL,
+							(errmsg("physical replication slot \"%s\" changed during pg_upgrade handoff",
+									NameStr(slots[i].name))));
+				if (invalidated || !XLogRecPtrIsValid(restart_lsn))
+					ereport(FATAL,
+							(errmsg("physical replication slot \"%s\" became invalid during pg_upgrade handoff",
+									NameStr(slots[i].name))));
+				if (!received)
+					continue;
+
+				slots[i].confirmed = true;
+				remaining--;
+			}
+			LWLockRelease(ReplicationSlotControlLock);
+		}
+
+		if (remaining == 0)
+			break;
+		pg_usleep(10000L);
+	}
+
+	if (nslots > 0)
+	{
+		/*
+		 * Save confirmed persistent physical slots with restart_lsn no lower
+		 * than their HANDOFF floors.
+		 */
+		CheckPointReplicationSlots(false);
+		if (PgUpgradeHandoffCancellationRequested())
+			return false;
+
+		LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+		for (int i = 0; i < nslots; i++)
+		{
+			ReplicationSlot *slot = slots[i].slot;
+			bool		invalidated;
+			bool		matches;
+			XLogRecPtr	saved_restart_lsn;
+
+			if (!slot->in_use)
+				ereport(FATAL,
+						(errmsg("physical replication slot \"%s\" was removed while persisting pg_upgrade handoff receipt",
+								NameStr(slots[i].name))));
+
+			SpinLockAcquire(&slot->mutex);
+			matches = SlotIsPhysical(slot) &&
+				slot->data.persistency == RS_PERSISTENT &&
+				namestrcmp(&slot->data.name, NameStr(slots[i].name)) == 0;
+			invalidated = slot->data.invalidated != RS_INVAL_NONE;
+			saved_restart_lsn = slot->last_saved_restart_lsn;
+			SpinLockRelease(&slot->mutex);
+
+			if (!matches || invalidated ||
+				saved_restart_lsn < checkpoint_end_lsn)
+				ereport(FATAL,
+						(errmsg("could not persist pg_upgrade handoff receipt for physical replication slot \"%s\"",
+								NameStr(slots[i].name))));
+		}
+		LWLockRelease(ReplicationSlotControlLock);
+
+		ereport(LOG,
+				(errmsg("all physical standbys durably received the pg_upgrade handoff checkpoint")));
+	}
+
+	return true;
+}
+
+/*
+ * Wait until each snapshotted persistent physical slot's restart_lsn reaches
+ * checkpoint_end_lsn. Save restart_lsn no lower than its HANDOFF floor, then
+ * discard the snapshot. Return false if replay resume requests cancellation.
+ */
+bool
+WaitForPgUpgradeHandoffSlots(XLogRecPtr checkpoint_end_lsn)
+{
+	bool		completed;
+
+	if (!pg_upgrade_handoff_slots_prepared)
+		PreparePgUpgradeHandoffSlots();
+
+	completed = wait_for_pg_upgrade_handoff_slots(pg_upgrade_handoff_slots,
+												  pg_upgrade_handoff_nslots,
+												  checkpoint_end_lsn);
+	CancelPgUpgradeHandoffSlots();
+	return completed;
+}
+
 /*
  * Perform a checkpoint --- either during shutdown, or on-the-fly
  *
@@ -7689,6 +8600,10 @@ CreateCheckPoint(int flags)
 	VirtualTransactionId *vxids;
 	int			nvxids;
 	int			oldXLogAllowed = 0;
+	XLogRecPtr	upgrade_complete_lsn = InvalidXLogRecPtr;
+	PgUpgradeHandoffSlot *handoff_slots = NULL;
+	int			nhandoff_slots = 0;
+	bool		handoff_emitted = false;
 
 	/*
 	 * An end-of-recovery checkpoint is really a shutdown checkpoint, just
@@ -7724,6 +8639,15 @@ CreateCheckPoint(int flags)
 	/* Run these points outside the critical section. */
 	INJECTION_POINT("create-checkpoint-initial", NULL);
 	INJECTION_POINT_LOAD("create-checkpoint-run");
+
+	/* HANDOFF must be the shutdown checkpoint's preceding WAL record. */
+	if ((flags & CHECKPOINT_IS_SHUTDOWN) && PgUpgradeHandoffIsArmed())
+	{
+		handoff_slots = snapshot_pg_upgrade_handoff_slots(&nhandoff_slots);
+		(void) RequestXLogSwitch(false);
+		handoff_emitted =
+			XLogRecPtrIsValid(EmitPgUpgradeHandoffIfArmed());
+	}
 
 	/*
 	 * Use a critical section to force system panic if we have trouble.
@@ -8077,6 +9001,30 @@ CreateCheckPoint(int flags)
 		ereport(PANIC,
 				(errmsg("concurrent write-ahead log activity while database system is shutting down")));
 
+	if (shutdown)
+	{
+		upgrade_complete_lsn = GetUpgradeCompletionLSN();
+		if (!XLogRecPtrIsInvalid(upgrade_complete_lsn) &&
+			ProcLastRecPtr < upgrade_complete_lsn)
+			ereport(PANIC,
+					(errmsg("pg_upgrade completion checkpoint precedes COMPLETE")));
+	}
+
+	/*
+	 * Save each snapshotted persistent physical slot with restart_lsn no
+	 * lower than its HANDOFF floor before publishing DB_SHUTDOWNED.
+	 */
+	if (handoff_emitted)
+	{
+		END_CRIT_SECTION();
+		wait_for_pg_upgrade_handoff_slots(handoff_slots, nhandoff_slots,
+										  recptr);
+		if (handoff_slots != NULL)
+			pfree(handoff_slots);
+		handoff_slots = NULL;
+		START_CRIT_SECTION();
+	}
+
 	/*
 	 * Remember the prior checkpoint's redo ptr for
 	 * UpdateCheckPointDistanceEstimate()
@@ -8094,6 +9042,13 @@ CreateCheckPoint(int flags)
 	/* crash recovery should always recover to the end of WAL */
 	ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
 	ControlFile->minRecoveryPointTLI = 0;
+	/* A shutdown checkpoint after committed COMPLETE finalizes the primary. */
+	if (!XLogRecPtrIsInvalid(upgrade_complete_lsn))
+	{
+		if (!ControlFile->upgrade_started || ControlFile->upgrade_finalized)
+			elog(PANIC, "invalid pg_upgrade state at completion checkpoint");
+		ControlFile->upgrade_finalized = true;
+	}
 
 	/*
 	 * Persist the data checksum state this node runs under into the control
@@ -8139,12 +9094,17 @@ CreateCheckPoint(int flags)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+	if (!XLogRecPtrIsInvalid(upgrade_complete_lsn))
+		ClearUpgradeCompletionLSN();
 
 	/*
 	 * We are now done with critical updates; no need for system panic if we
 	 * have trouble while fooling with old log segments.
 	 */
 	END_CRIT_SECTION();
+
+	if (handoff_slots != NULL)
+		pfree(handoff_slots);
 
 	/*
 	 * WAL summaries end when the next XLOG_CHECKPOINT_REDO or
@@ -8931,7 +9891,14 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 		 * slots were to be invalidated because of this, it would not be
 		 * possible to preserve logical ones during the upgrade.
 		 */
-		if (max_slot_wal_keep_size_mb >= 0 && !IsBinaryUpgrade)
+
+		/*
+		 * HANDOFF WAL retention and HANDOFF slot freezing also skip this
+		 * limit.
+		 */
+		if (max_slot_wal_keep_size_mb >= 0 && !IsBinaryUpgrade &&
+			!XLogRecPtrIsValid(GetPgUpgradeHandoffRetention()) &&
+			!PgUpgradeHandoffSlotsAreFrozen())
 		{
 			uint64		slot_keep_segs;
 
@@ -8971,6 +9938,17 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 			else
 				segno = currSegNo - keep_segs;
 		}
+	}
+
+	/* Retain HANDOFF's segment while its checkpoint is pending or paused. */
+	keep = GetPgUpgradeHandoffRetention();
+	if (XLogRecPtrIsValid(keep) && keep < recptr)
+	{
+		XLogSegNo	handoff_segno;
+
+		XLByteToSeg(keep, handoff_segno, wal_segment_size);
+		if (handoff_segno < segno)
+			segno = handoff_segno;
 	}
 
 	/* don't delete WAL segments newer than the calculated segment */
@@ -9079,6 +10057,269 @@ XLogAssignLSN(void)
 	XLogSetRecordFlags(XLOG_MARK_UNIMPORTANT);
 	XLogRegisterData(&dummy, sizeof(dummy));
 	return XLogInsert(RM_XLOG_ID, XLOG_ASSIGN_LSN);
+}
+
+static XLogRecPtr
+XLogWritePgUpgradeHandoff(uint32 target_major_version)
+{
+	xl_pg_upgrade_handoff xlrec;
+	XLogRecPtr	RecPtr;
+
+	memset(&xlrec, 0, sizeof(xlrec));
+	xlrec.old_major_version = PG_VERSION_NUM / 10000;
+	xlrec.target_major_version = target_major_version;
+	xlrec.handoff_time = (pg_time_t) time(NULL);
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfPgUpgradeHandoff);
+	RecPtr = XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_HANDOFF);
+
+	ereport(LOG,
+			(errmsg("pg_upgrade handoff trigger recorded at %X/%X "
+					"(old major version %u, target major version %u)",
+					LSN_FORMAT_ARGS(RecPtr),
+					xlrec.old_major_version, target_major_version)));
+
+	return RecPtr;
+}
+
+bool
+PgUpgradeHandoffIsArmed(void)
+{
+	struct stat st;
+
+	if (stat(PG_UPGRADE_HANDOFF_SIGNAL_FILE, &st) == 0)
+		return true;
+	if (errno != ENOENT)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not access pg_upgrade handoff signal file \"%s\": %m",
+						PG_UPGRADE_HANDOFF_SIGNAL_FILE)));
+	return false;
+}
+
+bool
+PgUpgradeHandoffSlotsAreFrozen(void)
+{
+	return PgUpgradeHandoffIsArmed();
+}
+
+static XLogRecPtr
+EmitPgUpgradeHandoffIfArmed(void)
+{
+	const char *path = PG_UPGRADE_HANDOFF_SIGNAL_FILE;
+	FILE	   *f;
+	int			target_major = 0;
+
+	f = AllocateFile(path, "r");
+	if (f == NULL)
+	{
+		if (errno != ENOENT)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not open pg_upgrade handoff signal file \"%s\": %m",
+							path)));
+		return InvalidXLogRecPtr;
+	}
+
+	if (fscanf(f, "%d", &target_major) != 1 || target_major <= 0)
+	{
+		FreeFile(f);
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid data in pg_upgrade handoff signal file \"%s\"",
+						path)));
+	}
+	FreeFile(f);
+
+	/*
+	 * Remove the request before emitting HANDOFF.  A later shutdown requires
+	 * a new request.
+	 */
+	if (durable_unlink(path, FATAL) != 0)
+		return InvalidXLogRecPtr;
+
+	return XLogWritePgUpgradeHandoff((uint32) target_major);
+}
+
+/*
+ * Emit full-page relation after-images. Dirty buffers and set each initialized
+ * page's LSN to its capture record in the new WAL stream.
+ */
+void
+XLogUpgradeCaptureImage(const char *path, Oid tsoid, Oid dboid,
+						RelFileNumber rfnum, uint8 forknum, uint32 segno,
+						uint32 expected_blocks)
+{
+	struct stat stbuf;
+	RelFileLocator rlocator;
+	ForkNumber	fork = (ForkNumber) forknum;
+	BlockNumber segfirst;
+	BlockNumber nblocks;
+	BlockNumber blkno;
+
+	if (lstat(path, &stbuf) != 0)
+	{
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat \"%s\": %m", path)));
+	}
+
+	rlocator.spcOid = tsoid;
+	rlocator.dbOid = dboid;
+	rlocator.relNumber = rfnum;
+	if (!S_ISREG(stbuf.st_mode) ||
+		(uint64) segno * RELSEG_SIZE + expected_blocks > InvalidBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid declared relation segment \"%s\"", path)));
+	segfirst = (BlockNumber) segno * RELSEG_SIZE;
+	if (stbuf.st_size < 0 || stbuf.st_size % BLCKSZ != 0 ||
+		stbuf.st_size / BLCKSZ > RELSEG_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid relation segment size for \"%s\"", path)));
+	nblocks = stbuf.st_size / BLCKSZ;
+	if (nblocks != expected_blocks)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("relation segment \"%s\" changed after upgrade validation", path),
+				 errdetail("Expected %u blocks, found %u.", expected_blocks, nblocks)));
+
+	if (nblocks == 0)
+		return;
+
+	XLogEnsureRecordSpace(XLR_MAX_BLOCK_ID - 1, 0);
+
+	for (blkno = 0; blkno < nblocks;)
+	{
+		Buffer		buffers[XLR_MAX_BLOCK_ID];
+		uint32		batch_limit = Min((uint32) XLR_MAX_BLOCK_ID,
+									  nblocks - blkno);
+		XLogRecPtr	recptr;
+		uint32		nbatch = 0;
+
+		CHECK_FOR_INTERRUPTS();
+		/* Bound each capture batch by the backend's remaining pin allowance. */
+		LimitAdditionalPins(&batch_limit);
+		while (nbatch < batch_limit && blkno < nblocks)
+		{
+			Buffer		buffer;
+
+			buffer = ReadBufferWithoutRelcache(rlocator, fork, segfirst + blkno,
+											   RBM_NORMAL, NULL, true);
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			buffers[nbatch++] = buffer;
+			blkno++;
+		}
+
+		XLogBeginInsert();
+		START_CRIT_SECTION();
+		for (uint32 i = 0; i < nbatch; i++)
+		{
+			MarkBufferDirty(buffers[i]);
+			XLogRegisterBuffer(i, buffers[i], REGBUF_FORCE_IMAGE);
+		}
+		recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+		for (uint32 i = 0; i < nbatch; i++)
+		{
+			Page		page = BufferGetPage(buffers[i]);
+
+			if (!PageIsNew(page))
+				PageSetLSN(page, recptr);
+		}
+		END_CRIT_SECTION();
+
+		for (uint32 i = 0; i < nbatch; i++)
+			UnlockReleaseBuffer(buffers[i]);
+	}
+}
+
+/* Emit one locked snapshot of pg_control as a complete RAWFILE image. */
+void
+XLogWriteUpgradeControlFile(void)
+{
+	const char *path = XLOG_CONTROL_FILE;
+	uint32		path_len = (uint32) strlen(path);
+	char	   *buffer;
+	xl_pg_upgrade_rawfile xlrec;
+
+	if ((Size) PG_CONTROL_FILE_SIZE + SizeOfPgUpgradeRawFile + path_len +
+		SizeOfXLogRecord > XLogRecordMaxSize)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("pg_control is too large to capture in a pg_upgrade WAL record")));
+
+	buffer = palloc0(PG_CONTROL_FILE_SIZE);
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	memcpy(buffer, ControlFile, sizeof(ControlFileData));
+	LWLockRelease(ControlFileLock);
+
+#ifdef USE_ASSERT_CHECKING
+	if (getenv("PG_UPGRADE_TEST_CHECKPOINT_AFTER_CONTROL_SNAPSHOT") != NULL)
+	{
+		RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST | CHECKPOINT_WAIT);
+		RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST | CHECKPOINT_WAIT);
+	}
+#endif
+
+	memset(&xlrec, 0, sizeof(xlrec));
+	xlrec.path_len = path_len;
+	xlrec.data_len = PG_CONTROL_FILE_SIZE;
+	xlrec.offset = 0;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfPgUpgradeRawFile);
+	XLogRegisterData(unconstify(char *, path), path_len);
+	XLogRegisterData(buffer, PG_CONTROL_FILE_SIZE);
+	(void) XLogInsert(RM_PG_UPGRADE_ID, XLOG_UPGRADE_RAWFILE);
+
+	pfree(buffer);
+}
+
+/* Write and fsync the SLRU files without creating a checkpoint. */
+void
+XLogFlushUpgradeSLRU(void)
+{
+	CheckPointCLOG();
+	CheckPointCommitTs();
+	CheckPointMultiXact();
+
+	{
+		static const char *const slru_dirs[] = UPGRADE_SLRU_DIRS;
+		int			i;
+
+		for (i = 0; i < lengthof(slru_dirs); i++)
+		{
+			DIR		   *dir;
+			struct dirent *de;
+
+			dir = AllocateDir(slru_dirs[i]);
+			if (dir == NULL)
+				continue;
+
+			while ((de = ReadDir(dir, slru_dirs[i])) != NULL)
+			{
+				char		path[MAXPGPATH];
+
+				if (de->d_name[0] == '.')
+					continue;
+
+				if (strlen(de->d_name) > 8)
+					continue;
+				if (strspn(de->d_name, "0123456789ABCDEF") != strlen(de->d_name))
+					continue;
+
+				snprintf(path, sizeof(path), "%s/%s",
+						 slru_dirs[i], de->d_name);
+
+				(void) fsync_fname(path, false);
+			}
+			FreeDir(dir);
+
+			(void) fsync_fname(slru_dirs[i], true);
+		}
+	}
 }
 
 /*
@@ -9302,6 +10543,7 @@ xlog_redo(XLogReaderState *record)
 		TimeLineID	replayTLI;
 
 		memcpy(&checkPoint, XLogRecGetData(record), sizeof(CheckPoint));
+		RememberUpgradeControlCheckpoint(record->ReadRecPtr, &checkPoint);
 		/* In a SHUTDOWN checkpoint, believe the counters exactly */
 		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
 		TransamVariables->nextXid = checkPoint.nextXid;
@@ -9399,6 +10641,7 @@ xlog_redo(XLogReaderState *record)
 							checkPoint.ThisTimeLineID, replayTLI)));
 
 		RecoveryRestartPoint(&checkPoint, record);
+		PgUpgradeCheckpointReplayed(&checkPoint, record);
 
 		/*
 		 * After replaying a checkpoint record, free all smgr objects.
@@ -9414,6 +10657,7 @@ xlog_redo(XLogReaderState *record)
 		TimeLineID	replayTLI;
 
 		memcpy(&checkPoint, XLogRecGetData(record), sizeof(CheckPoint));
+		RememberUpgradeControlCheckpoint(record->ReadRecPtr, &checkPoint);
 		/* In an ONLINE checkpoint, treat the XID counter as a minimum */
 		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
 		if (FullTransactionIdPrecedes(TransamVariables->nextXid,

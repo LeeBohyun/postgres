@@ -28,6 +28,7 @@
 #include "commands/tablespace.h"
 #include "replication/message.h"
 #include "replication/origin.h"
+#include "access/pgupgrade_wal.h"
 #include "rmgrdesc.h"
 #include "storage/standbydefs.h"
 #include "utils/relmapper.h"

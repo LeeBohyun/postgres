@@ -270,6 +270,9 @@ typedef struct ReplicationSlot
 	 */
 	XLogRecPtr	last_saved_restart_lsn;
 
+	/* Minimum restart_lsn saved for this slot while HANDOFF WAL is retained. */
+	XLogRecPtr	handoff_restart_lsn_floor;
+
 	/*
 	 * Reason for the most recent slot synchronization skip.
 	 *
@@ -345,6 +348,7 @@ extern void ReplicationSlotRelease(void);
 extern void ReplicationSlotCleanup(bool synced_only);
 extern void ReplicationSlotSave(void);
 extern void ReplicationSlotMarkDirty(void);
+extern void ReplicationSlotsClearPgUpgradeHandoffFloors(void);
 
 /* misc stuff */
 extern void ReplicationSlotInitialize(void);
@@ -365,11 +369,14 @@ extern bool InvalidateObsoleteReplicationSlots(uint32 possible_causes,
 											   XLogSegNo oldestSegno,
 											   Oid dboid,
 											   TransactionId snapshotConflictHorizon);
-extern ReplicationSlot *SearchNamedReplicationSlot(const char *name, bool need_lock);
+extern ReplicationSlot *SearchNamedReplicationSlot(const char *name,
+												   bool need_lock);
 extern int	ReplicationSlotIndex(ReplicationSlot *slot);
 extern bool ReplicationSlotName(int index, Name name);
-extern void ReplicationSlotNameForTablesync(Oid suboid, Oid relid, char *syncslotname, Size szslot);
-extern void ReplicationSlotDropAtPubNode(WalReceiverConn *wrconn, char *slotname, bool missing_ok);
+extern void ReplicationSlotNameForTablesync(Oid suboid, Oid relid,
+											char *syncslotname, Size szslot);
+extern void ReplicationSlotDropAtPubNode(WalReceiverConn *wrconn,
+										 char *slotname, bool missing_ok);
 
 extern void StartupReplicationSlots(void);
 extern void CheckPointReplicationSlots(bool is_shutdown);
@@ -378,7 +385,8 @@ extern void CheckSlotRequirements(bool repack);
 extern void CheckSlotPermissions(void);
 extern ReplicationSlotInvalidationCause
 			GetSlotInvalidationCause(const char *cause_name);
-extern const char *GetSlotInvalidationCauseName(ReplicationSlotInvalidationCause cause);
+extern const char *GetSlotInvalidationCauseName(
+												ReplicationSlotInvalidationCause cause);
 
 extern bool SlotExistsInSyncStandbySlots(const char *slot_name);
 extern bool StandbySlotsHaveCaughtup(XLogRecPtr wait_for_lsn, int elevel);

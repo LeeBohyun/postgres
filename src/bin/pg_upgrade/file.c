@@ -21,6 +21,7 @@
 #endif
 
 #include "common/file_perm.h"
+#include "common/file_utils.h"
 #include "pg_upgrade.h"
 
 
@@ -35,36 +36,17 @@ void
 cloneFile(const char *src, const char *dst,
 		  const char *schemaName, const char *relName)
 {
-#if defined(HAVE_COPYFILE) && defined(COPYFILE_CLONE_FORCE)
-	if (copyfile(src, dst, NULL, COPYFILE_CLONE_FORCE) < 0)
-		pg_fatal("error while cloning relation \"%s.%s\" (\"%s\" to \"%s\"): %m",
-				 schemaName, relName, src, dst);
-#elif defined(__linux__) && defined(FICLONE)
-	int			src_fd;
-	int			dest_fd;
+	int			save_errno;
 
-	if ((src_fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
-		pg_fatal("error while cloning relation \"%s.%s\": could not open file \"%s\": %m",
-				 schemaName, relName, src);
-
-	if ((dest_fd = open(dst, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
-						pg_file_create_mode)) < 0)
-		pg_fatal("error while cloning relation \"%s.%s\": could not create file \"%s\": %m",
-				 schemaName, relName, dst);
-
-	if (ioctl(dest_fd, FICLONE, src_fd) < 0)
+	switch (pg_clone_file(src, dst, &save_errno))
 	{
-		int			save_errno = errno;
-
-		unlink(dst);
-
-		pg_fatal("error while cloning relation \"%s.%s\" (\"%s\" to \"%s\"): %s",
-				 schemaName, relName, src, dst, strerror(save_errno));
+		case PG_REFLINK_OK:
+		case PG_REFLINK_UNSUPPORTED:
+			break;
+		case PG_REFLINK_ERROR:
+			pg_fatal("error while cloning relation \"%s.%s\" (\"%s\" to \"%s\"): %s",
+					 schemaName, relName, src, dst, strerror(save_errno));
 	}
-
-	close(src_fd);
-	close(dest_fd);
-#endif
 }
 
 
@@ -147,32 +129,17 @@ void
 copyFileByRange(const char *src, const char *dst,
 				const char *schemaName, const char *relName)
 {
-#ifdef HAVE_COPY_FILE_RANGE
-	int			src_fd;
-	int			dest_fd;
-	ssize_t		nbytes;
+	int			save_errno;
 
-	if ((src_fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
-		pg_fatal("error while copying relation \"%s.%s\": could not open file \"%s\": %m",
-				 schemaName, relName, src);
-
-	if ((dest_fd = open(dst, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
-						pg_file_create_mode)) < 0)
-		pg_fatal("error while copying relation \"%s.%s\": could not create file \"%s\": %m",
-				 schemaName, relName, dst);
-
-	do
+	switch (pg_copy_file_range_all(src, dst, &save_errno))
 	{
-		nbytes = copy_file_range(src_fd, NULL, dest_fd, NULL, SSIZE_MAX, 0);
-		if (nbytes < 0)
-			pg_fatal("error while copying relation \"%s.%s\": could not copy file range from \"%s\" to \"%s\": %m",
-					 schemaName, relName, src, dst);
+		case PG_REFLINK_OK:
+		case PG_REFLINK_UNSUPPORTED:
+			break;
+		case PG_REFLINK_ERROR:
+			pg_fatal("error while copying relation \"%s.%s\": could not copy file range from \"%s\" to \"%s\": %s",
+					 schemaName, relName, src, dst, strerror(save_errno));
 	}
-	while (nbytes > 0);
-
-	close(src_fd);
-	close(dest_fd);
-#endif
 }
 
 

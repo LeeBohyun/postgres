@@ -23,13 +23,54 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef HAVE_COPYFILE_H
+#include <copyfile.h>
+#endif
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#endif
 
+#include "common/file_perm.h"
 #include "common/file_utils.h"
 #ifdef FRONTEND
 #include "common/logging.h"
 #endif
 #include "common/relpath.h"
 #include "port/pg_iovec.h"
+
+/* Return the file identity, or false with errno set on failure. */
+bool
+pg_get_file_identity(const char *path, const struct stat *st,
+					 PGFileIdentity *identity)
+{
+#ifdef WIN32
+	BY_HANDLE_FILE_INFORMATION info;
+	HANDLE		handle = pgwin32_open_handle(path, O_RDONLY, true);
+
+	if (handle == INVALID_HANDLE_VALUE)
+		return false;
+	if (!GetFileInformationByHandle(handle, &info))
+	{
+		DWORD		error = GetLastError();
+
+		CloseHandle(handle);
+		_dosmaperr(error);
+		return false;
+	}
+	if (!CloseHandle(handle))
+	{
+		_dosmaperr(GetLastError());
+		return false;
+	}
+	identity->device = info.dwVolumeSerialNumber;
+	identity->file = ((uint64) info.nFileIndexHigh << 32) | info.nFileIndexLow;
+#else
+	identity->device = st->st_dev;
+	identity->file = st->st_ino;
+#endif
+	return true;
+}
 
 #ifdef FRONTEND
 
@@ -747,4 +788,107 @@ pg_pwrite_zeros(int fd, size_t size, pgoff_t offset)
 	Assert(total_written == size);
 
 	return total_written;
+}
+
+/*
+ * Clone src to a new dst with the platform reflink primitive. Return
+ * PG_REFLINK_UNSUPPORTED when unavailable. On failure, set *save_errno.
+ */
+PGReflinkResult
+pg_clone_file(const char *src, const char *dst, int *save_errno)
+{
+	*save_errno = 0;
+
+#if defined(HAVE_COPYFILE) && defined(COPYFILE_CLONE_FORCE)
+	if (copyfile(src, dst, NULL, COPYFILE_CLONE_FORCE) < 0)
+	{
+		*save_errno = errno;
+		return PG_REFLINK_ERROR;
+	}
+	return PG_REFLINK_OK;
+#elif defined(__linux__) && defined(FICLONE)
+	{
+		int			src_fd;
+		int			dst_fd;
+
+		if ((src_fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
+		{
+			*save_errno = errno;
+			return PG_REFLINK_ERROR;
+		}
+		if ((dst_fd = open(dst, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
+						   pg_file_create_mode)) < 0)
+		{
+			*save_errno = errno;
+			close(src_fd);
+			return PG_REFLINK_ERROR;
+		}
+		if (ioctl(dst_fd, FICLONE, src_fd) < 0)
+		{
+			*save_errno = errno;
+			close(dst_fd);
+			close(src_fd);
+			unlink(dst);
+			return PG_REFLINK_ERROR;
+		}
+		close(dst_fd);
+		close(src_fd);
+		return PG_REFLINK_OK;
+	}
+#else
+	return PG_REFLINK_UNSUPPORTED;
+#endif
+}
+
+/*
+ * Copy all of src to a new dst with copy_file_range(). Return
+ * PG_REFLINK_UNSUPPORTED when unavailable. On failure, set *save_errno and
+ * remove a partially created dst.
+ */
+PGReflinkResult
+pg_copy_file_range_all(const char *src, const char *dst, int *save_errno)
+{
+	*save_errno = 0;
+
+#if defined(HAVE_COPY_FILE_RANGE)
+	{
+		int			src_fd;
+		int			dst_fd;
+
+		if ((src_fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
+		{
+			*save_errno = errno;
+			return PG_REFLINK_ERROR;
+		}
+		if ((dst_fd = open(dst, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
+						   pg_file_create_mode)) < 0)
+		{
+			*save_errno = errno;
+			close(src_fd);
+			return PG_REFLINK_ERROR;
+		}
+
+		for (;;)
+		{
+			ssize_t		nbytes = copy_file_range(src_fd, NULL, dst_fd, NULL,
+												 SSIZE_MAX, 0);
+
+			if (nbytes < 0)
+			{
+				*save_errno = errno;
+				close(dst_fd);
+				close(src_fd);
+				unlink(dst);
+				return PG_REFLINK_ERROR;
+			}
+			if (nbytes == 0)
+				break;
+		}
+		close(dst_fd);
+		close(src_fd);
+		return PG_REFLINK_OK;
+	}
+#else
+	return PG_REFLINK_UNSUPPORTED;
+#endif
 }

@@ -89,6 +89,7 @@
 #include <pthread.h>
 #endif
 
+#include "access/pgupgrade_wal.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
@@ -362,6 +363,9 @@ static PMState pmState = PM_INIT;
  */
 static bool connsAllowed = true;
 
+/* Allow physical standbys to reconnect during HANDOFF shutdown. */
+static bool PgUpgradeHandoffShutdown = false;
+
 /* Start time of SIGKILL timeout during immediate shutdown or child crash */
 /* Zero means timeout is not running */
 static time_t AbortStartTime = 0;
@@ -451,6 +455,8 @@ static bool maybe_reap_io_worker(int pid);
 static void maybe_start_io_workers(void);
 static TimestampTz maybe_start_io_workers_scheduled_at(void);
 static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
+static bool CreateUpgradeEndpointFile(void);
+static bool RemoveUpgradeEndpointFile(void);
 static PMChild *StartChildProcess(BackendType type);
 static void StartSysLogger(void);
 static void StartAutovacuumWorker(void);
@@ -830,10 +836,7 @@ PostmasterMain(int argc, char *argv[])
 	}
 
 	/* Verify that DataDir looks reasonable */
-	checkDataDir();
-
-	/* Check that pg_control exists */
-	checkControlFile();
+	checkDataDirPermissions();
 
 	/* And switch working directory into it */
 	ChangeToDataDir();
@@ -906,6 +909,32 @@ PostmasterMain(int argc, char *argv[])
 	 * lockfiles go away after CloseServerPorts runs.
 	 */
 	CreateDataDirLockFile(true);
+
+	/*
+	 * Create upgrade startup files under the data-directory lock, then
+	 * validate the resulting PG_VERSION and pg_control.
+	 */
+	{
+		char		verpath[MAXPGPATH];
+		struct stat st;
+		UpgradeRecoveryMode mode = GetUpgradeRecoveryMode();
+
+		snprintf(verpath, sizeof(verpath), "%s/PG_VERSION", DataDir);
+
+		if (mode == UPGRADE_RECOVERY_STANDBY)
+		{
+			if (stat(verpath, &st) != 0)
+				SynthesizeUpgradeStreamControlFile(false);
+		}
+		else if (mode == UPGRADE_RECOVERY_ARCHIVE)
+		{
+			SynthesizeUpgradeStreamControlFile(true);
+		}
+	}
+	ValidatePgVersion(DataDir);
+
+	/* Check that pg_control exists */
+	checkControlFile();
 
 	/*
 	 * Read the control file (for error checking and config info).
@@ -1846,6 +1875,9 @@ canAcceptConnections(BackendType backend_type)
 	 */
 	if (pmState != PM_RUN && pmState != PM_HOT_STANDBY)
 	{
+		if (PgUpgradeHandoffShutdown && backend_type == B_BACKEND &&
+			pmState == PM_WAIT_XLOG_SHUTDOWN)
+			return CAC_UPGRADE_HANDOFF;
 		if (Shutdown > NoShutdown)
 			return CAC_SHUTDOWN;	/* shutdown is pending */
 		else if (!FatalError && pmState == PM_STARTUP)
@@ -2124,6 +2156,9 @@ process_pm_shutdown_request(void)
 	else
 		mode = SmartShutdown;
 
+	if (mode != ImmediateShutdown && PgUpgradeHandoffIsArmed())
+		PgUpgradeHandoffShutdown = true;
+
 	switch (mode)
 	{
 		case SmartShutdown:
@@ -2360,6 +2395,9 @@ process_pm_child_exit(void)
 			StartupStatus = STARTUP_NOT_RUNNING;
 			FatalError = false;
 			AbortStartTime = 0;
+			if (!CreateUpgradeEndpointFile() &&
+				!RemoveUpgradeEndpointFile())
+				ExitPostmaster(1);
 			UpdatePMState(PM_RUN);
 			connsAllowed = true;
 
@@ -3605,7 +3643,7 @@ BackendStartup(ClientSocket *client_sock)
 	 * slots) cleanly.
 	 */
 	cac = canAcceptConnections(B_BACKEND);
-	if (cac == CAC_OK)
+	if (cac == CAC_OK || cac == CAC_UPGRADE_HANDOFF)
 	{
 		/* Can change later to B_WAL_SENDER */
 		bn = AssignPostmasterChildSlot(B_BACKEND);
@@ -3885,6 +3923,12 @@ process_pm_pmsignal(void)
 			/* Waken archiver for the last time */
 			if (PgArchPMChild != NULL)
 				signal_child(PgArchPMChild, SIGUSR2);
+
+			if (PgUpgradeHandoffShutdown)
+			{
+				SignalChildren(SIGTERM, btmask(B_BACKEND));
+				WalSndInitStopping();
+			}
 
 			/*
 			 * Waken walsenders for the last time. No regular backends should
@@ -4170,6 +4214,66 @@ CreateOptsFile(int argc, char *argv[], char *fullprogname)
 	}
 
 	return true;
+}
+
+
+static bool
+CreateUpgradeEndpointFile(void)
+{
+	const char *path = "pg_upgrade_endpoint";
+	const char *tmppath = "pg_upgrade_endpoint.tmp";
+	const char *addresses = ListenAddresses ? ListenAddresses : "";
+	FILE	   *fp;
+
+	if ((fp = fopen(tmppath, PG_BINARY_W)) == NULL)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", tmppath)));
+		return false;
+	}
+	if (fprintf(fp, "%d\n", PostPortNumber) < 0 ||
+		fwrite(addresses, 1, strlen(addresses), fp) != strlen(addresses) ||
+		fflush(fp) != 0 || pg_fsync(fileno(fp)) != 0)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", tmppath)));
+		fclose(fp);
+		unlink(tmppath);
+		return false;
+	}
+	if (fclose(fp) != 0)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", tmppath)));
+		unlink(tmppath);
+		return false;
+	}
+	if (durable_rename(tmppath, path, LOG) != 0)
+		return false;
+	return true;
+}
+
+
+static bool
+RemoveUpgradeEndpointFile(void)
+{
+	const char *path = "pg_upgrade_endpoint";
+	struct stat st;
+
+	if (lstat(path, &st) != 0)
+	{
+		if (errno == ENOENT)
+			return true;
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not access file \"%s\": %m", path)));
+		return false;
+	}
+
+	return durable_unlink(path, LOG) == 0;
 }
 
 

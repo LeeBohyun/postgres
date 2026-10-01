@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "access/htup_details.h"
+#include "access/transam.h"
 #include "access/xlog_internal.h"
 #include "access/xlogbackup.h"
 #include "access/xlogrecovery.h"
@@ -27,6 +28,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "replication/slot.h"
 #include "utils/acl.h"
 #include "replication/walreceiver.h"
 #include "storage/fd.h"

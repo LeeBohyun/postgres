@@ -11,11 +11,69 @@
 
 #include <ctype.h>
 #include <limits.h>				/* for CHAR_MIN */
+#include <fcntl.h>
 
 #include "access/xlog_internal.h"
 #include "common/string.h"
 #include "pg_upgrade.h"
 #include "storage/checksum.h"
+
+static uint64
+parse_system_identifier(const char *value)
+{
+	const char *p = value;
+	char	   *end;
+	uint64		identifier;
+
+	while (*p == ' ' || *p == '\t')
+		p++;
+	if (*p < '0' || *p > '9')
+		pg_fatal("invalid database system identifier: \"%s\"", value);
+	errno = 0;
+	identifier = strtou64(p, &end, 10);
+	if (errno != 0 || identifier == 0)
+		pg_fatal("invalid database system identifier: \"%s\"", value);
+	while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
+		end++;
+	if (*end != '\0')
+		pg_fatal("invalid database system identifier: \"%s\"", value);
+	return identifier;
+}
+
+/* Read next_multi_offset's SQL type width to select multixact conversion. */
+void
+get_multixact_offset_type_size(ClusterInfo *cluster)
+{
+	PGconn	   *conn = connectToServer(cluster, "template1");
+	PGresult   *res;
+	int			size;
+
+	res = executeQueryOrDie(conn,
+							"SELECT count(*) FROM pg_catalog.pg_proc p "
+							"JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
+							"WHERE n.nspname = 'pg_catalog' "
+							"AND p.proname = 'pg_control_checkpoint' "
+							"AND p.pronargs = 0");
+	if (strcmp(PQgetvalue(res, 0, 0), "0") == 0)
+	{
+		cluster->controldata.chkpnt_nxtmxoff_size = sizeof(uint32);
+		PQclear(res);
+		PQfinish(conn);
+		return;
+	}
+	PQclear(res);
+
+	res = executeQueryOrDie(conn,
+							"SELECT next_multi_offset FROM pg_control_checkpoint()");
+	size = PQfsize(res, 0);
+	if (size != (int) sizeof(uint32) && size != (int) sizeof(uint64))
+		pg_fatal("old cluster returned unsupported multixact offset width %d",
+				 size);
+
+	cluster->controldata.chkpnt_nxtmxoff_size = size;
+	PQclear(res);
+	PQfinish(conn);
+}
 
 
 /*
@@ -62,6 +120,8 @@ get_control_data(ClusterInfo *cluster)
 	bool		got_date_is_int = false;
 	bool		got_data_checksum_version = false;
 	bool		got_cluster_state = false;
+	bool		got_checkpoint_lsn = false;
+	bool		got_checkpoint_redo = false;
 	bool		got_default_char_signedness = false;
 	char	   *lc_collate = NULL;
 	char	   *lc_ctype = NULL;
@@ -74,6 +134,10 @@ get_control_data(ClusterInfo *cluster)
 	char	   *lc_messages = NULL;
 	int			rc;
 	bool		live_check = (cluster == &old_cluster && user_opts.live_check);
+
+	/* Reuse control data already loaded while preparing --initdb. */
+	if (cluster->controldata.ctrl_ver != 0)
+		return;
 
 	/*
 	 * Because we test the pg_resetwal output as strings, it has to be in
@@ -166,6 +230,50 @@ get_control_data(ClusterInfo *cluster)
 				}
 				got_cluster_state = true;
 			}
+			else if ((p = strstr(bufin, "Latest checkpoint location:")) != NULL)
+			{
+				uint32		hi,
+							lo;
+
+				p = strchr(p, ':');
+				if (p == NULL || sscanf(p + 1, " %X/%X", &hi, &lo) != 2)
+					pg_fatal("%d: could not parse checkpoint location", __LINE__);
+				cluster->controldata.chkpnt_lsn = ((uint64) hi) << 32 | lo;
+				got_checkpoint_lsn = true;
+			}
+			else if ((p = strstr(bufin, "Latest checkpoint's REDO WAL file:")) != NULL)
+			{
+				p = strchr(p, ':');
+				if (p == NULL || strlen(p) <= 1)
+					pg_fatal("%d: checkpoint redo WAL file problem", __LINE__);
+				p++;			/* remove ':' char */
+				(void) pg_strip_crlf(p);
+				while (*p == ' ')
+					p++;
+				strlcpy(cluster->controldata.chkpnt_redo_wal_file, p,
+						sizeof(cluster->controldata.chkpnt_redo_wal_file));
+			}
+			else if ((p = strstr(bufin, "Latest checkpoint's REDO location:")) != NULL)
+			{
+				uint32		hi,
+							lo;
+
+				p = strchr(p, ':');
+				if (p == NULL || strlen(p) <= 1)
+					pg_fatal("%d: checkpoint redo location problem", __LINE__);
+				p++;			/* remove ':' char */
+				if (sscanf(p, " %X/%X", &hi, &lo) != 2)
+					pg_fatal("%d: could not parse checkpoint redo location", __LINE__);
+				cluster->controldata.chkpnt_redo_lsn =
+					((uint64) hi) << 32 | lo;
+				got_checkpoint_redo = true;
+			}
+			else if ((p = strstr(bufin, "Latest checkpoint's TimeLineID:")) != NULL)
+			{
+				p = strchr(p, ':');
+				if (p == NULL || sscanf(p + 1, " %u", &cluster->controldata.chkpnt_tli) != 1)
+					pg_fatal("%d: could not parse checkpoint timeline", __LINE__);
+			}
 		}
 
 		rc = pclose(output);
@@ -180,6 +288,11 @@ get_control_data(ClusterInfo *cluster)
 			else
 				pg_fatal("The target cluster lacks cluster state information:");
 		}
+
+		if (user_opts.wal_upgrade && cluster == &old_cluster &&
+			(!got_checkpoint_lsn || !got_checkpoint_redo ||
+			 cluster->controldata.chkpnt_tli == 0))
+			pg_fatal("The source cluster lacks its final checkpoint location or timeline");
 	}
 
 	snprintf(cmd, sizeof(cmd), "\"%s/%s \"%s\"",
@@ -207,6 +320,11 @@ get_control_data(ClusterInfo *cluster)
 
 			p++;				/* remove ':' char */
 			cluster->controldata.ctrl_ver = str2uint(p);
+		}
+		else if ((p = strstr(bufin, "Database system identifier:")) != NULL)
+		{
+			p = strchr(p, ':');
+			cluster->controldata.system_identifier = parse_system_identifier(p + 1);
 		}
 		else if ((p = strstr(bufin, "Catalog version number:")) != NULL)
 		{
@@ -604,6 +722,30 @@ get_control_data(ClusterInfo *cluster)
 
 		pg_fatal("Cannot continue without required control information, terminating");
 	}
+
+	if (user_opts.wal_upgrade && !user_opts.check &&
+		cluster->controldata.system_identifier == 0)
+		pg_fatal("The cluster lacks its database system identifier");
+
+	if (user_opts.wal_upgrade && cluster == &old_cluster && !live_check)
+	{
+		XLogSegNo	segno;
+		uint64		checkpoint_end_lsn;
+
+		if (cluster->controldata.chkpnt_lsn !=
+			cluster->controldata.chkpnt_redo_lsn)
+			pg_fatal("The source cluster's final checkpoint location does not match its REDO location");
+
+		checkpoint_end_lsn = get_shutdown_checkpoint_end_lsn(cluster);
+		cluster->controldata.shutdown_checkpoint_end_lsn = checkpoint_end_lsn;
+		XLByteToPrevSeg(checkpoint_end_lsn, segno,
+						cluster->controldata.walseg);
+		segno++;
+		/* Select the upgrade WAL filename on the old checkpoint's timeline. */
+		XLogFileName(cluster->controldata.upgrade_start_wal_file,
+					 cluster->controldata.chkpnt_tli, segno,
+					 cluster->controldata.walseg);
+	}
 }
 
 
@@ -709,4 +851,58 @@ disable_old_cluster(transferMode transfer_mode)
 			   "safely started.");
 	else
 		pg_fatal("unrecognized transfer mode");
+}
+
+/*
+ * Calculate the shutdown checkpoint's end from its WAL record length,
+ * including alignment and page headers.
+ */
+uint64
+get_shutdown_checkpoint_end_lsn(ClusterInfo *cluster)
+{
+	char		wal_path[MAXPGPATH];
+	int			fd;
+	uint32		tot_len = 0;
+	uint64		redo;
+	uint32		wal_segsz;
+	uint64		ptr;
+	uint64		remaining;
+
+	redo = cluster->controldata.chkpnt_redo_lsn;
+	wal_segsz = cluster->controldata.walseg;
+
+	if (redo == 0)
+		pg_fatal("--wal-upgrade: old cluster has no checkpoint redo LSN");
+
+	snprintf(wal_path, sizeof(wal_path), "%s/pg_wal/%s",
+			 cluster->pgdata, cluster->controldata.chkpnt_redo_wal_file);
+	fd = open(wal_path, O_RDONLY | PG_BINARY, 0);
+	if (fd < 0)
+		pg_fatal("could not open \"%s\": %m", wal_path);
+	if (pread(fd, &tot_len, sizeof(tot_len),
+			  (off_t) (redo % wal_segsz)) != (ssize_t) sizeof(tot_len))
+	{
+		close(fd);
+		pg_fatal("could not read xl_tot_len from \"%s\"", wal_path);
+	}
+	close(fd);
+	if (tot_len < 24 || tot_len > 4096)
+		pg_fatal("--wal-upgrade: implausible shutdown-checkpoint xl_tot_len %u", tot_len);
+
+	ptr = redo;
+	remaining = MAXALIGN(tot_len);
+	while (remaining > 0)
+	{
+		uint64		avail = XLOG_BLCKSZ - (ptr % XLOG_BLCKSZ);
+
+		if (remaining <= avail)
+		{
+			ptr += remaining;
+			break;
+		}
+		ptr += avail;
+		remaining -= avail;
+		ptr += (ptr % wal_segsz == 0) ? SizeOfXLogLongPHD : SizeOfXLogShortPHD;
+	}
+	return ptr;
 }

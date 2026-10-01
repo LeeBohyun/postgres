@@ -111,6 +111,19 @@ typedef enum RecoveryState
 extern PGDLLIMPORT int wal_level;
 extern PGDLLIMPORT bool XLogLogicalInfo;
 
+typedef enum
+{
+	PG_UPGRADE_XFER_MIRROR = -1,
+	PG_UPGRADE_XFER_CLONE = 0,
+	PG_UPGRADE_XFER_COPY = 1,
+	PG_UPGRADE_XFER_COPY_FILE_RANGE = 2,
+	PG_UPGRADE_XFER_LINK = 3,
+	PG_UPGRADE_XFER_SWAP = 4,
+} PgUpgradeTransferMode;
+
+extern PGDLLIMPORT int pg_upgrade_standby_transfer_mode;
+extern PGDLLIMPORT char *pg_upgrade_standby_old_datadir;
+
 /* Is WAL archiving enabled (always or only while server is running normally)? */
 #define XLogArchivingActive() \
 	(AssertMacro(XLogArchiveMode == ARCHIVE_MODE_OFF || wal_level >= WAL_LEVEL_REPLICA), XLogArchiveMode > ARCHIVE_MODE_OFF)
@@ -287,6 +300,35 @@ extern WALAvailability GetWALAvailability(XLogRecPtr targetLSN);
 extern void XLogPutNextOid(Oid8 nextOid);
 extern XLogRecPtr XLogRestorePoint(const char *rpName);
 extern XLogRecPtr XLogAssignLSN(void);
+
+struct CheckPoint;
+extern void ArmControlFileForUpgradeRecovery(
+											 const struct CheckPoint *replay_start_checkpoint,
+											 XLogRecPtr replay_start_lsn,
+											 uint64 wal_sysid, bool for_streaming);
+
+extern void AdoptUpgradeControlFile(const char *data, Size len);
+
+extern void VerifyUpgradeRestartPoint(XLogRecPtr checkpoint_lsn,
+									  TimeLineID checkpoint_tli);
+
+extern void SynthesizeUpgradeStreamControlFile(bool allow_overwrite);
+
+extern void SetControlFileUpgradeFinalized(void);
+extern void SetControlFileUpgradeComplete(XLogRecPtr end_lsn,
+										  TimeLineID replay_tli);
+extern void ArmUpgradeCompletionCheckpoint(XLogRecPtr complete_lsn);
+extern bool GetControlFileUpgradeFinalized(void);
+extern void SetControlFileUpgradeStarted(void);
+extern void BeginControlFileUpgrade(void);
+extern bool GetControlFileUpgradeStarted(void);
+
+extern bool PgUpgradeHandoffIsArmed(void);
+extern bool PgUpgradeHandoffSlotsAreFrozen(void);
+extern void PreparePgUpgradeHandoffSlots(void);
+extern void CancelPgUpgradeHandoffSlots(void);
+extern bool WaitForPgUpgradeHandoffSlots(XLogRecPtr checkpoint_end_lsn);
+
 extern void UpdateFullPageWrites(void);
 extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p);
 extern XLogRecPtr GetRedoRecPtr(void);
@@ -347,6 +389,9 @@ extern SessionBackupState get_backup_status(void);
 #define RECOVERY_SIGNAL_FILE	"recovery.signal"
 #define STANDBY_SIGNAL_FILE		"standby.signal"
 #define BACKUP_LABEL_FILE		"backup_label"
+#define PG_UPGRADE_HANDOFF_SIGNAL_FILE	"pg_upgrade_handoff.pending"
+#define PG_UPGRADE_SIGNAL_FILE			"pg_upgrade.signal"
+
 #define BACKUP_LABEL_OLD		"backup_label.old"
 
 #define TABLESPACE_MAP			"tablespace_map"

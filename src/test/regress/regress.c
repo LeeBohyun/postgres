@@ -21,6 +21,7 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
+#include "access/pgupgrade_wal.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_operator.h"
@@ -1279,6 +1280,22 @@ binary_coercible(PG_FUNCTION_ARGS)
 	Oid			targettype = PG_GETARG_OID(1);
 
 	PG_RETURN_BOOL(IsBinaryCoercible(srctype, targettype));
+}
+
+PG_FUNCTION_INFO_V1(test_pg_upgrade_directory_paths);
+Datum
+test_pg_upgrade_directory_paths(PG_FUNCTION_ARGS)
+{
+	EXPECT_TRUE(PgUpgradeDirectoryPathIsSafe("base"));
+	EXPECT_TRUE(PgUpgradeDirectoryPathIsSafe("base/5"));
+	EXPECT_TRUE(PgUpgradeDirectoryPathIsSafe("pg_multixact/offsets"));
+	EXPECT_TRUE(!PgUpgradeDirectoryPathIsSafe("/base"));
+	EXPECT_TRUE(!PgUpgradeDirectoryPathIsSafe(".."));
+	EXPECT_TRUE(!PgUpgradeDirectoryPathIsSafe("../base"));
+	EXPECT_TRUE(!PgUpgradeDirectoryPathIsSafe("base/../global"));
+	EXPECT_TRUE(!PgUpgradeDirectoryPathIsSafe("base/.."));
+
+	PG_RETURN_BOOL(true);
 }
 
 /*

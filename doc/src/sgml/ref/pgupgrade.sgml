@@ -263,6 +263,31 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--initdb</option></term>
+      <listitem>
+       <para>
+        Create the new cluster automatically by running
+        <command>initdb</command> before upgrading, instead of requiring the
+        user to have created it manually.  The WAL segment size, data checksum
+        setting, encoding, and locale are derived from the old cluster so that
+        <application>pg_upgrade</application> can verify compatibility.
+       </para>
+       <para>
+        The new cluster data directory specified with
+        <option>-D</option>/<option>--new-datadir</option> must not already
+        exist when this option is given; if it does,
+        <application>pg_upgrade</application> will exit with an error.
+       </para>
+       <para>
+        This option cannot be combined with
+        <option>-c</option>/<option>--check</option>, because
+        <option>--check</option> is read-only and must not create the new
+        cluster.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--no-statistics</option></term>
       <listitem>
        <para>
@@ -374,6 +399,77 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--wal-upgrade</option></term>
+      <listitem>
+       <para>
+        Capture the entire upgrade as write-ahead log (WAL) so that it is
+        replayable, and leave the new cluster ready to start read-write on its
+        own.  The new cluster comes up on its first start with no separate
+        commit step, exactly as an ordinary upgraded cluster would.
+       </para>
+       <para>
+        The upgrade WAL allows a standby to adopt the upgraded state through
+        ordinary replication without a fresh base backup.
+       </para>
+       <para>
+        A replacement standby need not even be initialized with
+        <command>initdb</command>: an empty data directory containing only its
+        configuration, a <filename>standby.signal</filename>, and an empty
+        <filename>pg_upgrade.signal</filename> is sufficient.  Set
+        <xref linkend="guc-pg-upgrade-standby-old-datadir"/> to this standby's
+        retained pre-upgrade data directory and set
+        <varname>primary_conninfo</varname> to the upgraded primary.  Upgrade
+        replay starts without a replication slot, so
+        <varname>primary_slot_name</varname> must be empty and
+        <varname>wal_receiver_create_temp_slot</varname> must be off.
+       </para>
+       <para>
+        When persistent physical slots are migrated, the new primary must have
+        <varname>wal_level</varname> set to <literal>replica</literal> or
+        <literal>logical</literal> and enough
+        <varname>max_replication_slots</varname> to hold its existing and
+        migrated slots.  Configure these settings before running
+        <application>pg_upgrade</application>.  A replacement standby that
+        recreates physical slots from its retained data directory also requires
+        <varname>fsync</varname> to be on, <varname>wal_level</varname> to be
+        <literal>replica</literal> or higher, and enough
+        <varname>max_replication_slots</varname> for those slots.  Configure the
+        replacement standby before starting it.
+       </para>
+       <para>
+        Configure every new server that retains migrated slots with
+        <varname>max_slot_wal_keep_size</varname> set to <literal>-1</literal>
+        and <varname>idle_replication_slot_timeout</varname> set to
+        <literal>0</literal>.
+        Keep those settings until every replacement standby has finalized and
+        switched its existing WAL receiver to its named slot, working from the
+        leaves toward the primary.  This keeps each migrated slot's WAL
+        available while that slot is inactive during slotless replay.
+       </para>
+       <para>
+        On its first start the server derives the upgrade replay start LSN from
+        the retained standby's final checkpoint.  It obtains the upgraded system
+        identifier and current primary timeline over the replication connection,
+        then streams the upgrade window and becomes a hot standby.  After replay
+        finalizes, reload <varname>primary_slot_name</varname> to switch the
+        existing WAL receiver to the migrated physical slot.  Switch cascaded
+        standbys from the leaves toward the primary.
+       </para>
+       <para>
+        It may be combined with any transfer mode.  With
+        <option>--copy</option>, <option>--copy-file-range</option>, or
+        <option>--clone</option>, the old cluster's files remain independent.
+        <option>--link</option> shares them with the new cluster, and
+        <option>--swap</option> moves them into the new cluster.  These
+        restrictions also apply when a standby places retained files during
+        upgrade replay.  Set
+        <xref linkend="guc-pg-upgrade-standby-transfer-mode"/> to override the
+        primary's transfer mode on a standby.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-?</option></term>
       <term><option>--help</option></term>
       <listitem><para>show help, then exit</para></listitem>
@@ -461,6 +557,12 @@ make prefix=/usr/local/pgsql.new install
      flags that match the old cluster. Many
      prebuilt installers do this step automatically. There is no need to
      start the new cluster.
+    </para>
+    <para>
+     Alternatively, pass <option>--initdb</option> to
+     <application>pg_upgrade</application> to have it run
+     <command>initdb</command> automatically, deriving the required settings
+     from the old cluster.  In that case this manual step can be skipped.
     </para>
    </step>
 

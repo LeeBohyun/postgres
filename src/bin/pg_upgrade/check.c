@@ -9,17 +9,29 @@
 
 #include "postgres_fe.h"
 
+#include <fcntl.h>
+
 #include "access/multixact.h"
 #include "access/transam.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_class_d.h"
+#include "common/file_utils.h"
+#include "common/string.h"
 #include "fe_utils/string_utils.h"
 #include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
+#include "prepare_upgrade.h"
 #include "common/unicode_version.h"
 
 static void check_new_cluster_is_empty(void);
+static void arm_pg_upgrade_handoff(void);
+static void finish_pg_upgrade_handoff(void);
+static void set_pg_upgrade_handoff_signal_handlers(pqsigfunc handler);
+static char *get_new_cluster_setting(const char *name, bool use_new_options);
+static int	get_new_cluster_int_setting(const char *name, bool use_new_options);
+static void check_wal_upgrade_slot_retention(void);
+static void wait_for_wal_upgrade_standbys(PGconn *conn);
 static void check_is_install_user(ClusterInfo *cluster);
 static void check_for_unsupported_encodings(ClusterInfo *cluster);
 static void check_for_connection_status(ClusterInfo *cluster);
@@ -39,6 +51,93 @@ static void check_old_cluster_for_valid_slots(void);
 static void check_old_cluster_subscription_state(void);
 static void check_old_cluster_global_names(ClusterInfo *cluster);
 static void check_for_oldestxid_consistency(ClusterInfo *cluster);
+
+/*
+ * Track this process's HANDOFF request, an unfinished old-primary stop, and a
+ * frontend signal deferred until that stop completes.
+ */
+static char pg_upgrade_handoff_pending_path[MAXPGPATH];
+static bool pg_upgrade_handoff_pending_owned = false;
+static bool pg_upgrade_handoff_stop_incomplete = false;
+static volatile sig_atomic_t pg_upgrade_handoff_signal = 0;
+
+static void
+pg_upgrade_handoff_signal_handler(SIGNAL_ARGS)
+{
+	/*
+	 * Reinstall the handler and defer the signal until the old-primary stop
+	 * completes.
+	 */
+	pqsignal(postgres_signal_arg, pg_upgrade_handoff_signal_handler);
+	pg_upgrade_handoff_signal = postgres_signal_arg;
+}
+
+static void
+set_pg_upgrade_handoff_signal_handlers(pqsigfunc handler)
+{
+	pqsignal(SIGINT, handler);
+	pqsignal(SIGTERM, handler);
+#ifndef WIN32
+#ifdef SIGQUIT
+	pqsignal(SIGQUIT, handler);
+#endif
+#ifdef SIGHUP
+	pqsignal(SIGHUP, handler);
+#endif
+#ifdef SIGPIPE
+	pqsignal(SIGPIPE, handler);
+#endif
+#endif
+}
+
+static bool
+remove_pg_upgrade_handoff_file(const char *path)
+{
+	if (unlink(path) != 0)
+	{
+		if (errno == ENOENT)
+			return true;
+		return false;
+	}
+	return fsync_parent_path(path) == 0;
+}
+
+/* Remove this process's HANDOFF request after the old postmaster stops. */
+void
+cleanup_pg_upgrade_handoff_after_stop(void)
+{
+	if (!pg_upgrade_handoff_pending_owned)
+		return;
+
+	if (pid_lock_file_exists(old_cluster.pgdata))
+	{
+		pg_log(PG_WARNING,
+			   "preserving pg_upgrade handoff request because the old primary is still running");
+		return;
+	}
+
+	if (!remove_pg_upgrade_handoff_file(pg_upgrade_handoff_pending_path))
+	{
+		pg_log(PG_WARNING,
+			   "could not durably remove pg_upgrade handoff request \"%s\": %m",
+			   pg_upgrade_handoff_pending_path);
+		return;
+	}
+	pg_upgrade_handoff_pending_owned = false;
+	pg_upgrade_handoff_stop_incomplete = false;
+}
+
+bool
+pg_upgrade_handoff_requires_immediate_stop(void)
+{
+	return pg_upgrade_handoff_stop_incomplete;
+}
+
+int
+pg_upgrade_handoff_signal_status(void)
+{
+	return (int) pg_upgrade_handoff_signal;
+}
 
 /*
  * DataTypesUsageChecks - definitions of data type checks for the old cluster
@@ -563,13 +662,200 @@ output_check_banner(void)
 	}
 }
 
+/* Set the HANDOFF request path and reject an existing request. */
+void
+prepare_pg_upgrade_handoff(void)
+{
+	struct stat st;
+
+	if (old_cluster.pgdata == NULL || old_cluster.pgdata[0] == '\0')
+		pg_fatal("pg_upgrade handoff requires the old cluster data directory");
+
+	snprintf(pg_upgrade_handoff_pending_path,
+			 sizeof(pg_upgrade_handoff_pending_path),
+			 "%s/pg_upgrade_handoff.pending",
+			 old_cluster.pgdata);
+	if (lstat(pg_upgrade_handoff_pending_path, &st) == 0)
+		pg_fatal("handoff signal file \"%s\" already exists; remove it only after verifying that no source postmaster can consume it",
+				 pg_upgrade_handoff_pending_path);
+	if (errno != ENOENT)
+		pg_fatal("could not inspect handoff signal file \"%s\": %m",
+				 pg_upgrade_handoff_pending_path);
+}
+
+/* Begin guarded smart shutdown and durably create the HANDOFF request. */
+static void
+arm_pg_upgrade_handoff(void)
+{
+	char		contents[32];
+	int			contents_len;
+	int			fd;
+	PGconn	   *guard;
+
+	Assert(os_info.running_cluster == &old_cluster);
+
+	set_pg_upgrade_handoff_signal_handlers(pg_upgrade_handoff_signal_handler);
+
+	prep_status("Arming pg_upgrade handoff on the old primary");
+
+	pg_upgrade_handoff_stop_incomplete = true;
+	guard = begin_postmaster_stop_for_handoff(&old_cluster);
+
+	fd = open(pg_upgrade_handoff_pending_path,
+			  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | PG_BINARY,
+			  S_IRUSR | S_IWUSR);
+	if (fd < 0)
+	{
+		if (errno == EEXIST)
+			pg_fatal("handoff signal file \"%s\" already exists; stop the old primary and resolve the earlier request before retrying",
+					 pg_upgrade_handoff_pending_path);
+		pg_fatal("could not create handoff signal file \"%s\": %m",
+				 pg_upgrade_handoff_pending_path);
+	}
+	pg_upgrade_handoff_pending_owned = true;
+	contents_len = snprintf(contents, sizeof(contents), "%d\n",
+							PG_MAJORVERSION_NUM);
+	if (contents_len < 0 || contents_len >= sizeof(contents) ||
+		write(fd, contents, contents_len) != contents_len || fsync(fd) != 0)
+		pg_fatal("could not write handoff signal file \"%s\": %m",
+				 pg_upgrade_handoff_pending_path);
+	if (close(fd) != 0)
+		pg_fatal("could not close handoff signal file \"%s\": %m",
+				 pg_upgrade_handoff_pending_path);
+	if (fsync_parent_path(pg_upgrade_handoff_pending_path) != 0)
+		pg_fatal("could not sync handoff signal file \"%s\": %m",
+				 pg_upgrade_handoff_pending_path);
+	check_ok();
+
+	/*
+	 * Recheck that required physical slots are unchanged, streaming, and
+	 * caught up.
+	 */
+	wait_for_wal_upgrade_standbys(guard);
+}
+
+/* Verify request consumption and restore the frontend signal handlers. */
+static void
+finish_pg_upgrade_handoff(void)
+{
+	struct stat st;
+
+	if (lstat(pg_upgrade_handoff_pending_path, &st) == 0)
+		pg_fatal("old primary stopped without consuming handoff signal file \"%s\"",
+				 pg_upgrade_handoff_pending_path);
+	if (errno != ENOENT)
+		pg_fatal("could not inspect handoff signal file \"%s\": %m",
+				 pg_upgrade_handoff_pending_path);
+
+	pg_upgrade_handoff_pending_owned = false;
+	pg_upgrade_handoff_stop_incomplete = false;
+
+	set_pg_upgrade_handoff_signal_handlers(PG_SIG_DFL);
+	if (pg_upgrade_handoff_signal != 0)
+		pg_fatal("received signal %d while completing the old-primary HANDOFF",
+				 (int) pg_upgrade_handoff_signal);
+}
+
+/* Read a target setting with postgres -C. */
+static char *
+get_new_cluster_setting(const char *name, bool use_new_options)
+{
+	PQExpBufferData cmd;
+	char	   *line;
+	char		postgres_path[MAXPGPATH];
+	FILE	   *output;
+	int			rc;
+
+	snprintf(postgres_path, sizeof(postgres_path), "%s/postgres",
+			 new_cluster.bindir);
+	initPQExpBuffer(&cmd);
+	appendShellString(&cmd, postgres_path);
+	appendPQExpBufferStr(&cmd, " -D ");
+	appendShellString(&cmd, new_cluster.pgconfig);
+	if (use_new_options && new_cluster.pgopts != NULL)
+		appendPQExpBuffer(&cmd, " %s", new_cluster.pgopts);
+	appendPQExpBuffer(&cmd, " -C %s", name);
+
+	fflush(NULL);
+	output = popen(cmd.data, "r");
+	if (output == NULL)
+		pg_fatal("could not read target setting \"%s\"", name);
+	line = pg_get_line(output, NULL);
+	rc = pclose(output);
+	if (line == NULL || rc != 0)
+		pg_fatal("could not read target setting \"%s\" using %s: %s",
+				 name, cmd.data, wait_result_to_str(rc));
+
+	(void) pg_strip_crlf(line);
+	termPQExpBuffer(&cmd);
+	return line;
+}
+
+static int
+get_new_cluster_int_setting(const char *name, bool use_new_options)
+{
+	char	   *end;
+	char	   *value = get_new_cluster_setting(name, use_new_options);
+	int			result;
+
+	errno = 0;
+	result = strtoint(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0')
+		pg_fatal("target setting \"%s\" has invalid value \"%s\"",
+				 name, value);
+	pg_free(value);
+	return result;
+}
+
+/*
+ * Require persistent target settings and any --new-options overrides to retain
+ * WAL for inactive migrated physical slots.
+ */
+static void
+check_wal_upgrade_slot_retention(void)
+{
+	static const struct
+	{
+		const char *name;
+		int			required;
+	}			settings[] = {
+		{"max_slot_wal_keep_size", -1},
+		{"idle_replication_slot_timeout", 0},
+	};
+	int			nchecks = new_cluster.pgopts == NULL ? 1 : 2;
+
+	if (!user_opts.wal_upgrade ||
+		old_cluster.phys_slot_arr.nslots == 0)
+		return;
+
+	prep_status("Checking WAL retention for migrated physical slots");
+	for (int i = 0; i < lengthof(settings); i++)
+	{
+		/*
+		 * Read each persistent setting, then read it with --new-options when
+		 * supplied.
+		 */
+		for (int check = 0; check < nchecks; check++)
+		{
+			int			value = get_new_cluster_int_setting(settings[i].name,
+															check == 1);
+
+			if (value != settings[i].required)
+				pg_fatal("target setting \"%s\" must be %d while migrated physical slots are inactive during standby upgrade replay",
+						 settings[i].name, settings[i].required);
+		}
+	}
+	check_ok();
+}
+
 
 void
-check_and_dump_old_cluster(void)
+check_and_dump_old_cluster(UpgradePreparation * preparation)
 {
 	/* -- OLD -- */
 
-	if (!user_opts.live_check)
+	if (!user_opts.live_check &&
+		os_info.running_cluster != &old_cluster)
 		start_postmaster(&old_cluster, true);
 
 	/*
@@ -577,6 +863,7 @@ check_and_dump_old_cluster(void)
 	 * fail in later stages.
 	 */
 	check_for_connection_status(&old_cluster);
+	get_multixact_offset_type_size(&old_cluster);
 
 	/*
 	 * Check for encodings that are no longer supported.
@@ -596,6 +883,9 @@ check_and_dump_old_cluster(void)
 	 * the old cluster.
 	 */
 	get_db_rel_and_slot_infos(&old_cluster);
+
+	get_old_cluster_physical_slot_infos();
+	check_wal_upgrade_slot_retention();
 
 	init_tablespaces();
 
@@ -695,8 +985,201 @@ check_and_dump_old_cluster(void)
 	if (!user_opts.check)
 		generate_old_dump();
 
+#ifdef USE_ASSERT_CHECKING
+	if (getenv("PG_UPGRADE_TEST_ADD_PHYSICAL_SLOT_AFTER_DUMP") != NULL)
+	{
+		PGconn	   *conn = connectToServer(&old_cluster, "template1");
+
+		PQclear(executeQueryOrDie(conn,
+								  "SELECT pg_create_physical_replication_slot('late_physical_slot', true)"));
+		PQfinish(conn);
+	}
+	if (getenv("PG_UPGRADE_TEST_DROP_PHYSICAL_SLOT_AFTER_DUMP") != NULL)
+	{
+		PGconn	   *conn = connectToServer(&old_cluster, "template1");
+
+		PQclear(executeQueryOrDie(conn,
+								  "SELECT pg_drop_replication_slot('late_physical_slot')"));
+		PQfinish(conn);
+	}
+#endif
+
+	if (preparation != NULL)
+	{
+		Assert(user_opts.wal_upgrade && !user_opts.check);
+		prepare_upgrade_catalogs(preparation, &old_cluster,
+								 UPGRADE_CATALOG_OLD);
+	}
+
 	if (!user_opts.live_check)
 		stop_postmaster(false);
+}
+
+/*
+ * Restart the old primary, validate its physical slots, and stop it with
+ * HANDOFF.
+ */
+void
+perform_pg_upgrade_handoff(void)
+{
+	PGconn	   *conn;
+
+	Assert(user_opts.wal_upgrade && !user_opts.check &&
+		   !user_opts.live_check);
+	Assert(os_info.running_cluster == NULL);
+
+	start_postmaster(&old_cluster, true);
+
+	conn = connectToServer(&old_cluster, "template1");
+	wait_for_wal_upgrade_standbys(conn);
+	PQfinish(conn);
+
+	arm_pg_upgrade_handoff();
+	stop_postmaster(false);
+	finish_pg_upgrade_handoff();
+}
+
+
+/*
+ * Match the current physical slots to the checked set and wait for each
+ * to have a streaming standby and a restart LSN at or beyond the current WAL
+ * flush position.
+ */
+static void
+wait_for_wal_upgrade_standbys(PGconn *conn)
+{
+	uint32		source_major_version =
+		GET_MAJOR_VERSION(old_cluster.major_version);
+	PGresult   *res;
+	int			i_caught_up;
+	int			i_flush_lsn;
+	int			i_has_restart_lsn;
+	int			i_invalidation_reason;
+	int			i_replication_state;
+	int			i_restart_lsn;
+	int			i_slotname;
+	int			i_wal_status;
+	int			num_slots;
+
+#ifdef USE_ASSERT_CHECKING
+	if (pg_upgrade_handoff_pending_owned &&
+		getenv("PG_UPGRADE_TEST_FAIL_HANDOFF_REVALIDATION") != NULL)
+		PQclear(executeQueryOrDie(conn, "SELECT 1 / 0"));
+#endif
+
+	/* Skip physical-slot checks for sources before PostgreSQL 9.4. */
+	if (source_major_version < 904)
+	{
+		Assert(old_cluster.phys_slot_arr.nslots == 0);
+		return;
+	}
+
+	prep_status("Waiting for old-cluster physical standbys");
+	for (int attempt = 0; attempt < 600; attempt++)
+	{
+		bool		ready = true;
+		bool		timed_out = attempt == 599;
+
+		res = executeQueryOrDie(conn,
+								"SELECT s.slot_name, "
+								"       s.restart_lsn IS NOT NULL AS has_restart_lsn, "
+								"       s.restart_lsn >= p.flush_lsn AS caught_up, "
+								"       s.restart_lsn::text AS restart_lsn, "
+								"       p.flush_lsn::text AS flush_lsn, "
+								"       %s AS wal_status, %s AS invalidation_reason, "
+								"       r.state AS replication_state "
+								"FROM pg_catalog.pg_replication_slots s "
+								"CROSS JOIN (SELECT %s() AS flush_lsn) p "
+								"LEFT JOIN pg_catalog.pg_stat_replication r "
+								"  ON r.pid = s.active_pid "
+								"WHERE s.slot_type = 'physical' AND "
+								"      %s AND "
+								"      %s "
+								"ORDER BY s.slot_name",
+								source_major_version >= 1300 ?
+								"s.wal_status" : "NULL::text",
+								source_major_version >= 1700 ?
+								"s.invalidation_reason" : "NULL::text",
+								source_major_version >= 1000 ?
+								"pg_catalog.pg_current_wal_flush_lsn" :
+								"pg_catalog.pg_current_xlog_flush_location",
+								source_major_version >= 1000 ?
+								"s.temporary IS FALSE" : "true",
+								source_major_version >= 1900 ?
+								"s.slot_name <> 'pg_conflict_detection'" : "true");
+
+		num_slots = PQntuples(res);
+		i_slotname = PQfnumber(res, "slot_name");
+		i_has_restart_lsn = PQfnumber(res, "has_restart_lsn");
+		i_caught_up = PQfnumber(res, "caught_up");
+		i_restart_lsn = PQfnumber(res, "restart_lsn");
+		i_flush_lsn = PQfnumber(res, "flush_lsn");
+		i_wal_status = PQfnumber(res, "wal_status");
+		i_invalidation_reason = PQfnumber(res, "invalidation_reason");
+		i_replication_state = PQfnumber(res, "replication_state");
+
+		for (int slotnum = 0;
+			 slotnum < num_slots || slotnum < old_cluster.phys_slot_arr.nslots;
+			 slotnum++)
+		{
+			if (slotnum >= num_slots)
+				pg_fatal("required physical replication slot \"%s\" was removed during the upgrade",
+						 old_cluster.phys_slot_arr.slots[slotnum].slotname);
+			if (slotnum >= old_cluster.phys_slot_arr.nslots)
+				pg_fatal("physical replication slot \"%s\" was added during the upgrade",
+						 PQgetvalue(res, slotnum, i_slotname));
+			if (strcmp(old_cluster.phys_slot_arr.slots[slotnum].slotname,
+					   PQgetvalue(res, slotnum, i_slotname)) != 0)
+				pg_fatal("physical replication slot set changed during the upgrade; expected \"%s\", found \"%s\"",
+						 old_cluster.phys_slot_arr.slots[slotnum].slotname,
+						 PQgetvalue(res, slotnum, i_slotname));
+		}
+
+		for (int slotnum = 0; slotnum < num_slots; slotnum++)
+		{
+			const char *slotname = PQgetvalue(res, slotnum, i_slotname);
+
+			if (strcmp(PQgetvalue(res, slotnum, i_has_restart_lsn), "t") != 0)
+				pg_fatal("physical replication slot \"%s\" lost its restart LSN during the upgrade",
+						 slotname);
+			if (!PQgetisnull(res, slotnum, i_invalidation_reason))
+				pg_fatal("physical replication slot \"%s\" was invalidated during the upgrade (%s)",
+						 slotname,
+						 PQgetvalue(res, slotnum, i_invalidation_reason));
+			if (!PQgetisnull(res, slotnum, i_wal_status) &&
+				strcmp(PQgetvalue(res, slotnum, i_wal_status), "lost") == 0)
+				pg_fatal("physical replication slot \"%s\" lost required WAL during the upgrade",
+						 slotname);
+			if (PQgetisnull(res, slotnum, i_replication_state) ||
+				strcmp(PQgetvalue(res, slotnum, i_replication_state),
+					   "streaming") != 0)
+			{
+				if (timed_out)
+					pg_fatal("required physical replication slot \"%s\" does not have a streaming standby",
+							 slotname);
+				ready = false;
+			}
+			if (strcmp(PQgetvalue(res, slotnum, i_caught_up), "t") != 0)
+			{
+				if (timed_out)
+					pg_fatal("required physical replication slot \"%s\" is stale; restart LSN %s has not reached current flush LSN %s",
+							 slotname,
+							 PQgetvalue(res, slotnum, i_restart_lsn),
+							 PQgetvalue(res, slotnum, i_flush_lsn));
+				ready = false;
+			}
+		}
+
+		PQclear(res);
+		if (ready)
+		{
+			check_ok();
+			return;
+		}
+		pg_usleep(100000L);
+	}
+
+	pg_fatal("timed out waiting for old-cluster physical standbys");
 }
 
 
@@ -797,6 +1280,11 @@ output_completion_banner(char *deletion_script_file_name)
 		appendShellString(&user_specification, os_info.user);
 		appendPQExpBufferChar(&user_specification, ' ');
 	}
+
+	if (user_opts.wal_upgrade)
+		pg_log(PG_REPORT,
+			   "WAL generated during schema restore: " UINT64_FORMAT " bytes",
+			   log_opts.pg_upgrade_wal_bytes);
 
 	pg_log(PG_REPORT,
 		   "Some statistics are not transferred by pg_upgrade.\n"
@@ -2091,12 +2579,16 @@ check_new_cluster_replication_slots(void)
 {
 	PGresult   *res;
 	PGconn	   *conn;
-	int			nslots_on_old;
+	int			nlogical_slots_on_old;
+	int			nlogical_slots_on_new;
+	int			nphysical_slots_on_old = old_cluster.phys_slot_arr.nslots;
 	int			nslots_on_new;
 	int			rdt_slot_on_new;
 	int			max_replication_slots;
+	int			required_slots;
 	char	   *output_plugin_libraries;
 	char	   *wal_level;
+	int			i_nlogical_slots_on_new;
 	int			i_nslots_on_new;
 	int			i_rdt_slot_on_new;
 
@@ -2104,52 +2596,71 @@ check_new_cluster_replication_slots(void)
 	 * Logical slots can be migrated since PG17 and a physical slot
 	 * CONFLICT_DETECTION_SLOT can be migrated since PG19.
 	 */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 1600)
-		return;
-
-	nslots_on_old = count_old_cluster_logical_slots();
+	nlogical_slots_on_old = count_old_cluster_logical_slots();
 
 	/*
 	 * Quick return if there are no slots to be migrated and no subscriptions
 	 * have the retain_dead_tuples option enabled.
 	 */
-	if (nslots_on_old == 0 && !old_cluster.sub_retain_dead_tuples)
+	if (nlogical_slots_on_old == 0 && nphysical_slots_on_old == 0 &&
+		!old_cluster.sub_retain_dead_tuples)
 		return;
 
 	conn = connectToServer(&new_cluster, "template1");
 
 	prep_status("Checking new cluster replication slots");
 
-	res = executeQueryOrDie(conn, "SELECT %s AS nslots_on_new, %s AS rdt_slot_on_new "
-							"FROM pg_catalog.pg_replication_slots",
-							nslots_on_old > 0
-							? "COUNT(*) FILTER (WHERE slot_type = 'logical' AND temporary IS FALSE)"
-							: "0",
-							old_cluster.sub_retain_dead_tuples
-							? "COUNT(*) FILTER (WHERE slot_name = 'pg_conflict_detection')"
-							: "0");
+	res = executeQueryOrDie(conn,
+							"SELECT COUNT(*) FILTER (WHERE temporary IS FALSE) AS nslots_on_new, "
+							"       COUNT(*) FILTER (WHERE slot_type = 'logical' AND temporary IS FALSE) AS nlogical_slots_on_new, "
+							"       COUNT(*) FILTER (WHERE slot_name = 'pg_conflict_detection') AS rdt_slot_on_new "
+							"FROM pg_catalog.pg_replication_slots");
 
 	if (PQntuples(res) != 1)
 		pg_fatal("could not count the number of replication slots");
 
 	i_nslots_on_new = PQfnumber(res, "nslots_on_new");
+	i_nlogical_slots_on_new = PQfnumber(res, "nlogical_slots_on_new");
 	i_rdt_slot_on_new = PQfnumber(res, "rdt_slot_on_new");
 
 	nslots_on_new = atoi(PQgetvalue(res, 0, i_nslots_on_new));
+	nlogical_slots_on_new =
+		atoi(PQgetvalue(res, 0, i_nlogical_slots_on_new));
 
-	if (nslots_on_new)
-	{
-		Assert(nslots_on_old);
+	if (nlogical_slots_on_old > 0 && nlogical_slots_on_new > 0)
 		pg_fatal("expected 0 logical replication slots but found %d",
+				 nlogical_slots_on_new);
+	if (nphysical_slots_on_old > 0 && nslots_on_new > 0)
+		pg_fatal("expected 0 persistent replication slots in the new cluster while migrating physical slots but found %d",
 				 nslots_on_new);
-	}
 
 	rdt_slot_on_new = atoi(PQgetvalue(res, 0, i_rdt_slot_on_new));
 
-	if (rdt_slot_on_new)
-	{
-		Assert(old_cluster.sub_retain_dead_tuples);
+	if (old_cluster.sub_retain_dead_tuples && rdt_slot_on_new)
 		pg_fatal("replication slot \"%s\" already exists in the new cluster", "pg_conflict_detection");
+	required_slots = nslots_on_new + nphysical_slots_on_old +
+		nlogical_slots_on_old +
+		(old_cluster.sub_retain_dead_tuples ? 1 : 0);
+
+	/*
+	 * Read persistent wal_level and max_replication_slots without
+	 * --new-options.
+	 */
+	if (user_opts.wal_upgrade)
+	{
+		int			persistent_max =
+			get_new_cluster_int_setting("max_replication_slots", false);
+		char	   *persistent_wal_level =
+			get_new_cluster_setting("wal_level", false);
+
+		if (strcmp(persistent_wal_level, "minimal") == 0)
+			pg_fatal("target setting \"wal_level\" must be \"replica\" or \"logical\" during normal startup while migrating replication slots");
+
+		if (persistent_max < required_slots)
+			pg_fatal("target setting \"max_replication_slots\" must be at least %d during normal startup while migrating replication slots",
+					 required_slots);
+
+		pg_free(persistent_wal_level);
 	}
 
 	PQclear(res);
@@ -2163,7 +2674,8 @@ check_new_cluster_replication_slots(void)
 
 	wal_level = PQgetvalue(res, 0, 0);
 
-	if ((nslots_on_old > 0 || old_cluster.sub_retain_dead_tuples) &&
+	if ((nlogical_slots_on_old > 0 || nphysical_slots_on_old > 0 ||
+		 old_cluster.sub_retain_dead_tuples) &&
 		strcmp(wal_level, "minimal") == 0)
 		pg_fatal("\"wal_level\" must be \"replica\" or \"logical\" but is set to \"%s\"",
 				 wal_level);
@@ -2174,7 +2686,7 @@ check_new_cluster_replication_slots(void)
 	 * Make sure the output_plugin_libraries setting covers all plugins needed
 	 * by any migrated slots.
 	 */
-	if (nslots_on_old > 0)
+	if (nlogical_slots_on_old > 0)
 	{
 		char	   *guc_copy = pg_strdup(output_plugin_libraries);
 		char	  **allowed_plugins;
@@ -2248,17 +2760,18 @@ check_new_cluster_replication_slots(void)
 
 	max_replication_slots = atoi(PQgetvalue(res, 2, 0));
 
-	if (old_cluster.sub_retain_dead_tuples &&
-		nslots_on_old + 1 > max_replication_slots)
-		pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of "
-				 "logical replication slots in the old cluster plus one additional slot required "
-				 "for retaining conflict detection information (%d)",
-				 max_replication_slots, nslots_on_old + 1);
-
-	if (nslots_on_old > max_replication_slots)
-		pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of "
-				 "logical replication slots (%d) in the old cluster",
-				 max_replication_slots, nslots_on_old);
+	if (required_slots > max_replication_slots)
+	{
+		if (nphysical_slots_on_old == 0 && nslots_on_new == 0 &&
+			old_cluster.sub_retain_dead_tuples)
+			pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of logical replication slots in the old cluster plus one additional slot required for retaining conflict detection information (%d)",
+					 max_replication_slots, required_slots);
+		if (nphysical_slots_on_old == 0 && nslots_on_new == 0)
+			pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of logical replication slots (%d) in the old cluster",
+					 max_replication_slots, nlogical_slots_on_old);
+		pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the combined number of existing and migrated replication slots (%d)",
+				 max_replication_slots, required_slots);
+	}
 
 	PQclear(res);
 	PQfinish(conn);

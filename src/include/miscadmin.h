@@ -423,6 +423,7 @@ extern const char *GetBackendTypeDesc(BackendType backendType);
 
 extern void SetDatabasePath(const char *path);
 extern void checkDataDir(void);
+extern void checkDataDirPermissions(void);
 extern void SetDataDir(const char *dir);
 extern void ChangeToDataDir(void);
 

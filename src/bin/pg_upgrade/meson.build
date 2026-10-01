@@ -8,6 +8,8 @@ pg_upgrade_sources = files(
   'file.c',
   'function.c',
   'info.c',
+  'upgrade_catalogs.c',
+  'emit_upgrade_wal.c',
   'multixact_read_v18.c',
   'multixact_rewrite.c',
   'option.c',
@@ -20,6 +22,7 @@ pg_upgrade_sources = files(
   'task.c',
   'util.c',
   'version.c',
+  'prepare_upgrade.c',
 )
 
 if host_system == 'windows'
@@ -69,6 +72,10 @@ tests += {
       't/006_transfer_modes.pl',
       't/007_multixact_conversion.pl',
       't/008_extension_control_path.pl',
+      't/009_initdb_option.pl',
+      't/010_wal_upgrade.pl',
+      't/011_wal_upgrade_standby.pl',
+      't/012_wal_upgrade_validation.pl',
     ],
     'deps': [test_ext],
     'test_kwargs': {'priority': 40}, # pg_upgrade tests are slow

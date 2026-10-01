@@ -21,7 +21,6 @@ static void create_rel_filename_map(const char *old_data, const char *new_data,
 static void report_unmatched_relation(const RelInfo *rel, const DbInfo *db,
 									  bool is_new_db);
 static void free_db_and_rel_infos(DbInfoArr *db_arr);
-static void get_template0_info(ClusterInfo *cluster);
 static void get_db_infos(ClusterInfo *cluster);
 static char *get_rel_infos_query(void);
 static void process_rel_infos(DbInfo *dbinfo, PGresult *res, void *arg);
@@ -198,6 +197,7 @@ create_rel_filename_map(const char *old_data, const char *new_data,
 	/* DB oid and relfilenumbers are preserved between old and new cluster */
 	map->db_oid = old_db->db_oid;
 	map->relfilenumber = old_rel->relfilenumber;
+	map->reloid = old_rel->reloid;
 
 	/* used only for logging and error reporting, old/new are identical */
 	map->nspname = old_rel->nspname;
@@ -328,12 +328,13 @@ get_db_rel_and_slot_infos(ClusterInfo *cluster)
  * Get information about template0, which will be copied from the old cluster
  * to the new cluster.
  */
-static void
+void
 get_template0_info(ClusterInfo *cluster)
 {
 	PGconn	   *conn = connectToServer(cluster, "template1");
 	DbLocaleInfo *locale;
 	PGresult   *dbres;
+	int			i_dboid;
 	int			i_datencoding;
 	int			i_datlocprovider;
 	int			i_datcollate;
@@ -342,19 +343,19 @@ get_template0_info(ClusterInfo *cluster)
 
 	if (GET_MAJOR_VERSION(cluster->major_version) >= 1700)
 		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, datlocprovider, "
+								  "SELECT oid, dattablespace, encoding, datlocprovider, "
 								  "       datcollate, datctype, datlocale "
 								  "FROM	pg_catalog.pg_database "
 								  "WHERE datname='template0'");
 	else if (GET_MAJOR_VERSION(cluster->major_version) >= 1500)
 		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, datlocprovider, "
+								  "SELECT oid, dattablespace, encoding, datlocprovider, "
 								  "       datcollate, datctype, daticulocale AS datlocale "
 								  "FROM	pg_catalog.pg_database "
 								  "WHERE datname='template0'");
 	else
 		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, 'c' AS datlocprovider, "
+								  "SELECT oid, dattablespace, encoding, 'c' AS datlocprovider, "
 								  "       datcollate, datctype, NULL AS datlocale "
 								  "FROM	pg_catalog.pg_database "
 								  "WHERE datname='template0'");
@@ -365,12 +366,16 @@ get_template0_info(ClusterInfo *cluster)
 
 	locale = pg_malloc_object(DbLocaleInfo);
 
+	i_dboid = PQfnumber(dbres, "oid");
 	i_datencoding = PQfnumber(dbres, "encoding");
 	i_datlocprovider = PQfnumber(dbres, "datlocprovider");
 	i_datcollate = PQfnumber(dbres, "datcollate");
 	i_datctype = PQfnumber(dbres, "datctype");
 	i_datlocale = PQfnumber(dbres, "datlocale");
 
+	locale->db_oid = atooid(PQgetvalue(dbres, 0, i_dboid));
+	locale->db_tablespace_oid = atooid(PQgetvalue(dbres, 0,
+												  PQfnumber(dbres, "dattablespace")));
 	locale->db_encoding = atoi(PQgetvalue(dbres, 0, i_datencoding));
 	locale->db_collprovider = PQgetvalue(dbres, 0, i_datlocprovider)[0];
 	locale->db_collate = pg_strdup(PQgetvalue(dbres, 0, i_datcollate));
@@ -401,13 +406,14 @@ get_db_infos(ClusterInfo *cluster)
 	int			ntups;
 	int			tupnum;
 	DbInfo	   *dbinfos;
-	int			i_oid,
+	int			i_dattablespace,
 				i_datname,
+				i_oid,
 				i_spclocation;
 	char		query[QUERY_ALLOC];
 
 	snprintf(query, sizeof(query),
-			 "SELECT d.oid, d.datname, "
+			 "SELECT d.oid, d.datname, d.dattablespace, "
 			 "pg_catalog.pg_tablespace_location(t.oid) AS spclocation "
 			 "FROM pg_catalog.pg_database d "
 			 " LEFT OUTER JOIN pg_catalog.pg_tablespace t "
@@ -419,6 +425,7 @@ get_db_infos(ClusterInfo *cluster)
 
 	i_oid = PQfnumber(res, "oid");
 	i_datname = PQfnumber(res, "datname");
+	i_dattablespace = PQfnumber(res, "dattablespace");
 	i_spclocation = PQfnumber(res, "spclocation");
 
 	ntups = PQntuples(res);
@@ -430,6 +437,8 @@ get_db_infos(ClusterInfo *cluster)
 		bool		inplace = spcloc[0] && !is_absolute_path(spcloc);
 
 		dbinfos[tupnum].db_oid = atooid(PQgetvalue(res, tupnum, i_oid));
+		dbinfos[tupnum].db_tablespace_oid = atooid(PQgetvalue(res, tupnum,
+															  i_dattablespace));
 		dbinfos[tupnum].db_name = pg_strdup(PQgetvalue(res, tupnum, i_datname));
 
 		/*
@@ -820,6 +829,101 @@ count_old_cluster_logical_slots(void)
 		slot_count += old_cluster.dbarr.dbs[dbnum].slot_arr.nslots;
 
 	return slot_count;
+}
+
+void
+get_old_cluster_physical_slot_infos(void)
+{
+	PGconn	   *conn;
+	PGresult   *res;
+	PhysicalSlotInfo *slotinfos = NULL;
+	int			num_slots;
+	int			i_has_restart_lsn;
+	int			i_invalidation_reason;
+	int			i_slotname;
+	int			i_wal_status;
+	uint32		source_major_version =
+		GET_MAJOR_VERSION(old_cluster.major_version);
+
+	old_cluster.phys_slot_arr.slots = NULL;
+	old_cluster.phys_slot_arr.nslots = 0;
+
+	if (!user_opts.wal_upgrade)
+		return;
+	if (source_major_version < 904)
+		return;
+
+	conn = connectToServer(&old_cluster, "template1");
+
+	/*
+	 * Collect persistent physical slots that must be valid and streaming
+	 * before HANDOFF and recreated in the new cluster.
+	 */
+	res = executeQueryOrDie(conn,
+							"SELECT slot_name, restart_lsn IS NOT NULL AS has_restart_lsn, "
+							"       %s AS wal_status, %s AS invalidation_reason "
+							"FROM pg_catalog.pg_replication_slots "
+							"WHERE slot_type = 'physical' AND "
+							"%s AND "
+							"%s "
+							"ORDER BY slot_name",
+							source_major_version >= 1300 ?
+							"wal_status" : "NULL::text",
+							source_major_version >= 1700 ?
+							"invalidation_reason" : "NULL::text",
+							source_major_version >= 1000 ?
+							"temporary IS FALSE" : "true",
+							source_major_version >= 1900 ?
+							"slot_name <> 'pg_conflict_detection'" : "true");
+
+	num_slots = PQntuples(res);
+	i_slotname = PQfnumber(res, "slot_name");
+	i_has_restart_lsn = PQfnumber(res, "has_restart_lsn");
+	i_wal_status = PQfnumber(res, "wal_status");
+	i_invalidation_reason = PQfnumber(res, "invalidation_reason");
+
+	if (num_slots)
+	{
+		slotinfos = pg_malloc_array(PhysicalSlotInfo, num_slots);
+
+		for (int slotnum = 0; slotnum < num_slots; slotnum++)
+			slotinfos[slotnum].slotname =
+				pg_strdup(PQgetvalue(res, slotnum, i_slotname));
+	}
+
+	old_cluster.phys_slot_arr.slots = slotinfos;
+	old_cluster.phys_slot_arr.nslots = num_slots;
+	if (num_slots > 0 && source_major_version < 1400)
+		pg_fatal("--wal-upgrade cannot migrate physical replication slots from "
+				 "source versions before PostgreSQL 14; drop the slots or "
+				 "upgrade the source first");
+
+	for (int slotnum = 0; slotnum < num_slots; slotnum++)
+	{
+		const char *slotname = slotinfos[slotnum].slotname;
+
+		if (strcmp(slotname, "pg_conflict_detection") == 0)
+			pg_fatal("physical replication slot \"%s\" uses a name reserved by the "
+					 "new cluster; drop or rename the slot before upgrading",
+					 slotname);
+		if (strcmp(PQgetvalue(res, slotnum, i_has_restart_lsn), "t") != 0)
+			pg_fatal("physical replication slot \"%s\" has no restart LSN; "
+					 "initialize its standby or drop the stale slot before upgrading",
+					 slotname);
+		if (!PQgetisnull(res, slotnum, i_invalidation_reason))
+			pg_fatal("physical replication slot \"%s\" is invalidated (%s); "
+					 "recreate its standby and slot or drop the stale slot before upgrading",
+					 slotname,
+					 PQgetvalue(res, slotnum, i_invalidation_reason));
+		if (!PQgetisnull(res, slotnum, i_wal_status) &&
+			strcmp(PQgetvalue(res, slotnum, i_wal_status), "lost") == 0)
+			pg_fatal("physical replication slot \"%s\" has lost required WAL; "
+					 "recreate its standby and slot or drop the stale slot before upgrading",
+					 slotname);
+	}
+
+	PQclear(res);
+	PQfinish(conn);
 }
 
 /*

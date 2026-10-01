@@ -17,12 +17,13 @@
 
 #include "access/transam.h"
 #include "access/xlogdefs.h"
+#include "common/relpath.h"
 #include "pgtime.h"				/* for pg_time_t */
 #include "port/pg_crc32c.h"
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	2001
+#define PG_CONTROL_VERSION	2002
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
@@ -83,12 +84,41 @@ typedef struct CheckPoint
 #define XLOG_FPI						0xB0
 #define XLOG_ASSIGN_LSN					0xC0
 #define XLOG_OVERWRITE_CONTRECORD		0xD0
+
+#define XLOG_UPGRADE_START			0x00	/* opens the upgrade window */
+#define XLOG_UPGRADE_COMPLETE		0x10	/* closes the upgrade window */
+#define XLOG_UPGRADE_RAWFILE			0x50	/* non-relation after-image
+												 * chunk */
+/* HANDOFF pauses old-major standbys after the next shutdown checkpoint. */
+#define XLOG_UPGRADE_HANDOFF			0x60
+/*
+ * RELINK applies DIRECTORY, RELATION, and FILE operations using INHERIT,
+ * CREATE, RECREATE, or DELETE.
+ */
+#define XLOG_UPGRADE_RELINK				0x70
 #define XLOG_CHECKPOINT_REDO			0xE0
 #define XLOG_LOGICAL_DECODING_STATUS_CHANGE	0xF0
 
 /* XLOG info values for XLOG2 rmgr */
 #define XLOG2_CHECKSUMS					0x00
 
+/* HANDOFF names the source and target majors and records its emission time. */
+typedef struct xl_pg_upgrade_handoff
+{
+	uint32		old_major_version;
+	uint32		target_major_version;
+	pg_time_t	handoff_time;
+} xl_pg_upgrade_handoff;
+
+#define SizeOfPgUpgradeHandoff	sizeof(xl_pg_upgrade_handoff)
+
+#define UPGRADE_SLRU_DIRS		{ "pg_xact", "pg_multixact/offsets", "pg_multixact/members" }
+
+#define UPGRADE_RELINK_MODE_CLONE			0
+#define UPGRADE_RELINK_MODE_COPY			1
+#define UPGRADE_RELINK_MODE_COPY_FILE_RANGE	2
+#define UPGRADE_RELINK_MODE_LINK			3
+#define UPGRADE_RELINK_MODE_SWAP			4
 
 /*
  * System status indicator.  Note this is stored in pg_control; if you change
@@ -103,6 +133,8 @@ typedef enum DBState
 	DB_IN_CRASH_RECOVERY,
 	DB_IN_ARCHIVE_RECOVERY,
 	DB_IN_PRODUCTION,
+
+	DB_IN_UPGRADE,
 } DBState;
 
 /*
@@ -269,6 +301,12 @@ typedef struct ControlFileData
 	 * the cluster is initialized.
 	 */
 	bool		default_char_signedness;
+
+	/* The completion checkpoint or restartpoint is durable. */
+	bool		upgrade_finalized;
+
+	/* Emission reserved this target, or recovery replayed START. */
+	bool		upgrade_started;
 
 	/*
 	 * Random nonce, used in authentication requests that need to proceed

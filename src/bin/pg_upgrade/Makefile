@@ -18,6 +18,8 @@ OBJS = \
 	file.o \
 	function.o \
 	info.o \
+	upgrade_catalogs.o \
+	emit_upgrade_wal.o \
 	multixact_read_v18.o \
 	multixact_rewrite.o \
 	option.o \
@@ -29,7 +31,8 @@ OBJS = \
 	tablespace.o \
 	task.o \
 	util.o \
-	version.o
+	version.o \
+	prepare_upgrade.o
 
 override CPPFLAGS := -I$(srcdir) -I$(libpq_srcdir) $(CPPFLAGS)
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)

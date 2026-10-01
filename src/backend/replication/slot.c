@@ -186,7 +186,8 @@ static XLogRecPtr ss_oldest_flush_lsn = InvalidXLogRecPtr;
 
 static void ReplicationSlotShmemExit(int code, Datum arg);
 static bool IsSlotForConflictCheck(const char *name);
-static void ReplicationSlotDropPtr(ReplicationSlot *slot);
+static void ReplicationSlotDropPtr(ReplicationSlot *slot,
+								   bool allocation_lock_held);
 
 /* internal persistency functions */
 static void RestoreSlotFromDisk(const char *name);
@@ -430,6 +431,13 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 	 * might both be monkeying with the same directory.
 	 */
 	LWLockAcquire(ReplicationSlotAllocationLock, LW_EXCLUSIVE);
+	if (!db_specific && persistency == RS_PERSISTENT &&
+		!IsSlotForConflictCheck(name) &&
+		(XLogRecPtrIsValid(GetPgUpgradeHandoffRetention()) ||
+		 PgUpgradeHandoffSlotsAreFrozen()))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot create a persistent physical replication slot during pg_upgrade handoff")));
 
 	/*
 	 * Check for name collision (across the whole array), and identify an
@@ -494,6 +502,7 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 	slot->candidate_restart_lsn = InvalidXLogRecPtr;
 	slot->last_saved_confirmed_flush = InvalidXLogRecPtr;
 	slot->last_saved_restart_lsn = InvalidXLogRecPtr;
+	slot->handoff_restart_lsn_floor = InvalidXLogRecPtr;
 	slot->inactive_since = 0;
 	slot->slotsync_skip_reason = SS_SKIP_NONE;
 
@@ -901,7 +910,7 @@ restart:
 			if (SlotIsLogical(s))
 				dropped_logical = true;
 
-			ReplicationSlotDropPtr(s);
+			ReplicationSlotDropPtr(s, false);
 
 			ConditionVariableBroadcast(&s->active_cv);
 			goto restart;
@@ -1047,11 +1056,24 @@ ReplicationSlotDropAcquired(bool try_disable)
 
 	/* Can only disable logical decoding if slot is logical */
 	Assert(!try_disable || SlotIsLogical(slot));
+	LWLockAcquire(ReplicationSlotAllocationLock, LW_EXCLUSIVE);
+	if (SlotIsPhysical(slot) &&
+		slot->data.persistency == RS_PERSISTENT &&
+		!IsSlotForConflictCheck(NameStr(slot->data.name)) &&
+		(XLogRecPtrIsValid(GetPgUpgradeHandoffRetention()) ||
+		 PgUpgradeHandoffSlotsAreFrozen()))
+	{
+		LWLockRelease(ReplicationSlotAllocationLock);
+		ReplicationSlotRelease();
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot drop a persistent physical replication slot during pg_upgrade handoff")));
+	}
 
 	/* slot isn't acquired anymore */
 	MyReplicationSlot = NULL;
 
-	ReplicationSlotDropPtr(slot);
+	ReplicationSlotDropPtr(slot, true);
 
 	if (try_disable)
 		RequestDisableLogicalDecoding();
@@ -1060,9 +1082,12 @@ ReplicationSlotDropAcquired(bool try_disable)
 /*
  * Permanently drop the replication slot which will be released by the point
  * this function returns.
+ *
+ * If allocation_lock_held is true, the caller holds
+ * ReplicationSlotAllocationLock.  It is released before return.
  */
 static void
-ReplicationSlotDropPtr(ReplicationSlot *slot)
+ReplicationSlotDropPtr(ReplicationSlot *slot, bool allocation_lock_held)
 {
 	char		path[MAXPGPATH];
 	char		tmppath[MAXPGPATH];
@@ -1072,7 +1097,8 @@ ReplicationSlotDropPtr(ReplicationSlot *slot)
 	 * to delete a slot with a certain name while someone else was trying to
 	 * create a slot with the same name.
 	 */
-	LWLockAcquire(ReplicationSlotAllocationLock, LW_EXCLUSIVE);
+	if (!allocation_lock_held)
+		LWLockAcquire(ReplicationSlotAllocationLock, LW_EXCLUSIVE);
 
 	/* Generate pathnames. */
 	sprintf(path, "%s/%s", PG_REPLSLOT_DIR, NameStr(slot->data.name));
@@ -1877,7 +1903,13 @@ ReportSlotInvalidation(ReplicationSlotInvalidationCause cause,
 static inline bool
 CanInvalidateIdleSlot(ReplicationSlot *s)
 {
+	/*
+	 * Binary upgrade and active HANDOFF WAL retention disable idle timeout
+	 * invalidation.
+	 */
 	return (idle_replication_slot_timeout_secs != 0 &&
+			!IsBinaryUpgrade &&
+			!XLogRecPtrIsValid(GetPgUpgradeHandoffRetention()) &&
 			XLogRecPtrIsValid(s->data.restart_lsn) &&
 			s->inactive_since > 0 &&
 			!(RecoveryInProgress() && s->data.synced));
@@ -2228,6 +2260,7 @@ InvalidateObsoleteReplicationSlots(uint32 possible_causes,
 								   TransactionId snapshotConflictHorizon)
 {
 	XLogRecPtr	oldestLSN;
+	bool		handoff_slots_frozen;
 	bool		invalidated = false;
 	bool		invalidated_logical = false;
 	bool		found_valid_logicalslot;
@@ -2238,6 +2271,10 @@ InvalidateObsoleteReplicationSlots(uint32 possible_causes,
 
 	if (max_replication_slots == 0 && max_repack_replication_slots == 0)
 		return invalidated;
+	handoff_slots_frozen =
+		(possible_causes & RS_INVAL_IDLE_TIMEOUT) != 0 &&
+		(XLogRecPtrIsValid(GetPgUpgradeHandoffRetention()) ||
+		 PgUpgradeHandoffSlotsAreFrozen());
 
 	XLogSegNoOffsetToRecPtr(oldestSegno, 0, wal_segment_size, oldestLSN);
 
@@ -2248,8 +2285,15 @@ restart:
 	{
 		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
 		bool		released_lock = false;
+		uint32		slot_causes = possible_causes;
 
 		if (!s->in_use)
+			continue;
+		if (handoff_slots_frozen && SlotIsPhysical(s) &&
+			s->data.persistency == RS_PERSISTENT &&
+			!IsSlotForConflictCheck(NameStr(s->data.name)))
+			slot_causes &= ~RS_INVAL_IDLE_TIMEOUT;
+		if (slot_causes == RS_INVAL_NONE)
 			continue;
 
 		/* Prevent invalidation of logical slots during binary upgrade */
@@ -2262,7 +2306,7 @@ restart:
 			continue;
 		}
 
-		if (InvalidatePossiblyObsoleteSlot(possible_causes, s, oldestLSN,
+		if (InvalidatePossiblyObsoleteSlot(slot_causes, s, oldestLSN,
 										   dboid, snapshotConflictHorizon,
 										   &released_lock))
 		{
@@ -2397,6 +2441,80 @@ CheckPointReplicationSlots(bool is_shutdown)
 	 * last_saved_restart_lsn for any slot.
 	 */
 	if (last_saved_restart_lsn_updated)
+		ReplicationSlotsComputeRequiredLSN();
+}
+
+/*
+ * Clear every HANDOFF restart-LSN floor. Save each slot that had a floor and
+ * each physical slot whose saved restart_lsn is ahead of its in-memory value.
+ * The caller holds ReplicationSlotAllocationLock exclusively.
+ */
+void
+ReplicationSlotsClearPgUpgradeHandoffFloors(void)
+{
+	int			nslots = max_replication_slots + max_repack_replication_slots;
+	bool		saved_any = false;
+
+	Assert(LWLockHeldByMeInMode(ReplicationSlotAllocationLock, LW_EXCLUSIVE));
+
+	if (nslots == 0)
+		return;
+
+	for (int i = 0; i < nslots; i++)
+	{
+		ReplicationSlot *slot = &ReplicationSlotCtl->replication_slots[i];
+		char		path[MAXPGPATH];
+		bool		had_floor;
+		bool		must_save;
+
+		if (!slot->in_use)
+			continue;
+
+		SpinLockAcquire(&slot->mutex);
+		had_floor = XLogRecPtrIsValid(slot->handoff_restart_lsn_floor);
+		must_save = had_floor ||
+			(SlotIsPhysical(slot) &&
+			 XLogRecPtrIsValid(slot->last_saved_restart_lsn) &&
+			 (!XLogRecPtrIsValid(slot->data.restart_lsn) ||
+			  slot->last_saved_restart_lsn > slot->data.restart_lsn));
+		if (had_floor)
+			slot->handoff_restart_lsn_floor = InvalidXLogRecPtr;
+		if (must_save)
+		{
+			slot->just_dirtied = true;
+			slot->dirty = true;
+		}
+		SpinLockRelease(&slot->mutex);
+
+		if (!must_save)
+			continue;
+
+		sprintf(path, "%s/%s", PG_REPLSLOT_DIR, NameStr(slot->data.name));
+		for (;;)
+		{
+			bool		resave;
+
+			SaveSlotToPath(slot, path, PANIC);
+
+			SpinLockAcquire(&slot->mutex);
+			resave = XLogRecPtrIsValid(slot->last_saved_restart_lsn) &&
+				(!XLogRecPtrIsValid(slot->data.restart_lsn) ||
+				 slot->last_saved_restart_lsn > slot->data.restart_lsn);
+			if (resave)
+			{
+				slot->just_dirtied = true;
+				slot->dirty = true;
+			}
+			SpinLockRelease(&slot->mutex);
+
+			if (!resave)
+				break;
+			CHECK_FOR_INTERRUPTS();
+		}
+		saved_any = true;
+	}
+
+	if (saved_any)
 		ReplicationSlotsComputeRequiredLSN();
 }
 
@@ -2581,6 +2699,10 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 	SpinLockAcquire(&slot->mutex);
 
 	memcpy(&cp.slotdata, &slot->data, sizeof(ReplicationSlotPersistentData));
+	if (XLogRecPtrIsValid(slot->handoff_restart_lsn_floor) &&
+		(!XLogRecPtrIsValid(cp.slotdata.restart_lsn) ||
+		 cp.slotdata.restart_lsn < slot->handoff_restart_lsn_floor))
+		cp.slotdata.restart_lsn = slot->handoff_restart_lsn_floor;
 
 	SpinLockRelease(&slot->mutex);
 
@@ -2677,8 +2799,13 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 	 * already and remember the confirmed_flush LSN value.
 	 */
 	SpinLockAcquire(&slot->mutex);
-	if (!slot->just_dirtied)
+	if (!slot->just_dirtied &&
+		(!XLogRecPtrIsValid(slot->handoff_restart_lsn_floor) ||
+		 slot->data.restart_lsn == cp.slotdata.restart_lsn))
 		slot->dirty = false;
+	else if (XLogRecPtrIsValid(slot->handoff_restart_lsn_floor) &&
+			 slot->data.restart_lsn != cp.slotdata.restart_lsn)
+		slot->dirty = true;
 	slot->last_saved_confirmed_flush = cp.slotdata.confirmed_flush;
 	slot->last_saved_restart_lsn = cp.slotdata.restart_lsn;
 	SpinLockRelease(&slot->mutex);
@@ -2904,6 +3031,7 @@ RestoreSlotFromDisk(const char *name)
 		slot->effective_catalog_xmin = cp.slotdata.catalog_xmin;
 		slot->last_saved_confirmed_flush = cp.slotdata.confirmed_flush;
 		slot->last_saved_restart_lsn = cp.slotdata.restart_lsn;
+		slot->handoff_restart_lsn_floor = InvalidXLogRecPtr;
 
 		slot->candidate_catalog_xmin = InvalidTransactionId;
 		slot->candidate_xmin_lsn = InvalidXLogRecPtr;

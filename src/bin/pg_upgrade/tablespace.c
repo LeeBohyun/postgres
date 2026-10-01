@@ -56,10 +56,10 @@ get_tablespace_paths(void)
 	char		query[QUERY_ALLOC];
 
 	snprintf(query, sizeof(query),
-			 "SELECT pg_catalog.pg_tablespace_location(oid) AS spclocation "
+			 "SELECT oid, pg_catalog.pg_tablespace_location(oid) AS spclocation "
 			 "FROM	pg_catalog.pg_tablespace "
 			 "WHERE	spcname != 'pg_default' AND "
-			 "		spcname != 'pg_global'");
+			 "		spcname != 'pg_global' ORDER BY oid");
 
 	res = executeQueryOrDie(conn, "%s", query);
 
@@ -72,6 +72,8 @@ get_tablespace_paths(void)
 			pg_malloc_array(char *, old_cluster.num_tablespaces);
 		new_cluster.tablespaces =
 			pg_malloc_array(char *, new_cluster.num_tablespaces);
+		old_cluster.tablespace_oids = new_cluster.tablespace_oids =
+			pg_malloc_array(Oid, old_cluster.num_tablespaces);
 	}
 	else
 	{
@@ -85,6 +87,11 @@ get_tablespace_paths(void)
 	{
 		struct stat statBuf;
 		char	   *spcloc = PQgetvalue(res, tblnum, i_spclocation);
+
+		if (PQgetisnull(res, tblnum, 0) ||
+			PQgetisnull(res, tblnum, i_spclocation) || spcloc[0] == '\0')
+			pg_fatal("invalid tablespace location in catalog query");
+		old_cluster.tablespace_oids[tblnum] = atooid(PQgetvalue(res, tblnum, 0));
 
 		/*
 		 * For now, we do not expect non-in-place tablespaces to move during

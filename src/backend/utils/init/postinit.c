@@ -101,6 +101,37 @@ static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
 static void EmitConnectionWarnings(void);
 
+#ifdef WIN32
+static bool
+IsLoopbackAddress(const SockAddr *address)
+{
+	if (address->addr.ss_family == AF_INET)
+	{
+		const struct sockaddr_in *addr =
+			(const struct sockaddr_in *) &address->addr;
+
+		return (pg_ntoh32(addr->sin_addr.s_addr) & 0xff000000U) ==
+			0x7f000000U;
+	}
+	else if (address->addr.ss_family == AF_INET6)
+	{
+		static const unsigned char ipv6_loopback[16] =
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+		static const unsigned char ipv4_mapped_prefix[12] =
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+		const struct sockaddr_in6 *addr =
+			(const struct sockaddr_in6 *) &address->addr;
+		const unsigned char *bytes = addr->sin6_addr.s6_addr;
+
+		return memcmp(bytes, ipv6_loopback, sizeof(ipv6_loopback)) == 0 ||
+			(memcmp(bytes, ipv4_mapped_prefix,
+					sizeof(ipv4_mapped_prefix)) == 0 && bytes[12] == 127);
+	}
+
+	return false;
+}
+#endif
+
 
 /*** InitPostgres support ***/
 
@@ -727,6 +758,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
 	bool		am_superuser;
+	bool		binary_upgrade_replication = false;
 	char	   *fullpath;
 	char		dbname[NAMEDATALEN];
 	int			nfree = 0;
@@ -963,10 +995,27 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		pgstat_bestart_security();
 	}
 
-	/*
-	 * Binary upgrades only allowed super-user connections
-	 */
-	if (IsBinaryUpgrade && !am_superuser)
+	if (IsBinaryUpgrade && MyProcPort != NULL)
+	{
+		bool		binary_upgrade_control;
+
+		binary_upgrade_replication = am_walsender && !am_db_walsender;
+#ifndef WIN32
+		binary_upgrade_control = !am_walsender &&
+			MyProcPort->raddr.addr.ss_family == AF_UNIX;
+#else
+		binary_upgrade_control = !am_walsender &&
+			IsLoopbackAddress(&MyProcPort->raddr);
+#endif
+		if (!binary_upgrade_control && !binary_upgrade_replication)
+			ereport(FATAL,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("only local control connections and physical replication connections are allowed during upgrade handoff")));
+	}
+
+	/* Binary upgrades otherwise allow only superuser connections. */
+	if (IsBinaryUpgrade && !am_superuser &&
+		!binary_upgrade_replication)
 	{
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),

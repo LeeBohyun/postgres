@@ -188,6 +188,7 @@ start_conn(const ClusterInfo *cluster, UpgradeTaskSlot *slot)
 		appendPQExpBufferStr(&conn_opts, " host=");
 		appendConnStrVal(&conn_opts, cluster->sockdir);
 	}
+
 	if (!protocol_negotiation_supported(cluster))
 		appendPQExpBufferStr(&conn_opts, " max_protocol_version=3.0");
 

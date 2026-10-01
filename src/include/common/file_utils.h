@@ -31,6 +31,24 @@ typedef enum DataDirSyncMethod
 } DataDirSyncMethod;
 
 struct iovec;					/* avoid including port/pg_iovec.h here */
+struct stat;
+
+typedef struct PGFileIdentity
+{
+	uint64		device;
+	uint64		file;
+} PGFileIdentity;
+
+extern bool pg_get_file_identity(const char *path, const struct stat *st,
+								 PGFileIdentity *identity);
+
+static inline int
+pg_compare_file_identity(PGFileIdentity a, PGFileIdentity b)
+{
+	if (a.device != b.device)
+		return (a.device > b.device) - (a.device < b.device);
+	return (a.file > b.file) - (a.file < b.file);
+}
 
 #ifdef FRONTEND
 extern int	pre_sync_fname(const char *fname, bool isdir);
@@ -58,6 +76,18 @@ extern ssize_t pg_pwritev_with_retry(int fd,
 									 pgoff_t offset);
 
 extern ssize_t pg_pwrite_zeros(int fd, size_t size, pgoff_t offset);
+
+typedef enum PGReflinkResult
+{
+	PG_REFLINK_OK,
+	PG_REFLINK_UNSUPPORTED,
+	PG_REFLINK_ERROR,
+} PGReflinkResult;
+
+extern PGReflinkResult pg_clone_file(const char *src, const char *dst,
+									 int *save_errno);
+extern PGReflinkResult pg_copy_file_range_all(const char *src, const char *dst,
+											  int *save_errno);
 
 /* Filename components */
 #define PG_TEMP_FILES_DIR "pgsql_tmp"

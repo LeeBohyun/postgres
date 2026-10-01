@@ -18,6 +18,7 @@ OBJS = \
 	generic_xlog.o \
 	multixact.o \
 	parallel.o \
+	pgupgrade_emit.o \
 	rmgr.o \
 	slru.o \
 	subtrans.o \
@@ -37,7 +38,8 @@ OBJS = \
 	xlogrecovery.o \
 	xlogstats.o \
 	xlogutils.o \
-	xlogwait.o
+	xlogwait.o \
+	pgupgrade_wal.o
 
 include $(top_srcdir)/src/backend/common.mk
 
