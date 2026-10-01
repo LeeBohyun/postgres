@@ -4,6 +4,9 @@ These manual programs exercise WAL upgrade with larger and more varied
 fixtures than the TAP tests.  They are not part of the PostgreSQL test suite
 and are not required to apply the WAL-upgrade patch.
 
+For an overview of the design and motivation, see
+[The case for WAL-logging pg_upgrade](../../doc/high-level/wal-logging-pg-upgrade-v2.pdf).
+
 The programs require:
 
 - A Unix-like host with Python 3.10 or newer
