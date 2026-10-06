@@ -32,7 +32,7 @@
 
 /*
  * Base directories that include all the files generated internally, from the
- * root path of the new cluster.  The paths are dynamically built as of
+ * selected output root.  The paths are dynamically built as of
  * BASE_OUTPUTDIR/$timestamp/{LOG_OUTPUTDIR,DUMP_OUTPUTDIR} to ensure their
  * uniqueness in each run.
  */
@@ -368,6 +368,7 @@ extern OSInfo os_info;
 void		output_check_banner(void);
 void		check_and_dump_old_cluster(void);
 void		check_new_cluster(void);
+void		check_new_cluster_tablespace_dirs(void);
 void		report_clusters_compatible(void);
 void		issue_warnings_and_set_wal_level(void);
 void		output_completion_banner(char *deletion_script_file_name);
@@ -380,6 +381,7 @@ void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
 
 void		get_control_data(ClusterInfo *cluster);
 void		check_control_data(ControlData *oldctrl, ControlData *newctrl);
+void		check_old_control_data(ControlData *oldctrl);
 void		disable_old_cluster(transferMode transfer_mode);
 
 
@@ -397,7 +399,6 @@ bool		exec_prog(const char *log_filename, const char *opt_log_file,
 void		check_current_dir_write_permissions(void);
 void		check_bin_dir(ClusterInfo *cluster, bool check_versions);
 void		check_data_dir(ClusterInfo *cluster);
-void		get_bin_version(ClusterInfo *cluster);
 bool		pid_lock_file_exists(const char *datadir);
 
 
