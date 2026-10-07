@@ -7,7 +7,8 @@ EXTRA_INSTALL=contrib/dblink \
 	contrib/postgres_fdw \
 	contrib/test_decoding \
 	src/test/modules/dummy_seclabel \
-	src/test/modules/test_extensions
+	src/test/modules/test_extensions \
+	src/test/modules/test_slru
 
 subdir = src/bin/pg_upgrade
 top_builddir = ../../..
