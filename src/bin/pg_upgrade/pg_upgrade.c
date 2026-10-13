@@ -69,9 +69,8 @@ static void create_new_objects(void);
 static void copy_xact_xlog_xid(void);
 static void set_frozenxids(void);
 static void make_outputdirs(const char *output_root);
-static void setup(char *argv0);
-static void resolve_new_bindir(const char *argv0);
-static bool prepare_new_cluster_initdb(const char *argv0);
+static void check_bin_dirs(const char *argv0);
+static void check_clusters_stopped(void);
 static bool check_new_cluster_initdb_target(void);
 static void get_old_cluster_initdb_info(void);
 static void build_new_cluster_initdb_cmd(PQExpBuffer cmd);
@@ -115,11 +114,23 @@ main(int argc, char **argv)
 
 	get_restricted_token();
 
+	/*
+	 * Make sure the user has a clean environment, otherwise, we may confuse
+	 * libpq when we connect to one (or both) of the servers.
+	 */
+	check_pghost_envvar();
+
+	/*
+	 * Resolve old and new binary dirs before adjust_data_dir(), because
+	 * adjust_data_dir() might need to call the binaries.
+	 */
+	check_bin_dirs(argv[0]);
+
 	adjust_data_dir(&old_cluster);
 	adjust_data_dir(&new_cluster);
 
 	if (user_opts.initdb_new_cluster &&
-		prepare_new_cluster_initdb(argv[0]))
+		check_new_cluster_initdb_target())
 	{
 		/* Match output-file permissions to the cluster being inspected. */
 		if (!GetDataDirectoryCreatePerm(old_cluster.pgdata))
@@ -153,7 +164,11 @@ main(int argc, char **argv)
 	 */
 	make_outputdirs(new_cluster.pgdata);
 
-	setup(argv[0]);
+	check_current_dir_write_permissions();
+
+	check_data_dir(&old_cluster);
+	check_data_dir(&new_cluster);
+	check_clusters_stopped();
 
 	output_check_banner();
 
@@ -402,14 +417,11 @@ make_outputdirs(const char *output_root)
 
 
 /*
- * resolve_new_bindir()
- *
- * If new_cluster.bindir was not set by -B or PGBINNEW, derive it from the
- * path of the currently executing pg_upgrade binary.  Safe to call more than
- * once.
+ * Resolve the new binary directory from pg_upgrade's path when -B or
+ * PGBINNEW was not specified, then validate both clusters' binaries.
  */
 static void
-resolve_new_bindir(const char *argv0)
+check_bin_dirs(const char *argv0)
 {
 	if (!new_cluster.bindir)
 	{
@@ -422,20 +434,9 @@ resolve_new_bindir(const char *argv0)
 		canonicalize_path(exec_path);
 		new_cluster.bindir = pg_strdup(exec_path);
 	}
-}
 
-
-/*
- * Validate the new binaries and decide whether initdb is needed before
- * creating output files or starting either cluster.
- */
-static bool
-prepare_new_cluster_initdb(const char *argv0)
-{
-	check_pghost_envvar();
-	resolve_new_bindir(argv0);
+	check_bin_dir(&old_cluster, false);
 	check_bin_dir(&new_cluster, true);
-	return check_new_cluster_initdb_target();
 }
 
 
@@ -495,7 +496,10 @@ get_old_cluster_initdb_info(void)
 	if (!old_cluster.sockdir)
 		old_cluster.sockdir = user_opts.socketdir ? user_opts.socketdir : ".";
 
-	/* Allow a running old server for --check, as setup() does. */
+	/*
+	 * Allow a running old server for --check, as check_clusters_stopped()
+	 * does.
+	 */
 	if (pid_lock_file_exists(old_cluster.pgdata))
 	{
 		if (start_postmaster(&old_cluster, false))
@@ -618,23 +622,8 @@ create_new_cluster_via_initdb(void)
 
 
 static void
-setup(char *argv0)
+check_clusters_stopped(void)
 {
-	/*
-	 * make sure the user has a clean environment, otherwise, we may confuse
-	 * libpq when we connect to one (or both) of the servers.
-	 */
-	check_pghost_envvar();
-
-	/*
-	 * In case the user hasn't specified the directory for the new binaries
-	 * with -B, default to using the path of the currently executed pg_upgrade
-	 * binary.
-	 */
-	resolve_new_bindir(argv0);
-
-	verify_directories();
-
 	/* no postmasters should be running, except for a live check */
 	if (pid_lock_file_exists(old_cluster.pgdata))
 	{
