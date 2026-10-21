@@ -758,12 +758,7 @@ report_clusters_compatible(void)
 		/* stops new cluster */
 		stop_postmaster(false);
 
-		/*
-		 * --initdb defers syncing until pg_upgrade finishes.  Sync the
-		 * retained cluster before returning from --check.
-		 */
-		if (user_opts.initdb_new_cluster)
-			sync_new_cluster(true);
+		cleanup_initdb_cluster();
 
 		cleanup_output_dirs();
 		exit(0);
