@@ -228,6 +228,9 @@ static const char *const backend_options = "--single -F -O -j -c search_path=pg_
 
 /* Additional switches to pass to backend (either boot or standalone) */
 static char *extra_options = "";
+static char *pg_upgrade_state_file = NULL;
+static char *pg_upgrade_wal_parent = NULL;
+static mode_t pg_upgrade_wal_mode;
 
 static const char *const subdirs[] = {
 	"global",
@@ -280,6 +283,7 @@ static bool test_specific_config_settings(int test_conns, int test_av_slots,
 										  int test_buffs);
 static void setup_config(void);
 static void bootstrap_template1(void);
+static void write_pg_upgrade_state(void);
 static void setup_auth(FILE *cmdfd);
 static void get_su_pwd(void);
 static void setup_depend(FILE *cmdfd);
@@ -769,7 +773,9 @@ cleanup_directories_atexit(void)
 		{
 			pg_log_info("removing contents of data directory \"%s\"",
 						pg_data);
-			if (!rmtree(pg_data, false))
+			if (!(pg_upgrade_state_file ?
+				  rmtree_except(pg_data, "pg_upgrade_output.d") :
+				  rmtree(pg_data, false)))
 				pg_log_error("failed to remove contents of data directory");
 		}
 
@@ -1542,6 +1548,26 @@ setup_config(void)
 	check_ok();
 }
 
+
+/*
+ * Save the external WAL directory's original state for
+ * pg_upgrade --check --initdb. After checking, pg_upgrade removes generated
+ * WAL files and newly created directories, preserves any pre-existing WAL
+ * directory, and restores its original permissions.
+ */
+static void
+write_pg_upgrade_state(void)
+{
+	FILE	   *state = fopen(pg_upgrade_state_file, "w");
+
+	if (!state)
+		pg_fatal("could not open file \"%s\": %m", pg_upgrade_state_file);
+	if (fprintf(state, "%d %o\n%s\n%s\n", found_existing_xlogdir,
+				pg_upgrade_wal_mode, xlog_dir ? xlog_dir : "",
+				pg_upgrade_wal_parent ? pg_upgrade_wal_parent : "") < 0 ||
+		fclose(state) != 0)
+		pg_fatal("could not write file \"%s\": %m", pg_upgrade_state_file);
+}
 
 /*
  * run the BKI script in bootstrap mode to create template1
@@ -2900,8 +2926,10 @@ void
 create_data_directory(void)
 {
 	int			ret;
+	mode_t		pgdata_mode = pg_dir_create_mode;
 
-	switch ((ret = pg_check_dir(pg_data)))
+	switch ((ret = pg_check_dir_except(pg_data,
+									   pg_upgrade_state_file ? "pg_upgrade_output.d" : NULL)))
 	{
 		case 0:
 			/* PGDATA not there, must create it */
@@ -2923,7 +2951,19 @@ create_data_directory(void)
 				   pg_data);
 			fflush(stdout);
 
-			if (chmod(pg_data, pg_dir_create_mode) != 0)
+#ifndef WIN32
+			if (pg_upgrade_state_file)
+			{
+				struct stat st;
+
+				/* Preserve setgid inherited when pg_upgrade created PGDATA. */
+				if (stat(pg_data, &st) != 0)
+					pg_fatal("could not read permissions of directory \"%s\": %m",
+							 pg_data);
+				pgdata_mode |= st.st_mode & S_ISGID;
+			}
+#endif
+			if (chmod(pg_data, pgdata_mode) != 0)
 				pg_fatal("could not change permissions of directory \"%s\": %m",
 						 pg_data);
 			else
@@ -2980,6 +3020,20 @@ create_xlog_or_symlink(void)
 					   xlog_dir);
 				fflush(stdout);
 
+				if (pg_upgrade_state_file)
+				{
+					struct stat st;
+
+					pg_upgrade_wal_parent = pg_strdup(xlog_dir);
+					while (stat(pg_upgrade_wal_parent, &st) != 0 && errno == ENOENT)
+					{
+						size_t		len = strlen(pg_upgrade_wal_parent);
+
+						get_parent_directory(pg_upgrade_wal_parent);
+						if (strlen(pg_upgrade_wal_parent) == len)
+							break;
+					}
+				}
 				if (pg_mkdir_p(xlog_dir, pg_dir_create_mode) != 0)
 					pg_fatal("could not create directory \"%s\": %m",
 							 xlog_dir);
@@ -2995,6 +3049,14 @@ create_xlog_or_symlink(void)
 					   xlog_dir);
 				fflush(stdout);
 
+				if (pg_upgrade_state_file)
+				{
+					struct stat st;
+
+					if (stat(xlog_dir, &st) != 0)
+						pg_fatal("could not read permissions of directory \"%s\": %m", xlog_dir);
+					pg_upgrade_wal_mode = st.st_mode & 07777;
+				}
 				if (chmod(xlog_dir, pg_dir_create_mode) != 0)
 					pg_fatal("could not change permissions of directory \"%s\": %m",
 							 xlog_dir);
@@ -3207,6 +3269,8 @@ main(int argc, char *argv[])
 		{"sync-method", required_argument, NULL, 19},
 		{"no-data-checksums", no_argument, NULL, 20},
 		{"no-sync-data-files", no_argument, NULL, 21},
+		/* internal option for pg_upgrade */
+		{"for-pg-upgrade", required_argument, NULL, 22},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3404,6 +3468,9 @@ main(int argc, char *argv[])
 			case 21:
 				sync_data_files = false;
 				break;
+			case 22:
+				pg_upgrade_state_file = pg_strdup(optarg);
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -3567,6 +3634,9 @@ main(int argc, char *argv[])
 		destroyPQExpBuffer(start_db_cmd);
 	}
 
+
+	if (pg_upgrade_state_file)
+		write_pg_upgrade_state();
 
 	success = true;
 	return 0;

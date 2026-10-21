@@ -326,6 +326,7 @@ extern ssize_t pgreadlink(const char *path, char *buf, size_t size);
 #endif
 
 extern bool rmtree(const char *path, bool rmtopdir);
+extern bool rmtree_except(const char *path, const char *exclude);
 
 #if defined(WIN32) && !defined(__CYGWIN__)
 
@@ -537,6 +538,7 @@ extern bool pg_strong_random(void *buf, size_t len);
 
 /* port/pgcheckdir.c */
 extern int	pg_check_dir(const char *dir);
+extern int	pg_check_dir_except(const char *dir, const char *exclude);
 
 /* port/pgmkdirp.c */
 extern int	pg_mkdir_p(char *path, int omode);
