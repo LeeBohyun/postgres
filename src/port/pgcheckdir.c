@@ -16,6 +16,7 @@
 #include "c.h"
 
 #include <dirent.h>
+#include <sys/stat.h>
 
 
 /*
@@ -31,6 +32,16 @@
  */
 int
 pg_check_dir(const char *dir)
+{
+	return pg_check_dir_except(dir, NULL);
+}
+
+/*
+ * Return the same status codes as pg_check_dir(), ignoring the top-level
+ * entry named exclude only if it is a directory.
+ */
+int
+pg_check_dir_except(const char *dir, const char *exclude)
 {
 	int			result = 1;
 	DIR		   *chkdir;
@@ -50,6 +61,17 @@ pg_check_dir(const char *dir)
 		{
 			/* skip this and parent directory */
 			continue;
+		}
+		if (exclude && strcmp(file->d_name, exclude) == 0)
+		{
+			char		path[MAXPGPATH];
+			struct stat st;
+
+			snprintf(path, sizeof(path), "%s/%s", dir, exclude);
+			if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+				continue;
+			result = 4;
+			break;
 		}
 #ifndef WIN32
 		/* file starts with "." */

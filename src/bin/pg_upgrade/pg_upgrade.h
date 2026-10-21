@@ -443,6 +443,7 @@ void		get_sock_dir(ClusterInfo *cluster);
 
 /* pg_upgrade.c */
 
+void		cleanup_initdb_cluster(void);
 void		sync_new_cluster(bool sync_data_files);
 
 /* relfilenumber.c */
