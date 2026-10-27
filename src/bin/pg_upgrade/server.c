@@ -318,7 +318,7 @@ stop_postmaster(bool in_atexit)
 
 	/*
 	 * Clear the running-cluster marker only after confirmed shutdown.
-	 * Otherwise, --check --initdb cleanup could delete data still in use.
+	 * Otherwise, --initdb cleanup could delete data still in use.
 	 */
 	if (!stopped)
 		return;

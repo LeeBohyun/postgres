@@ -301,8 +301,10 @@ PostgreSQL documentation
        <para>
         Failed initialization follows
         <command>initdb</command>'s normal cleanup, including <option>--no-clean</option>.
-        Without <option>--check</option>, a later failure leaves the new data and any
-        separate WAL directory in place, just as without <option>--initdb</option>.
+        If compatibility checks fail without <option>--check</option>, the same
+        cleanup described above applies, allowing the command to be retried.
+        Failures after compatibility checks leave the new data and any separate
+        WAL directory in place, just as without <option>--initdb</option>.
         If the cleanup state file cannot be read or server shutdown cannot be
         confirmed, <application>pg_upgrade</application> reports failure and
         retains the initialized cluster and logs.  Failures while

@@ -7,8 +7,11 @@
 Compare native initdb followed by pg_upgrade with pg_upgrade --initdb. Wrappers
 observe initialization and the first new-server startup without changing their
 arguments or results. Compare configuration, control settings, file permissions,
-and upgraded SQL data, rather than random cluster IDs or physical WAL bytes.
+database locales and ICU rules, and upgraded SQL data, rather than random cluster
+IDs or physical WAL bytes. Use --case 'icu-rules-*' for the ICU rule cases.
+Those cases require ICU support in both PostgreSQL builds.
 Automatic checks intentionally delete their cluster. Manual checks retain it.
+Automatic upgrades also delete their cluster if compatibility checks fail.
 Reports and command logs remain in --output. Any mismatch makes the test fail.
 Use --case GLOB and --mode check|upgrade to run a smaller selection.
 
@@ -256,6 +259,17 @@ def cases():
         {'name': 'invalid-initdb-no-clean',
          'chunks': [['--no-clean', '-c', 'no_such_guc=1']],
          'expected': 'initdb-failure', 'no_clean': True},
+    ] + [
+        {'name': 'icu-rules-' + name, 'icu_rules': rules,
+         'old_options': ['--locale-provider=icu', '--icu-locale=en-US',
+                         *(['--icu-rules=' + rules] if rules is not None else [])],
+         'chunks': [['--icu-rules=&a<b']] if rules is None else []}
+        for name, rules in (
+            ('copied', "&a < '$' < c < b"),
+            ('multiline', "&a < '$' < c < b\n&c < d"),
+            ('long', '&a < c < b' + ' ' * 9000),
+            ('multiline-long', "&a < '$' < c < b\n&c < d" + ' ' * 9000),
+            ('cleared', None))
     ]
 
 
@@ -326,10 +340,10 @@ class Runner:
                           env=probe_env, required=True)
         return result.stdout.strip()
 
-    def initialize_old(self):
+    def initialize_old(self, options=()):
         self.run('old-initdb', [self.oldbin / 'initdb', '-D', self.old, '-N',
                                '-U', USER, '-A', 'trust', '--allow-group-access',
-                               '--locale=C', *BASE_OPTIONS], required=True)
+                               '--locale=C', *BASE_OPTIONS, *options], required=True)
         try:
             self.start(self.old, self.oldbin)
             self.sql("CREATE TABLE parity_data(id int PRIMARY KEY, note text); "
@@ -472,26 +486,29 @@ class Runner:
             check(not (cwd / 'pg_upgrade_output.d').exists(), 'logs appeared in working directory')
             logs = list(target.glob('pg_upgrade_output.d/*/log/pg_upgrade_utility.log'))
             keep_logs = case.get('retain', True) or result.returncode != 0
+            cleanup_expected = automatic and (mode == 'check' or
+                (init_rc == 0 and result.returncode != 0 and
+                 'Performing Upgrade' not in result.stdout))
             if automatic or init_rc == 0:
                 check(len(logs) == (1 if keep_logs else 0), 'wrong number/location of retained log sessions')
             if automatic and logs and init_rc == 0:
                 check('performing post-bootstrap initialization' in logs[0].read_text(),
                       'successful initdb output missing from logs')
-            if automatic and mode == 'check':
+            if cleanup_expected:
                 if baseline['0'] is not None:
                     check(metadata(target) == baseline['0'], 'existing target permissions/ownership not restored')
                 if not case.get('no_clean'):
-                    check(not (target / 'PG_VERSION').exists(), 'check left initialized final cluster')
+                    check(not (target / 'PG_VERSION').exists(), 'cleanup left initialized final cluster')
                     leftovers = [p.name for p in target.iterdir()
                                  if p.name != 'pg_upgrade_output.d'] if target.exists() else []
-                    check(not leftovers, f'check left temporary data: {leftovers}')
+                    check(not leftovers, f'cleanup left initialized data: {leftovers}')
                 if init_rc == 0 and wal:
                     check(metadata(wal) == wal_before, 'external WAL pre-run state not restored')
                     check(metadata(wal.parent) == wal_parent_before, 'external WAL parent state not restored')
                     check(not wal.exists() or not list(wal.iterdir()), 'external WAL still contains data')
                 if not keep_logs and baseline['0'] is None:
                     check(not target.parent.parent.exists(), 'check left created parent directories')
-            if init_rc == 0 and (not automatic or mode == 'upgrade'):
+            if init_rc == 0 and not cleanup_expected:
                 expected_mode = capture['state']['data_mode']
                 check(metadata(target) == expected_mode, 'final target differs from native initdb permissions')
                 for key in ('1', '2', '3'):
@@ -516,8 +533,15 @@ class Runner:
                     "('data_checksums', 'wal_segment_size', 'server_encoding', 'max_connections', 'huge_pages') "
                     "OR name LIKE 'custom.%' ORDER BY name", self.bin, env=env)
                 databases = self.sql(
-                    'SELECT datname, encoding, datlocprovider, datcollate, datctype '
-                    'FROM pg_database ORDER BY datname', self.bin, env=env)
+                    'SELECT json_agg(row_to_json(d) ORDER BY datname) FROM '
+                    '(SELECT datname, encoding, datlocprovider, datcollate, datctype, '
+                    "COALESCE(to_jsonb(d)->>'datlocale', to_jsonb(d)->>'daticulocale') AS locale, "
+                    "to_jsonb(d)->>'daticurules' AS icu_rules FROM pg_database d) d",
+                    self.bin, env=env)
+                if 'icu_rules' in case:
+                    for database in json.loads(databases):
+                        check(database['icu_rules'] == case['icu_rules'],
+                              f"ICU rules for {database['datname']} differ from source")
                 indexes = self.sql("SELECT indexdef FROM pg_indexes WHERE tablename='parity_data' ORDER BY indexname", self.bin, env=env)
                 logical = {'rows': rows, 'extra': extra, 'settings': settings,
                            'databases': databases, 'indexes': indexes}
@@ -561,7 +585,7 @@ class Runner:
                         for key in ('startup_files', 'logs'):
                             if left.get(key) != right.get(key):
                                 errors.append(f'before_server: {key} differs')
-            if (mode == 'upgrade' and manual['init_rc'] == automatic['init_rc'] == 0
+            if (mode == 'upgrade' and manual['rc'] == automatic['rc'] == 0
                     and manual['final_permissions'] != automatic['final_permissions']):
                 errors.append('final target/parent permissions differ')
         result = {'case': case['name'], 'mode': mode, 'passed': not errors, 'errors': errors}
@@ -909,8 +933,6 @@ def main():
             'cases': selected, 'transfers': transfers, 'operation': args.mode,
             'bindir': str(runner.bin), 'old_bindir': str(runner.oldbin)})
     try:
-        if not expanded:
-            runner.initialize_old()
         for transfer in transfers:
             for original in selected:
                 case = dict(original)
@@ -930,6 +952,11 @@ def main():
                     if args.expect_transfer_failure and case.get('expected', 'success') == 'success':
                         case['expected'] = 'upgrade-failure'
                         case['transfer_rejection'] = True
+                else:
+                    source_name = 'old-' + case['name'] if case.get('old_options') else 'old'
+                    runner.old = runner.output / source_name
+                    if not runner.old.exists():
+                        runner.initialize_old(case.get('old_options', []))
                 for mode in (('upgrade', 'check') if args.mode == 'both' else (args.mode,)):
                     mode_case = case | {'expected': case.get(mode + '_expected',
                                                             case.get('expected', 'success'))}
