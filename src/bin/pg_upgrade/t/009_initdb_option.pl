@@ -300,8 +300,7 @@ SKIP:
 }
 
 # Both --initdb and --check --initdb reject regproc columns in the old
-# cluster's user tables. After this failure, --initdb keeps the initialized
-# new cluster, while --check --initdb removes it.
+# cluster's user tables and remove the initialized new cluster.
 $oldnode->start;
 $oldnode->safe_psql('postgres', 'CREATE TABLE bad (c regproc)');
 $oldnode->stop;
@@ -326,9 +325,7 @@ for my $check (0, 1)
 		[qr/failed check: Checking for reg\* data types in user tables/],
 		[qr/^$/],
 		"$mode rejects an incompatible old cluster");
-	is( -f "$target/PG_VERSION" ? 1 : 0,
-		$check                  ? 0 : 1,
-		"failed $mode has the expected data lifetime");
+	ok(!-f "$target/PG_VERSION", "failed $mode removes initialized data");
 	my @logs = output_sessions($target);
 	is(scalar @logs, 1, 'failure retains one final-target output session');
 	like(
@@ -454,8 +451,8 @@ my $auth_options =
 		[qr/^$/],
 		'password authentication is not weakened when credentials are missing'
 	);
-	ok( -f $auth_missing->data_dir . '/PG_VERSION',
-		'authentication failure retains the new cluster');
+	ok( !-f $auth_missing->data_dir . '/PG_VERSION',
+		'authentication failure removes the new cluster');
 	ok( !-f $auth_missing->data_dir . '/postmaster.pid',
 		'authentication failure stops the new server');
 }

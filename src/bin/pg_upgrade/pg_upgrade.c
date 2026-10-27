@@ -89,7 +89,7 @@ OSInfo		os_info;
 
 /*
  * Track directories created by --initdb and the original permissions of
- * existing target and external WAL directories. Check-mode cleanup uses
+ * existing target and external WAL directories. Automatic cleanup uses
  * this state to remove initialized data and newly created directories,
  * preserve pre-existing directories, and restore their permissions.
  */
@@ -100,6 +100,7 @@ static char *initdb_wal_parent;
 static bool initdb_wal_existed;
 static mode_t initdb_wal_mode;
 static bool initdb_succeeded;
+static bool initdb_keep_cluster;
 static bool initdb_target_created;
 static bool initdb_output_root_created;
 static mode_t initdb_target_mode;
@@ -205,6 +206,8 @@ main(int argc, char **argv)
 
 	check_new_cluster();
 	report_clusters_compatible();
+	/* --check exits above. Retain the new cluster once the upgrade begins. */
+	initdb_keep_cluster = true;
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -515,7 +518,7 @@ prepare_initdb(void)
 		if (chmod(initdb_target, PG_DIR_MODE_OWNER) != 0)
 			pg_fatal("could not change permissions of directory \"%s\": %m",
 					 initdb_target);
-		initdb_restore_mode = user_opts.check;
+		initdb_restore_mode = true;
 	}
 
 	/* Keep early logs private until initdb's selected permissions are known. */
@@ -528,7 +531,7 @@ prepare_initdb(void)
 
 /*
  * Track parent directories created by this run so we can apply initdb's
- * permissions and remove them after --check if empty.
+ * permissions and remove them during cleanup if empty.
  */
 static void
 create_initdb_parents(char *path)
@@ -571,7 +574,7 @@ finalize_initdb(void)
 {
 	bool		failed = false;
 
-	if (!user_opts.check)
+	if (initdb_keep_cluster)
 		return;
 	for (int i = initdb_num_created_parents; i >= 0; i--)
 	{
@@ -644,7 +647,8 @@ set_output_permissions(void)
 
 /*
  * Before initdb, the target contained only pg_upgrade_output.d.
- * Remove initialized data after --check, preserving that log directory.
+ * Remove initialized data after --check or failed compatibility checks,
+ * preserving that log directory. Later upgrade failures retain the cluster.
  */
 void
 cleanup_initdb_cluster(void)
@@ -652,7 +656,7 @@ cleanup_initdb_cluster(void)
 	struct stat st;
 	char		path[MAXPGPATH];
 
-	if (!user_opts.check || !initdb_succeeded)
+	if (initdb_keep_cluster || !initdb_succeeded)
 		return;
 
 	snprintf(path, sizeof(path), "%s/postmaster.pid", initdb_target);
@@ -830,12 +834,10 @@ create_new_cluster_via_initdb(void)
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true, "%s", cmd.data);
 
 	/*
-	 * --initdb-options may override -D. Verify that the requested target
-	 * contains a valid cluster before enabling its automatic cleanup after
-	 * --check.
+	 * --initdb-options may override -D. Confirm that initdb populated the
+	 * requested target before allowing cleanup to remove its contents.
 	 */
 	check_data_dir(&new_cluster);
-	if (user_opts.check)
 	{
 		FILE	   *state = fopen(initdb_state_file, "r");
 		char	   *header = state ? pg_get_line(state, NULL) : NULL;
