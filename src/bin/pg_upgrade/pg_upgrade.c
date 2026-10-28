@@ -953,6 +953,7 @@ set_locale_and_encoding(void)
 	char	   *datcollate_literal;
 	char	   *datctype_literal;
 	char	   *datlocale_literal = NULL;
+	char	   *daticurules_literal = NULL;
 	DbLocaleInfo *locale = old_cluster.template0;
 
 	prep_status("Setting locale and encoding for new cluster");
@@ -974,70 +975,41 @@ set_locale_and_encoding(void)
 	else
 		datlocale_literal = "NULL";
 
-	/* update template0 in new cluster */
-	if (GET_MAJOR_VERSION(new_cluster.major_version) >= 1700)
-		PQclear(executeQueryOrDie(conn_new_template1,
-								  "UPDATE pg_catalog.pg_database "
-								  "  SET encoding = %d, "
-								  "      datlocprovider = '%c', "
-								  "      datcollate = %s, "
-								  "      datctype = %s, "
-								  "      datlocale = %s "
-								  "  WHERE datname = 'template0' ",
-								  locale->db_encoding,
-								  locale->db_collprovider,
-								  datcollate_literal,
-								  datctype_literal,
-								  datlocale_literal));
-	else if (GET_MAJOR_VERSION(new_cluster.major_version) >= 1500)
-		PQclear(executeQueryOrDie(conn_new_template1,
-								  "UPDATE pg_catalog.pg_database "
-								  "  SET encoding = %d, "
-								  "      datlocprovider = '%c', "
-								  "      datcollate = %s, "
-								  "      datctype = %s, "
-								  "      daticulocale = %s "
-								  "  WHERE datname = 'template0' ",
-								  locale->db_encoding,
-								  locale->db_collprovider,
-								  datcollate_literal,
-								  datctype_literal,
-								  datlocale_literal));
+	if (locale->db_icu_rules)
+	{
+		daticurules_literal = PQescapeLiteral(conn_new_template1,
+											  locale->db_icu_rules,
+											  strlen(locale->db_icu_rules));
+		if (daticurules_literal == NULL)
+			pg_fatal("could not escape ICU rules for new cluster's template0: %s",
+					 PQerrorMessage(conn_new_template1));
+	}
 	else
-		PQclear(executeQueryOrDie(conn_new_template1,
-								  "UPDATE pg_catalog.pg_database "
-								  "  SET encoding = %d, "
-								  "      datcollate = %s, "
-								  "      datctype = %s "
-								  "  WHERE datname = 'template0' ",
-								  locale->db_encoding,
-								  datcollate_literal,
-								  datctype_literal));
+		daticurules_literal = "NULL";
+
+	/* update template0 in new cluster */
+	PQclear(executeQueryOrDie(conn_new_template1,
+							  "UPDATE pg_catalog.pg_database "
+							  "  SET encoding = %d, "
+							  "      datlocprovider = '%c', "
+							  "      datcollate = %s, "
+							  "      datctype = %s, "
+							  "      datlocale = %s, "
+							  "      daticurules = %s "
+							  "  WHERE datname = 'template0' ",
+							  locale->db_encoding,
+							  locale->db_collprovider,
+							  datcollate_literal,
+							  datctype_literal,
+							  datlocale_literal,
+							  daticurules_literal));
 
 	PQfreemem(datcollate_literal);
 	PQfreemem(datctype_literal);
 	if (locale->db_locale)
 		PQfreemem(datlocale_literal);
-
-	/*
-	 * Copy ICU rules separately as a parameter: they can contain newlines or
-	 * exceed the command and query buffers.  Other databases' rules are
-	 * restored by pg_dump/pg_restore.
-	 */
-	if (GET_MAJOR_VERSION(new_cluster.major_version) >= 1600)
-	{
-		const char *params[] = {locale->db_icu_rules};
-		PGresult   *res;
-
-		res = PQexecParams(conn_new_template1,
-						   "UPDATE pg_catalog.pg_database SET daticurules = $1 "
-						   "WHERE datname = 'template0'",
-						   1, NULL, params, NULL, NULL, 0);
-		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-			pg_fatal("could not set ICU rules for new cluster's template0: %s",
-					 PQerrorMessage(conn_new_template1));
-		PQclear(res);
-	}
+	if (locale->db_icu_rules)
+		PQfreemem(daticurules_literal);
 
 	PQfinish(conn_new_template1);
 
