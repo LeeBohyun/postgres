@@ -17,6 +17,7 @@ SUBDIRS	    = \
 	heap \
 	index \
 	nbtree \
+	pgupgrade \
 	rmgrdesc \
 	spgist \
 	sequence \

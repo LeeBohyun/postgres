@@ -10,6 +10,7 @@
 #include "postgres_fe.h"
 
 #include <signal.h>
+#include <sys/stat.h>
 
 #include "common/username.h"
 #include "pg_upgrade.h"
@@ -17,6 +18,33 @@
 LogOpts		log_opts;
 
 static void pg_log_v(eLogType type, const char *fmt, va_list ap) pg_attribute_printf(2, 0);
+
+#ifdef USE_ASSERT_CHECKING
+/* Frontend test barriers have no backend injection-point registry. */
+void
+pg_upgrade_test_wait(const char *environment, const char *message)
+{
+	const char *gate = getenv(environment);
+	struct stat st;
+
+	if (gate == NULL)
+		return;
+	pg_log(PG_REPORT, "%s: %s", message, gate);
+	for (;;)
+	{
+		if (stat(gate, &st) == 0)
+		{
+			pg_usleep(10000);
+			continue;
+		}
+		if (errno == EINTR)
+			continue;
+		if (errno != ENOENT)
+			pg_fatal("could not inspect test gate \"%s\": %m", gate);
+		break;
+	}
+}
+#endif
 
 
 /*
@@ -57,12 +85,13 @@ end_progress_output(void)
 }
 
 /*
- * Remove any logs generated internally.  To be used once when exiting.
+ * Close the internal log and remove output directories unless --retain is set.
  */
 void
 cleanup_output_dirs(void)
 {
 	fclose(log_opts.internal);
+	log_opts.internal = NULL;
 
 	/* Remove dump and log files? */
 	if (log_opts.retain)

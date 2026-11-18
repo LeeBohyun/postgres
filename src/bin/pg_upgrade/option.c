@@ -9,6 +9,8 @@
 
 #include "postgres_fe.h"
 
+#include <limits.h>
+
 #ifdef WIN32
 #include <io.h>
 #endif
@@ -20,6 +22,8 @@
 #include "utils/pidfile.h"
 
 static void usage(void);
+static void parse_initdb_options(const char *options);
+static unsigned short parse_port(const char *value, const char *description);
 static void check_required_directory(char **dirpath,
 									 const char *envVarName, bool useCwd,
 									 const char *cmdLineOption, const char *description,
@@ -63,6 +67,9 @@ parseCommandLine(int argc, char *argv[])
 		{"no-statistics", no_argument, NULL, 5},
 		{"set-char-signedness", required_argument, NULL, 6},
 		{"swap", no_argument, NULL, 7},
+		{"initdb", no_argument, NULL, 8},
+		{"initdb-options", required_argument, NULL, 19},
+		{"wal-upgrade", no_argument, NULL, 9},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -79,8 +86,11 @@ parseCommandLine(int argc, char *argv[])
 	os_info.progname = get_progname(argv[0]);
 
 	/* Process libpq env. variables; load values here for usage() output */
-	old_cluster.port = getenv("PGPORTOLD") ? atoi(getenv("PGPORTOLD")) : DEF_PGUPORT;
-	new_cluster.port = getenv("PGPORTNEW") ? atoi(getenv("PGPORTNEW")) : DEF_PGUPORT;
+	user_opts.old_port_specified = getenv("PGPORTOLD") != NULL;
+	old_cluster.port = user_opts.old_port_specified ?
+		parse_port(getenv("PGPORTOLD"), "old") : DEF_PGUPORT;
+	new_cluster.port = getenv("PGPORTNEW") ?
+		parse_port(getenv("PGPORTNEW"), "new") : DEF_PGUPORT;
 
 	os_user_effective_id = get_user_info(&os_info.user);
 	/* we override just the database user name;  we got the OS id above */
@@ -173,13 +183,12 @@ parseCommandLine(int argc, char *argv[])
 				break;
 
 			case 'p':
-				if ((old_cluster.port = atoi(optarg)) <= 0)
-					pg_fatal("invalid old port number");
+				old_cluster.port = parse_port(optarg, "old");
+				user_opts.old_port_specified = true;
 				break;
 
 			case 'P':
-				if ((new_cluster.port = atoi(optarg)) <= 0)
-					pg_fatal("invalid new port number");
+				new_cluster.port = parse_port(optarg, "new");
 				break;
 
 			case 'r':
@@ -234,6 +243,19 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.transfer_mode = TRANSFER_MODE_SWAP;
 				break;
 
+			case 8:
+				user_opts.initdb_new_cluster = true;
+				break;
+
+			case 9:
+				user_opts.wal_upgrade = true;
+				break;
+
+			case 19:
+				user_opts.initdb_options_given = true;
+				parse_initdb_options(optarg);
+				break;
+
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 						os_info.progname);
@@ -243,6 +265,9 @@ parseCommandLine(int argc, char *argv[])
 
 	if (optind < argc)
 		pg_fatal("too many command-line arguments (first is \"%s\")", argv[optind]);
+
+	if (user_opts.initdb_options_given && !user_opts.initdb_new_cluster)
+		pg_fatal("--initdb-options requires --initdb");
 
 	if (!user_opts.sync_method)
 		user_opts.sync_method = pg_strdup("fsync");
@@ -267,10 +292,10 @@ parseCommandLine(int argc, char *argv[])
 	/* Get values from env if not already set */
 	check_required_directory(&old_cluster.bindir, "PGBINOLD", false,
 							 "-b", _("old cluster binaries reside"), false);
-	check_required_directory(&new_cluster.bindir, "PGBINNEW", false,
-							 "-B", _("new cluster binaries reside"), true);
 	check_required_directory(&old_cluster.pgdata, "PGDATAOLD", false,
 							 "-d", _("old cluster data resides"), false);
+	check_required_directory(&new_cluster.bindir, "PGBINNEW", false,
+							 "-B", _("new cluster binaries reside"), true);
 	check_required_directory(&new_cluster.pgdata, "PGDATANEW", false,
 							 "-D", _("new cluster data resides"), false);
 	check_required_directory(&user_opts.socketdir, "PGSOCKETDIR", true,
@@ -297,6 +322,138 @@ parseCommandLine(int argc, char *argv[])
 			pg_fatal("cannot run pg_upgrade from inside the new cluster data directory on Windows");
 	}
 #endif
+}
+
+
+static unsigned short
+parse_port(const char *value, const char *description)
+{
+	char	   *end;
+	unsigned long port;
+
+	errno = 0;
+	port = strtoul(value, &end, 10);
+	if (errno != 0 || value[0] == '\0' || end[0] != '\0' ||
+		port == 0 || port > 65535)
+		pg_fatal("invalid %s port number", description);
+	return (unsigned short) port;
+}
+
+
+/* Preserve the TCP endpoint that the old standbys already use. */
+void
+set_old_cluster_endpoint(void)
+{
+	char		path[MAXPGPATH];
+	char		contents[MAX_STRING + 1];
+	FILE	   *fp;
+	size_t		len;
+	char	   *addresses;
+	unsigned short port;
+
+	if (!user_opts.wal_upgrade || user_opts.check)
+		return;
+
+	snprintf(path, sizeof(path), "%s/%s", old_cluster.pgdata,
+			 PG_UPGRADE_ENDPOINT_FILE);
+	if ((fp = fopen(path, PG_BINARY_R)) == NULL)
+	{
+		if (errno == ENOENT)
+			return;
+		pg_fatal("could not open old primary endpoint file \"%s\": %m",
+				 path);
+	}
+	len = fread(contents, 1, sizeof(contents), fp);
+	if (ferror(fp) || fclose(fp) != 0)
+		pg_fatal("could not read old primary endpoint file \"%s\": %m",
+				 path);
+	if (len > MAX_STRING)
+		pg_fatal("old primary endpoint file \"%s\" is too long", path);
+	if (memchr(contents, '\0', len) != NULL)
+		pg_fatal("old primary endpoint file \"%s\" is malformed", path);
+	contents[len] = '\0';
+	addresses = strchr(contents, '\n');
+	if (addresses == NULL)
+		pg_fatal("old primary endpoint file \"%s\" is malformed", path);
+	*addresses++ = '\0';
+	port = parse_port(contents, "old primary's previous");
+	if (user_opts.old_port_specified &&
+		old_cluster.port != port)
+		pg_fatal("specified old-cluster port %hu does not match the old "
+				 "primary's previous port %hu",
+				 old_cluster.port, port);
+	if (strpbrk(addresses, "'\"\\`$\r\n") != NULL)
+		pg_fatal("old primary listen addresses cannot be represented safely");
+	old_cluster.port = port;
+	if (addresses[0] != '\0')
+		old_cluster.listen_addresses = pg_strdup(addresses);
+}
+
+
+/*
+ * Split --initdb-options without invoking a shell.  Single quotes preserve
+ * every character.  Outside single quotes, backslashes escape only quotes,
+ * backslashes, spaces, and tabs, so ordinary Windows path separators survive.
+ */
+static void
+parse_initdb_options(const char *options)
+{
+	const char *p = options;
+	char	   *argument;
+
+	if (strpbrk(options, "\r\n") != NULL)
+		pg_fatal("--initdb-options must not contain a newline or carriage return");
+
+	argument = pg_malloc(strlen(options) + 1);
+	while (*p)
+	{
+		char	   *out = argument;
+		char		quote = '\0';
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == '\0')
+			break;
+
+		while (*p)
+		{
+			if (quote == '\0' && (*p == ' ' || *p == '\t'))
+				break;
+			if (*p == quote)
+			{
+				quote = '\0';
+				p++;
+			}
+			else if (quote != '\'' && *p == '\\')
+			{
+				p++;
+				if (*p == '\0')
+					pg_fatal("trailing backslash in --initdb-options");
+				if (*p == '\'' || *p == '"' || *p == '\\' ||
+					*p == ' ' || *p == '\t')
+					*out++ = *p++;
+				else
+					*out++ = '\\';
+			}
+			else if (quote == '\0' && (*p == '\'' || *p == '"'))
+				quote = *p++;
+			else
+				*out++ = *p++;
+		}
+
+		if (quote != '\0')
+			pg_fatal("unterminated quote in --initdb-options");
+		*out = '\0';
+
+		if (user_opts.num_initdb_options == INT_MAX - 1)
+			pg_fatal("too many arguments in --initdb-options");
+		user_opts.initdb_options =
+			pg_realloc_array(user_opts.initdb_options, char *,
+							 (size_t) user_opts.num_initdb_options + 1);
+		user_opts.initdb_options[user_opts.num_initdb_options++] =
+			pg_strdup(argument);
+	}
+	pg_free(argument);
 }
 
 
@@ -328,6 +485,11 @@ usage(void)
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
 	printf(_("  --copy                        copy files to new cluster (default)\n"));
 	printf(_("  --copy-file-range             copy files to new cluster with copy_file_range\n"));
+	printf(_("  --wal-upgrade                 capture the whole upgrade as WAL, replayable\n"
+			 "                                and streamable to standbys\n"));
+	printf(_("  --initdb                      create the new cluster with initdb before\n"
+			 "                                checking or upgrading, using old cluster settings\n"));
+	printf(_("  --initdb-options=OPTIONS      options to pass to initdb (requires --initdb)\n"));
 	printf(_("  --no-statistics               do not import statistics from old cluster\n"));
 	printf(_("  --set-char-signedness=OPTION  set new cluster char signedness to \"signed\" or\n"
 			 "                                \"unsigned\"\n"));
@@ -336,7 +498,9 @@ usage(void)
 	printf(_("  -?, --help                    show this help, then exit\n"));
 	printf(_("\n"
 			 "Before running pg_upgrade you must:\n"
-			 "  create a new database cluster (using the new version of initdb)\n"
+			 "  create a new database cluster (using the new version of initdb),\n"
+			 "    unless the --initdb option is given, in which case pg_upgrade\n"
+			 "    creates the new cluster for you\n"
 			 "  shutdown the postmaster servicing the old cluster\n"
 			 "  shutdown the postmaster servicing the new cluster\n"));
 	printf(_("\n"

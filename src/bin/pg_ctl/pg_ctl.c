@@ -273,6 +273,17 @@ get_pgpid(bool is_status_request)
 
 	if (stat(version_file, &statbuf) != 0 && errno == ENOENT)
 	{
+		char		sigpath[MAXPGPATH];
+		struct stat sigbuf;
+
+		/*
+		 * Accept a staged upgrade standby without PG_VERSION. Startup creates
+		 * its initial control and version files.
+		 */
+		snprintf(sigpath, sizeof(sigpath), "%s/pg_upgrade.signal", pg_data);
+		if (stat(sigpath, &sigbuf) == 0)
+			return 0;
+
 		write_stderr(_("%s: directory \"%s\" is not a database cluster directory\n"),
 					 progname, pg_data);
 		exit(is_status_request ? 4 : 1);

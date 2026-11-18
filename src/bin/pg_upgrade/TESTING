@@ -19,6 +19,11 @@ export olddump=...somewhere/dump.sql	(old version's dump)
 export oldinstall=...otherversion/	(old version's install base path)
 See DETAILS below for more information about creation of the dump.
 
+The WAL-upgrade tests (010 and 011) require old binaries patched to handle
+PgUpgrade HANDOFF records. They are skipped when oldinstall has no PgUpgrade
+resource manager. The other tests still exercise ordinary upgrades from that
+installation.
+
 You can also test the different transfer modes (--copy, --link,
 --clone, --copy-file-range, --swap) by setting the environment variable
 PG_TEST_PG_UPGRADE_MODE to the respective command-line option, like
@@ -64,3 +69,13 @@ and then try to pg_upgrade it to the new version.  Success is reported
 if pg_dumpall output matches between the pre-upgrade and post-upgrade
 databases.  In case of trouble, manually comparing those dump files may
 help to isolate the problem.
+
+
+MANUAL WAL-UPGRADE TESTS
+------------------------
+
+The tests/wal_upgrade directory at the repository root contains standalone
+completion-validation, scale, multi-standby, and ordinary-link comparison
+tests.  These tests use installed PostgreSQL binaries and are not run by
+make check.  See
+tests/wal_upgrade/README.md for requirements and commands.

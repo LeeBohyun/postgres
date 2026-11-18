@@ -342,6 +342,13 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 						(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 						 errmsg("sorry, too many clients already")));
 				break;
+			case CAC_UPGRADE_HANDOFF:
+				if (!am_walsender || am_db_walsender)
+					ereport(FATAL,
+							(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+							 errmsg("the database system is shutting down")));
+				WalSndMarkPgUpgradeHandoff();
+				break;
 			case CAC_OK:
 				break;
 		}

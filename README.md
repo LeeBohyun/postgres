@@ -19,3 +19,9 @@ about building PostgreSQL from the source code can be found at
 The latest version of this software, and related software, may be
 obtained at <https://www.postgresql.org/download/>.  For more information
 look at our web site located at <https://www.postgresql.org/>.
+
+WAL-logging pg_upgrade
+----------------------
+
+For a high-level overview of the WAL-logging pg_upgrade patch, see
+[The case for WAL-logging pg_upgrade](doc/high-level/wal-logging-pg-upgrade-v2.pdf).

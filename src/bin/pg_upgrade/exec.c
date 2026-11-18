@@ -15,8 +15,6 @@
 #include "fe_utils/version.h"
 #include "pg_upgrade.h"
 
-static void check_data_dir(ClusterInfo *cluster);
-static void check_bin_dir(ClusterInfo *cluster, bool check_versions);
 static void get_bin_version(ClusterInfo *cluster);
 static void check_exec(const char *dir, const char *program, bool check_version);
 
@@ -263,7 +261,9 @@ verify_directories(void)
 
 	check_bin_dir(&old_cluster, false);
 	check_data_dir(&old_cluster);
-	check_bin_dir(&new_cluster, true);
+	/* --initdb checks the new binaries before creating the target. */
+	if (!user_opts.initdb_new_cluster)
+		check_bin_dir(&new_cluster, true);
 	check_data_dir(&new_cluster);
 }
 
@@ -329,7 +329,7 @@ check_single_dir(const char *pg_data, const char *subdir)
  *	us) we display an error message and exit()
  *
  */
-static void
+void
 check_data_dir(ClusterInfo *cluster)
 {
 	const char *pg_data = cluster->pgdata;
@@ -361,7 +361,7 @@ check_data_dir(ClusterInfo *cluster)
  *	against the version of this pg_upgrade.  This is for checking the target
  *	bindir.
  */
-static void
+void
 check_bin_dir(ClusterInfo *cluster, bool check_versions)
 {
 	struct stat statBuf;

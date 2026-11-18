@@ -50,7 +50,13 @@
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/pgupgrade_control.h"
+#include "access/pgupgrade_handoff.h"
+#include "access/pgupgrade_handoff_receipt.h"
+#include "access/pgupgrade_retention_slots.h"
+#include "access/pgupgrade_wal.h"
 #include "access/rewriteheap.h"
+#include "access/slru.h"
 #include "access/subtrans.h"
 #include "access/timeline.h"
 #include "access/transam.h"
@@ -86,6 +92,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
@@ -746,6 +753,7 @@ static void CleanupAfterArchiveRecovery(TimeLineID EndOfLogTLI,
 										XLogRecPtr EndOfLog,
 										TimeLineID newTLI);
 static void CheckRequiredParameterValues(void);
+static XLogRecPtr XLogInsertParameterChange(void);
 static void XLogReportParameters(void);
 static int	LocalSetXLogInsertAllowed(void);
 static void CreateEndOfRecoveryRecord(void);
@@ -776,8 +784,6 @@ static void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force);
 static bool PerformRecoveryXLogAction(void);
 static void CheckReplayedDataChecksumState(uint32 replayed_state);
 static void AdoptReplayedDataChecksumState(uint32 new_version, XLogRecPtr lsn);
-static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
-static void WriteControlFile(void);
 static void ReadControlFile(void);
 static void UpdateControlFile(void);
 static char *str_time(pg_time_t tnow, char *buf, size_t bufsize);
@@ -4300,22 +4306,19 @@ CleanupBackupHistory(void)
  * I/O routines for pg_control
  *
  * *ControlFile is a buffer in shared memory that holds an image of the
- * contents of pg_control.  WriteControlFile() initializes pg_control
- * given a preloaded buffer, ReadControlFile() loads the buffer from
- * the pg_control file (during postmaster or standalone-backend startup),
- * and UpdateControlFile() rewrites pg_control after we modify xlog state.
- * InitControlFile() fills the buffer with initial values.
- *
- * For simplicity, WriteControlFile() initializes the fields of pg_control
- * that are related to checking backend/database compatibility, and
- * ReadControlFile() verifies they are correct.  We could split out the
- * I/O and compatibility-check functions, but there seems no need currently.
+ * contents of pg_control.  InitControlFileData() fills a new image,
+ * WriteControlFileData() creates the file, ReadControlFile() loads it during
+ * startup, and UpdateControlFile() rewrites it after xlog state changes.
  */
 
-static void
-InitControlFile(uint64 sysidentifier, uint32 data_checksum_version)
+void
+InitControlFileData(ControlFileData *control_file, uint64 sysidentifier,
+					uint32 data_checksum_version, int control_wal_segment_size,
+					int elevel)
 {
 	char		mock_auth_nonce[MOCK_AUTH_NONCE_LEN];
+
+	Assert(elevel >= ERROR);
 
 	/*
 	 * Generate a random nonce. This is used for authentication requests that
@@ -4324,66 +4327,54 @@ InitControlFile(uint64 sysidentifier, uint32 data_checksum_version)
 	 * of an actual stored password.
 	 */
 	if (!pg_strong_random(mock_auth_nonce, MOCK_AUTH_NONCE_LEN))
-		ereport(PANIC,
+		ereport(elevel,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not generate secret authorization token")));
 
-	memset(ControlFile, 0, sizeof(ControlFileData));
+	memset(control_file, 0, sizeof(ControlFileData));
 	/* Initialize pg_control status fields */
-	ControlFile->system_identifier = sysidentifier;
-	memcpy(ControlFile->mock_authentication_nonce, mock_auth_nonce, MOCK_AUTH_NONCE_LEN);
-	ControlFile->state = DB_SHUTDOWNED;
-	ControlFile->unloggedLSN = FirstNormalUnloggedLSN;
+	control_file->system_identifier = sysidentifier;
+	memcpy(control_file->mock_authentication_nonce, mock_auth_nonce,
+		   MOCK_AUTH_NONCE_LEN);
+	control_file->state = DB_SHUTDOWNED;
+	control_file->unloggedLSN = FirstNormalUnloggedLSN;
 
 	/* Set important parameter values for use when replaying WAL */
-	ControlFile->MaxConnections = MaxConnections;
-	ControlFile->max_worker_processes = max_worker_processes;
-	ControlFile->max_wal_senders = max_wal_senders;
-	ControlFile->max_prepared_xacts = max_prepared_xacts;
-	ControlFile->max_locks_per_xact = max_locks_per_xact;
-	ControlFile->wal_level = wal_level;
-	ControlFile->wal_log_hints = wal_log_hints;
-	ControlFile->track_commit_timestamp = track_commit_timestamp;
-	ControlFile->data_checksum_version = data_checksum_version;
-	ControlFile->data_checksum_version_init = data_checksum_version;
-	ControlFile->data_checksum_is_local = false;
-	ControlFile->data_checksum_lsn = InvalidXLogRecPtr;
-
-	/*
-	 * Set the data_checksum_version value into XLogCtl, which is where all
-	 * processes get the current value from.
-	 */
-	XLogCtl->data_checksum_version = data_checksum_version;
-}
-
-static void
-WriteControlFile(void)
-{
-	int			fd;
-	char		buffer[PG_CONTROL_FILE_SIZE];	/* need not be aligned */
+	control_file->MaxConnections = MaxConnections;
+	control_file->max_worker_processes = max_worker_processes;
+	control_file->max_wal_senders = max_wal_senders;
+	control_file->max_prepared_xacts = max_prepared_xacts;
+	control_file->max_locks_per_xact = max_locks_per_xact;
+	control_file->wal_level = wal_level;
+	control_file->wal_log_hints = wal_log_hints;
+	control_file->track_commit_timestamp = track_commit_timestamp;
+	control_file->data_checksum_version = data_checksum_version;
+	control_file->data_checksum_version_init = data_checksum_version;
+	control_file->data_checksum_is_local = false;
+	control_file->data_checksum_lsn = InvalidXLogRecPtr;
 
 	/*
 	 * Initialize version and compatibility-check fields
 	 */
-	ControlFile->pg_control_version = PG_CONTROL_VERSION;
-	ControlFile->catalog_version_no = CATALOG_VERSION_NO;
+	control_file->pg_control_version = PG_CONTROL_VERSION;
+	control_file->catalog_version_no = CATALOG_VERSION_NO;
 
-	ControlFile->maxAlign = MAXIMUM_ALIGNOF;
-	ControlFile->floatFormat = FLOATFORMAT_VALUE;
+	control_file->maxAlign = MAXIMUM_ALIGNOF;
+	control_file->floatFormat = FLOATFORMAT_VALUE;
 
-	ControlFile->blcksz = BLCKSZ;
-	ControlFile->relseg_size = RELSEG_SIZE;
-	ControlFile->slru_pages_per_segment = SLRU_PAGES_PER_SEGMENT;
-	ControlFile->xlog_blcksz = XLOG_BLCKSZ;
-	ControlFile->xlog_seg_size = wal_segment_size;
+	control_file->blcksz = BLCKSZ;
+	control_file->relseg_size = RELSEG_SIZE;
+	control_file->slru_pages_per_segment = SLRU_PAGES_PER_SEGMENT;
+	control_file->xlog_blcksz = XLOG_BLCKSZ;
+	control_file->xlog_seg_size = control_wal_segment_size;
 
-	ControlFile->nameDataLen = NAMEDATALEN;
-	ControlFile->indexMaxKeys = INDEX_MAX_KEYS;
+	control_file->nameDataLen = NAMEDATALEN;
+	control_file->indexMaxKeys = INDEX_MAX_KEYS;
 
-	ControlFile->toast_max_chunk_size = TOAST_OID_MAX_CHUNK_SIZE;
-	ControlFile->loblksize = LOBLKSIZE;
+	control_file->toast_max_chunk_size = TOAST_OID_MAX_CHUNK_SIZE;
+	control_file->loblksize = LOBLKSIZE;
 
-	ControlFile->float8ByVal = true;	/* vestigial */
+	control_file->float8ByVal = true;	/* vestigial */
 
 	/*
 	 * Initialize the default 'char' signedness.
@@ -4410,14 +4401,24 @@ WriteControlFile(void)
 	 * cause the population of database clusters to converge toward that
 	 * retrospective ideal.
 	 */
-	ControlFile->default_char_signedness = true;
+	control_file->default_char_signedness = true;
+}
+
+void
+WriteControlFileData(ControlFileData *control_file, const char *path,
+					 bool exclusive, int elevel)
+{
+	int			fd;
+	char		buffer[PG_CONTROL_FILE_SIZE];	/* need not be aligned */
+
+	Assert(elevel >= ERROR);
 
 	/* Contents are protected with a CRC */
-	INIT_CRC32C(ControlFile->crc);
-	COMP_CRC32C(ControlFile->crc,
-				ControlFile,
+	INIT_CRC32C(control_file->crc);
+	COMP_CRC32C(control_file->crc,
+				control_file,
 				offsetof(ControlFileData, crc));
-	FIN_CRC32C(ControlFile->crc);
+	FIN_CRC32C(control_file->crc);
 
 	/*
 	 * We write out PG_CONTROL_FILE_SIZE bytes into pg_control, zero-padding
@@ -4427,15 +4428,15 @@ WriteControlFile(void)
 	 * error than "couldn't read pg_control".
 	 */
 	memset(buffer, 0, PG_CONTROL_FILE_SIZE);
-	memcpy(buffer, ControlFile, sizeof(ControlFileData));
+	memcpy(buffer, control_file, sizeof(ControlFileData));
 
-	fd = BasicOpenFile(XLOG_CONTROL_FILE,
-					   O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
+	fd = BasicOpenFile(path, O_RDWR | O_CREAT | PG_BINARY |
+					   (exclusive ? O_EXCL : O_TRUNC));
 	if (fd < 0)
-		ereport(PANIC,
+		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not create file \"%s\": %m",
-						XLOG_CONTROL_FILE)));
+						path)));
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_WRITE);
@@ -4444,26 +4445,26 @@ WriteControlFile(void)
 		/* if write didn't set errno, assume problem is no disk space */
 		if (errno == 0)
 			errno = ENOSPC;
-		ereport(PANIC,
+		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not write to file \"%s\": %m",
-						XLOG_CONTROL_FILE)));
+						path)));
 	}
 	pgstat_report_wait_end();
 
 	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_SYNC);
 	if (pg_fsync(fd) != 0)
-		ereport(PANIC,
+		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m",
-						XLOG_CONTROL_FILE)));
+						path)));
 	pgstat_report_wait_end();
 
 	if (close(fd) != 0)
-		ereport(PANIC,
+		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m",
-						XLOG_CONTROL_FILE)));
+						path)));
 }
 
 static void
@@ -4698,6 +4699,150 @@ static void
 UpdateControlFile(void)
 {
 	update_controlfile(DataDir, ControlFile, true);
+}
+
+void
+GetControlFileCopy(ControlFileData *copy)
+{
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	memcpy(copy, ControlFile, sizeof(*copy));
+	LWLockRelease(ControlFileLock);
+}
+
+void
+ArmControlFileForUpgradeRecovery(const struct CheckPoint *replay_start_checkpoint,
+								 uint64 wal_sysid, bool for_streaming)
+{
+	Assert(ControlFile != NULL);
+
+	ControlFile->checkPoint = replay_start_checkpoint->redo;
+	ControlFile->checkPointCopy = *replay_start_checkpoint;
+	ControlFile->wal_level = WAL_LEVEL_REPLICA;
+	ControlFile->minRecoveryPointTLI = replay_start_checkpoint->ThisTimeLineID;
+	ControlFile->upgrade_started = false;
+	ControlFile->upgrade_finalized = false;
+	ControlFile->state = for_streaming ? DB_SHUTDOWNED : DB_IN_ARCHIVE_RECOVERY;
+	ControlFile->minRecoveryPoint = replay_start_checkpoint->redo;
+	if (wal_sysid != 0)
+		ControlFile->system_identifier = wal_sysid;
+
+	UpdateControlFile();
+}
+
+void
+AdoptUpgradeControlFile(const char *data, Size len)
+{
+	ControlFileData image;
+
+	PgUpgradeValidateControlImage(data, len, ControlFile, &image);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	/* Runtime values arrive through their standard WAL records. */
+	ControlFile->data_checksum_version_init = image.data_checksum_version_init;
+	ControlFile->default_char_signedness = image.default_char_signedness;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+}
+
+void
+VerifyUpgradeRestartPoint(XLogRecPtr checkpoint_lsn,
+						  TimeLineID checkpoint_tli)
+{
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	if (ControlFile->checkPoint != checkpoint_lsn ||
+		ControlFile->checkPointCopy.redo != checkpoint_lsn ||
+		ControlFile->checkPointCopy.ThisTimeLineID != checkpoint_tli)
+	{
+		LWLockRelease(ControlFileLock);
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not persist the final pg_upgrade checkpoint on the standby")));
+	}
+	LWLockRelease(ControlFileLock);
+}
+
+void
+SetControlFileUpgradeFinalized(void)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (!ControlFile->upgrade_started)
+		elog(PANIC, "cannot finalize a pg_upgrade transaction that was not started");
+	if (!ControlFile->upgrade_finalized)
+	{
+		ControlFile->upgrade_finalized = true;
+		UpdateControlFile();
+	}
+	LWLockRelease(ControlFileLock);
+}
+
+void
+SetControlFileUpgradeComplete(XLogRecPtr end_lsn, TimeLineID replay_tli)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (!ControlFile->upgrade_started)
+		elog(PANIC, "cannot complete a pg_upgrade transaction that was not started");
+	if (ControlFile->state == DB_IN_UPGRADE)
+		ControlFile->state = DB_IN_ARCHIVE_RECOVERY;
+	if (ControlFile->minRecoveryPoint < end_lsn)
+	{
+		ControlFile->minRecoveryPoint = end_lsn;
+		ControlFile->minRecoveryPointTLI = replay_tli;
+	}
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+}
+
+void
+GetControlFileUpgradeState(bool *started, bool *finalized)
+{
+	Assert(ControlFile != NULL);
+	*started = ControlFile->upgrade_started;
+	*finalized = ControlFile->upgrade_finalized;
+}
+
+void
+SetControlFileUpgradeStarted(void)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (!ControlFile->upgrade_started)
+	{
+		ControlFile->upgrade_started = true;
+		ControlFile->state = DB_IN_UPGRADE;
+		ControlFile->time = (pg_time_t) time(NULL);
+		UpdateControlFile();
+	}
+	LWLockRelease(ControlFileLock);
+}
+
+/*
+ * Set upgrade_started in pg_control before inserting START. Normal startup
+ * rejects the new cluster until the completion checkpoint sets
+ * upgrade_finalized.
+ */
+void
+BeginControlFileUpgrade(void)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (ControlFile->upgrade_started || ControlFile->upgrade_finalized)
+	{
+		LWLockRelease(ControlFileLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("an upgrade transaction has already been started for "
+						"this new cluster"),
+				 errhint("Use a fresh new cluster for another upgrade attempt.")));
+	}
+	ControlFile->upgrade_started = true;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
 }
 
 /*
@@ -5206,7 +5351,7 @@ show_data_checksums(void)
  * default signedness of char is "signed". This function exists for code
  * that deals with pre-v18 data files that store data sorted by the 'char'
  * type on disk (e.g., GIN and GiST indexes). See the comments in
- * WriteControlFile() for details.
+ * InitControlFileData() for details.
  */
 bool
 GetDefaultCharSignedness(void)
@@ -5816,13 +5961,15 @@ BootStrapXLOG(uint32 data_checksum_version)
 	openLogFile = -1;
 
 	/* Now create pg_control */
-	InitControlFile(sysidentifier, data_checksum_version);
+	InitControlFileData(ControlFile, sysidentifier, data_checksum_version,
+						wal_segment_size, PANIC);
+	/* Make the current checksum state available to all processes. */
+	XLogCtl->data_checksum_version = data_checksum_version;
 	ControlFile->time = checkPoint.time;
 	ControlFile->checkPoint = checkPoint.redo;
 	ControlFile->checkPointCopy = checkPoint;
 
-	/* some additional ControlFile fields are set in WriteControlFile() */
-	WriteControlFile();
+	WriteControlFileData(ControlFile, XLOG_CONTROL_FILE, true, PANIC);
 
 	/* Bootstrap the commit log, too */
 	BootStrapCLOG();
@@ -6155,11 +6302,22 @@ StartupXLOG(void)
 									 timebuf, sizeof(timebuf)))));
 			break;
 
+		case DB_IN_UPGRADE:
+
+			ereport(LOG,
+					(errmsg("database system was interrupted while replaying a "
+								"pg_upgrade transaction (last known up at %s)",
+							str_time(ControlFile->time,
+									 timebuf, sizeof(timebuf)))));
+			break;
+
 		default:
 			ereport(FATAL,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("control file contains invalid database cluster state")));
 	}
+
+	PgUpgradeDiscardStaleHandoff(ControlFile->state);
 
 	/* This is just to allow attaching to startup process with a debugger */
 #ifdef XLOG_REPLAY_DELAY
@@ -6384,6 +6542,7 @@ StartupXLOG(void)
 	lastFullPageWrites = checkPoint.fullPageWrites;
 
 	RedoRecPtr = XLogCtl->RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
+	PgUpgradeCreateMigratedPhysicalSlots(checkPoint.redo);
 	doPageWrites = lastFullPageWrites;
 
 	/* REDO */
@@ -7689,6 +7848,8 @@ CreateCheckPoint(int flags)
 	VirtualTransactionId *vxids;
 	int			nvxids;
 	int			oldXLogAllowed = 0;
+	XLogRecPtr	upgrade_complete_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	handoff_lsn = InvalidXLogRecPtr;
 
 	/*
 	 * An end-of-recovery checkpoint is really a shutdown checkpoint, just
@@ -7724,6 +7885,10 @@ CreateCheckPoint(int flags)
 	/* Run these points outside the critical section. */
 	INJECTION_POINT("create-checkpoint-initial", NULL);
 	INJECTION_POINT_LOAD("create-checkpoint-run");
+
+	/* HANDOFF must be the shutdown checkpoint's preceding WAL record. */
+	if (flags & CHECKPOINT_IS_SHUTDOWN)
+		handoff_lsn = PgUpgradeEmitHandoffIfArmed();
 
 	/*
 	 * Use a critical section to force system panic if we have trouble.
@@ -8078,6 +8243,25 @@ CreateCheckPoint(int flags)
 				(errmsg("concurrent write-ahead log activity while database system is shutting down")));
 
 	/*
+	 * If the upgrade transaction committed, verify this shutdown checkpoint
+	 * follows COMPLETE. The control-file update below then sets
+	 * upgrade_finalized.
+	 */
+	if (shutdown)
+		upgrade_complete_lsn = PgUpgradeGetCompletionLSN(ProcLastRecPtr);
+
+	/*
+	 * Save each snapshotted persistent physical slot with restart_lsn no
+	 * lower than its HANDOFF floor before publishing DB_SHUTDOWNED.
+	 */
+	if (XLogRecPtrIsValid(handoff_lsn))
+	{
+		END_CRIT_SECTION();
+		(void) PgUpgradeWaitForHandoffSlots(recptr);
+		START_CRIT_SECTION();
+	}
+
+	/*
 	 * Remember the prior checkpoint's redo ptr for
 	 * UpdateCheckPointDistanceEstimate()
 	 */
@@ -8094,6 +8278,12 @@ CreateCheckPoint(int flags)
 	/* crash recovery should always recover to the end of WAL */
 	ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
 	ControlFile->minRecoveryPointTLI = 0;
+	if (!XLogRecPtrIsInvalid(upgrade_complete_lsn))
+	{
+		if (!ControlFile->upgrade_started || ControlFile->upgrade_finalized)
+			elog(PANIC, "invalid pg_upgrade state at completion checkpoint");
+		ControlFile->upgrade_finalized = true;
+	}
 
 	/*
 	 * Persist the data checksum state this node runs under into the control
@@ -8139,6 +8329,8 @@ CreateCheckPoint(int flags)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+	if (!XLogRecPtrIsInvalid(upgrade_complete_lsn))
+		PgUpgradeClearCompletionLSN();
 
 	/*
 	 * We are now done with critical updates; no need for system panic if we
@@ -8931,7 +9123,13 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 		 * slots were to be invalidated because of this, it would not be
 		 * possible to preserve logical ones during the upgrade.
 		 */
-		if (max_slot_wal_keep_size_mb >= 0 && !IsBinaryUpgrade)
+
+		/*
+		 * HANDOFF WAL retention and HANDOFF slot freezing also skip this
+		 * limit.
+		 */
+		if (max_slot_wal_keep_size_mb >= 0 && !IsBinaryUpgrade &&
+			!PgUpgradeHandoffSlotsAreFrozen())
 		{
 			uint64		slot_keep_segs;
 
@@ -9082,6 +9280,29 @@ XLogAssignLSN(void)
 }
 
 /*
+ * Insert the current values of the parameters that are critical for hot
+ * standby.
+ */
+static XLogRecPtr
+XLogInsertParameterChange(void)
+{
+	xl_parameter_change xlrec;
+
+	xlrec.MaxConnections = MaxConnections;
+	xlrec.max_worker_processes = max_worker_processes;
+	xlrec.max_wal_senders = max_wal_senders;
+	xlrec.max_prepared_xacts = max_prepared_xacts;
+	xlrec.max_locks_per_xact = max_locks_per_xact;
+	xlrec.wal_level = wal_level;
+	xlrec.wal_log_hints = wal_log_hints;
+	xlrec.track_commit_timestamp = track_commit_timestamp;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	return XLogInsert(RM_XLOG_ID, XLOG_PARAMETER_CHANGE);
+}
+
+/*
  * Check if any of the GUC parameters that are critical for hot standby
  * have changed, and update the value in pg_control file if necessary.
  */
@@ -9106,22 +9327,8 @@ XLogReportParameters(void)
 		 */
 		if (wal_level != ControlFile->wal_level || XLogIsNeeded())
 		{
-			xl_parameter_change xlrec;
-			XLogRecPtr	recptr;
+			XLogRecPtr	recptr = XLogInsertParameterChange();
 
-			xlrec.MaxConnections = MaxConnections;
-			xlrec.max_worker_processes = max_worker_processes;
-			xlrec.max_wal_senders = max_wal_senders;
-			xlrec.max_prepared_xacts = max_prepared_xacts;
-			xlrec.max_locks_per_xact = max_locks_per_xact;
-			xlrec.wal_level = wal_level;
-			xlrec.wal_log_hints = wal_log_hints;
-			xlrec.track_commit_timestamp = track_commit_timestamp;
-
-			XLogBeginInsert();
-			XLogRegisterData(&xlrec, sizeof(xlrec));
-
-			recptr = XLogInsert(RM_XLOG_ID, XLOG_PARAMETER_CHANGE);
 			XLogFlush(recptr);
 		}
 
@@ -9187,6 +9394,22 @@ XLogChecksums(uint32 new_type)
 	XLogFlush(recptr);
 
 	return recptr;
+}
+
+/*
+ * Record the current runtime control values for a receiver that starts with a
+ * different control file.  XLogChecksums() flushes both records.
+ */
+void
+XLogReportCurrentControlState(void)
+{
+	uint32		checksum_state;
+
+	(void) XLogInsertParameterChange();
+	SpinLockAcquire(&XLogCtl->info_lck);
+	checksum_state = XLogCtl->data_checksum_version;
+	SpinLockRelease(&XLogCtl->info_lck);
+	XLogChecksums(checksum_state);
 }
 
 /*
@@ -9399,6 +9622,7 @@ xlog_redo(XLogReaderState *record)
 							checkPoint.ThisTimeLineID, replayTLI)));
 
 		RecoveryRestartPoint(&checkPoint, record);
+		PgUpgradeCheckpointReplayed(&checkPoint, record);
 
 		/*
 		 * After replaying a checkpoint record, free all smgr objects.

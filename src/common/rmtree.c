@@ -46,8 +46,8 @@
  *	(The details of the problem are reported already, so caller
  *	doesn't really have to say anything more, but most do.)
  */
-bool
-rmtree(const char *path, bool rmtopdir)
+static bool
+rmtree_internal(const char *path, bool rmtopdir, const char *exclude)
 {
 	char		pathbuf[MAXPGPATH];
 	DIR		   *dir;
@@ -69,7 +69,8 @@ rmtree(const char *path, bool rmtopdir)
 	while (errno = 0, (de = readdir(dir)))
 	{
 		if (strcmp(de->d_name, ".") == 0 ||
-			strcmp(de->d_name, "..") == 0)
+			strcmp(de->d_name, "..") == 0 ||
+			(exclude && strcmp(de->d_name, exclude) == 0))
 			continue;
 		snprintf(pathbuf, sizeof(pathbuf), "%s/%s", path, de->d_name);
 		switch (get_dirent_type(pathbuf, de, false, LOG_LEVEL))
@@ -128,4 +129,21 @@ rmtree(const char *path, bool rmtopdir)
 	pfree(dirnames);
 
 	return result;
+}
+
+bool
+rmtree(const char *path, bool rmtopdir)
+{
+	return rmtree_internal(path, rmtopdir, NULL);
+}
+
+/*
+ * Recursively delete everything under path except the top-level entry named
+ * exclude. Preserve path itself and the excluded entry's contents.
+ * The caller must ensure that everything else is safe to delete.
+ */
+bool
+rmtree_except(const char *path, const char *exclude)
+{
+	return rmtree_internal(path, false, exclude);
 }

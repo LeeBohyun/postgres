@@ -10,8 +10,10 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include "common/pg_upgrade_data.h"
 #include "common/relpath.h"
 #include "libpq-fe.h"
+#include "pqexpbuffer.h"
 
 /* For now, pg_upgrade does not use common/logging.c; use our own pg_fatal */
 #undef pg_fatal
@@ -32,7 +34,7 @@
 
 /*
  * Base directories that include all the files generated internally, from the
- * root path of the new cluster.  The paths are dynamically built as of
+ * selected output root.  The paths are dynamically built as of
  * BASE_OUTPUTDIR/$timestamp/{LOG_OUTPUTDIR,DUMP_OUTPUTDIR} to ensure their
  * uniqueness in each run.
  */
@@ -129,6 +131,7 @@ typedef struct
 	char	   *tablespace;		/* tablespace path; "" for cluster default */
 	bool		nsp_alloc;		/* should nspname be freed? */
 	bool		tblsp_alloc;	/* should tablespace be freed? */
+	int			relink_index;	/* index in the database's relink inventory */
 } RelInfo;
 
 typedef struct
@@ -136,6 +139,12 @@ typedef struct
 	RelInfo    *rels;
 	int			nrels;
 } RelInfoArr;
+
+typedef struct
+{
+	PgUpgradeRelinkEntry *rels;
+	int			nrels;
+} RelinkInfoArr;
 
 /*
  * Structure to store logical replication slot information.
@@ -156,6 +165,12 @@ typedef struct
 	int			nslots;			/* number of logical slot infos */
 	LogicalSlotInfo *slots;		/* array of logical slot infos */
 } LogicalSlotInfoArr;
+
+typedef struct
+{
+	int			nslots;
+	char	  **slotnames;
+} PhysicalSlotNameArr;
 
 /*
  * The following structure represents a relation mapping.
@@ -179,10 +194,12 @@ typedef struct
 typedef struct
 {
 	Oid			db_oid;			/* oid of the database */
+	Oid			db_tablespace_oid;
 	char	   *db_name;		/* database name */
 	char		db_tablespace[MAXPGPATH];	/* database default tablespace
 											 * path */
 	RelInfoArr	rel_arr;		/* array of all user relinfos */
+	RelinkInfoArr relink_arr;	/* all local storage, for WAL upgrade */
 	LogicalSlotInfoArr slot_arr;	/* array of all LogicalSlotInfo */
 } DbInfo;
 
@@ -196,6 +213,8 @@ typedef struct
 	char		db_collprovider;
 	char	   *db_locale;
 	int			db_encoding;
+	Oid			db_oid;
+	Oid			db_tablespace_oid;
 } DbLocaleInfo;
 
 typedef struct
@@ -213,12 +232,23 @@ typedef struct
 {
 	uint32		ctrl_ver;
 	uint32		cat_ver;
+	uint64		system_identifier;
 	char		nextxlogfile[25];
+	char		chkpnt_redo_wal_file[25];
+	char		upgrade_start_wal_file[25]; /* first segment after the old
+											 * checkpoint */
+	uint64		chkpnt_lsn;		/* shutdown checkpoint record location */
+	uint64		chkpnt_redo_lsn;	/* local old-cluster checkpoint REDO LSN */
+	uint32		chkpnt_tli;		/* shutdown checkpoint timeline */
+	uint64		shutdown_checkpoint_end_lsn;	/* final old-major checkpoint
+												 * end */
 	uint32		chkpnt_nxtxid;
 	uint32		chkpnt_nxtepoch;
 	Oid8		chkpnt_nxtoid;
 	uint32		chkpnt_nxtmulti;
 	uint64		chkpnt_nxtmxoff;
+	int			chkpnt_nxtmxoff_size;	/* next_multi_offset SQL type width in
+										 * bytes */
 	uint32		chkpnt_oldstMulti;
 	uint32		chkpnt_oldstxid;
 	uint32		align;
@@ -241,11 +271,11 @@ typedef struct
  */
 typedef enum
 {
-	TRANSFER_MODE_CLONE,
-	TRANSFER_MODE_COPY,
-	TRANSFER_MODE_COPY_FILE_RANGE,
-	TRANSFER_MODE_LINK,
-	TRANSFER_MODE_SWAP,
+	TRANSFER_MODE_CLONE = UPGRADE_RELINK_MODE_CLONE,
+	TRANSFER_MODE_COPY = UPGRADE_RELINK_MODE_COPY,
+	TRANSFER_MODE_COPY_FILE_RANGE = UPGRADE_RELINK_MODE_COPY_FILE_RANGE,
+	TRANSFER_MODE_LINK = UPGRADE_RELINK_MODE_LINK,
+	TRANSFER_MODE_SWAP = UPGRADE_RELINK_MODE_SWAP,
 } transferMode;
 
 /*
@@ -272,23 +302,29 @@ typedef struct
 	ControlData controldata;	/* pg_control information */
 	DbLocaleInfo *template0;	/* template0 locale info */
 	DbInfoArr	dbarr;			/* dbinfos array */
+	RelinkInfoArr shared_relink_arr;	/* shared storage, for WAL upgrade */
 	char	   *pgdata;			/* pathname for cluster's $PGDATA directory */
 	char	   *pgconfig;		/* pathname for cluster's config file
 								 * directory */
 	char	   *bindir;			/* pathname for cluster's executable directory */
 	char	   *pgopts;			/* options to pass to the server, like pg_ctl
 								 * -o */
+	char	   *listen_addresses;	/* effective old-cluster TCP listen
+									 * addresses */
 	char	   *sockdir;		/* directory for Unix Domain socket, if any */
 	unsigned short port;		/* port number where postmaster is waiting */
 	uint32		major_version;	/* PG_VERSION of cluster */
 	char	   *major_version_str;	/* string PG_VERSION of cluster */
 	uint32		bin_version;	/* version returned from pg_ctl */
 	char	  **tablespaces;	/* tablespace directories */
+	Oid		   *tablespace_oids;	/* matches tablespaces[] order */
 	int			num_tablespaces;
 	const char *tablespace_suffix;	/* directory specification */
 	int			nsubs;			/* number of subscriptions */
 	bool		sub_retain_dead_tuples; /* whether a subscription enables
 										 * retain_dead_tuples. */
+	/* Old-cluster physical slots to recreate on the new cluster. */
+	PhysicalSlotNameArr phys_slot_arr;
 } ClusterInfo;
 
 
@@ -306,6 +342,7 @@ typedef struct
 	char	   *dumpdir;		/* Dumps */
 	char	   *logdir;			/* Log files */
 	bool		isatty;			/* is stdout a tty */
+	uint64		pg_upgrade_wal_bytes;
 } LogOpts;
 
 
@@ -314,7 +351,8 @@ typedef struct
  */
 typedef struct
 {
-	bool		check;			/* check clusters only, don't change any data */
+	bool		check;			/* check clusters without performing the
+								 * upgrade */
 	bool		live_check;		/* check clusters only, old server is running */
 	bool		do_sync;		/* flush changes to disk */
 	transferMode transfer_mode; /* copy files or link them? */
@@ -325,6 +363,14 @@ typedef struct
 	int			char_signedness;	/* default char signedness: -1 for initial
 									 * value, 1 for "signed" and 0 for
 									 * "unsigned" */
+	bool		initdb_new_cluster; /* run initdb before compatibility checks */
+	bool		initdb_options_given;	/* --initdb-options given, even if
+										 * empty */
+	char	  **initdb_options; /* additional arguments to initdb */
+	int			num_initdb_options;
+
+	bool		wal_upgrade;
+	bool		old_port_specified;
 } UserOpts;
 
 typedef struct
@@ -363,7 +409,14 @@ extern OSInfo os_info;
 /* check.c */
 
 void		output_check_banner(void);
-void		check_and_dump_old_cluster(void);
+struct UpgradePreparation;
+void		prepare_pg_upgrade_handoff(void);
+void		perform_pg_upgrade_handoff(void);
+void		check_and_dump_old_cluster(struct UpgradePreparation *preparation);
+bool		pg_upgrade_handoff_requires_immediate_stop(void);
+int			pg_upgrade_handoff_signal_status(void);
+void		cleanup_pg_upgrade_handoff_after_stop(void);
+PGconn	   *begin_postmaster_stop_for_handoff(ClusterInfo *cluster);
 void		check_new_cluster(void);
 void		report_clusters_compatible(void);
 void		issue_warnings_and_set_wal_level(void);
@@ -376,8 +429,10 @@ void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
 /* controldata.c */
 
 void		get_control_data(ClusterInfo *cluster);
+void		get_multixact_offset_type_size(ClusterInfo *cluster);
 void		check_control_data(ControlData *oldctrl, ControlData *newctrl);
 void		disable_old_cluster(transferMode transfer_mode);
+uint64		get_shutdown_checkpoint_end_lsn(ClusterInfo *cluster);
 
 
 /* dump.c */
@@ -390,18 +445,21 @@ void		generate_old_dump(void);
 #define EXEC_PSQL_ARGS "--echo-queries --set ON_ERROR_STOP=on --no-psqlrc --dbname=template1"
 
 bool		exec_prog(const char *log_filename, const char *opt_log_file,
-					  bool report_error, bool exit_on_error, const char *fmt, ...) pg_attribute_printf(5, 6);
+					  bool report_error, bool exit_on_error, const char *fmt, ...)
+			pg_attribute_printf(5, 6);
+void		check_bin_dir(ClusterInfo *cluster, bool check_versions);
+void		check_data_dir(ClusterInfo *cluster);
 void		verify_directories(void);
 bool		pid_lock_file_exists(const char *datadir);
 
 
 /* file.c */
 
-void		cloneFile(const char *src, const char *dst,
+void		cloneFile(const char *source, const char *dst,
 					  const char *schemaName, const char *relName);
 void		copyFile(const char *src, const char *dst,
 					 const char *schemaName, const char *relName);
-void		copyFileByRange(const char *src, const char *dst,
+void		copyFileByRange(const char *source, const char *dst,
 							const char *schemaName, const char *relName);
 void		linkFile(const char *src, const char *dst,
 					 const char *schemaName, const char *relName);
@@ -422,15 +480,25 @@ void		check_loadable_libraries(void);
 FileNameMap *gen_db_file_maps(DbInfo *old_db,
 							  DbInfo *new_db, int *nmaps, const char *old_pgdata,
 							  const char *new_pgdata);
-void		get_db_rel_and_slot_infos(ClusterInfo *cluster);
+void		get_db_rel_and_slot_infos(ClusterInfo *cluster,
+									  struct UpgradePreparation *preparation);
+void		get_template0_info(ClusterInfo *cluster);
+RelinkInfoArr get_template0_rel_infos(ClusterInfo *cluster);
 int			count_old_cluster_logical_slots(void);
+void		get_old_cluster_physical_slot_infos(void);
 void		get_subscription_info(ClusterInfo *cluster);
 
 /* option.c */
 
 void		parseCommandLine(int argc, char *argv[]);
 void		adjust_data_dir(ClusterInfo *cluster);
+void		set_old_cluster_endpoint(void);
 void		get_sock_dir(ClusterInfo *cluster);
+
+/* pg_upgrade.c */
+
+void		cleanup_initdb_cluster(void);
+void		sync_new_cluster(bool sync_data_files);
 
 /* relfilenumber.c */
 
@@ -458,6 +526,10 @@ void		check_pghost_envvar(void);
 
 
 /* util.c */
+
+#ifdef USE_ASSERT_CHECKING
+void		pg_upgrade_test_wait(const char *environment, const char *message);
+#endif
 
 char	   *quote_identifier(const char *s);
 int			get_user_info(char **user_name_p);
@@ -502,6 +574,9 @@ void		upgrade_task_add_step(UpgradeTask *task, const char *query,
 								  UpgradeTaskProcessCB process_cb, bool free_result,
 								  void *arg);
 void		upgrade_task_run(const UpgradeTask *task, const ClusterInfo *cluster);
+void		upgrade_task_run_range(const UpgradeTask *task,
+								   const ClusterInfo *cluster,
+								   int first_db, int end_db);
 void		upgrade_task_free(UpgradeTask *task);
 
 /* convenient type for common private data needed by several tasks */

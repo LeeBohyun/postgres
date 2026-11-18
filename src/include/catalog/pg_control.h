@@ -17,12 +17,13 @@
 
 #include "access/transam.h"
 #include "access/xlogdefs.h"
+#include "common/relpath.h"
 #include "pgtime.h"				/* for pg_time_t */
 #include "port/pg_crc32c.h"
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	2001
+#define PG_CONTROL_VERSION	2002
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
@@ -103,6 +104,8 @@ typedef enum DBState
 	DB_IN_CRASH_RECOVERY,
 	DB_IN_ARCHIVE_RECOVERY,
 	DB_IN_PRODUCTION,
+
+	DB_IN_UPGRADE,
 } DBState;
 
 /*
@@ -269,6 +272,12 @@ typedef struct ControlFileData
 	 * the cluster is initialized.
 	 */
 	bool		default_char_signedness;
+
+	/* The completion checkpoint or restartpoint is durable. */
+	bool		upgrade_finalized;
+
+	/* Emission reserved this new cluster, or recovery replayed START. */
+	bool		upgrade_started;
 
 	/*
 	 * Random nonce, used in authentication requests that need to proceed

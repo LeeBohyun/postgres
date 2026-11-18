@@ -45,11 +45,16 @@
 
 #include "access/multixact.h"
 #include "catalog/pg_class_d.h"
+#include "catalog/pg_collation_d.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
 #include "common/restricted_token.h"
+#include "common/string.h"
 #include "fe_utils/string_utils.h"
+#include "fe_utils/version.h"
+#include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
+#include "prepare_upgrade.h"
 
 /*
  * Maximum number of pg_restore actions (TOC entries) to process within one
@@ -62,11 +67,21 @@ static void set_new_cluster_char_signedness(void);
 static void set_locale_and_encoding(void);
 static void prepare_new_cluster(void);
 static void prepare_new_globals(void);
-static void create_new_objects(void);
+static void create_new_objects(UpgradePreparation *preparation);
 static void copy_xact_xlog_xid(void);
 static void set_frozenxids(void);
-static void make_outputdirs(char *pgdata);
+static void make_outputdirs(const char *output_root);
 static void setup(char *argv0);
+static void resolve_new_bindir(const char *argv0);
+static void prepare_new_cluster_initdb(const char *argv0);
+static void prepare_initdb(void);
+static void create_initdb_parents(char *path);
+static void finalize_initdb(void);
+static void set_initdb_directory_permissions(const char *path);
+static void set_output_permissions(void);
+static void get_old_cluster_initdb_info(void);
+static void build_new_cluster_initdb_cmd(PQExpBuffer cmd);
+static void create_new_cluster_via_initdb(void);
 static void create_logical_replication_slots(void);
 static void create_conflict_detection_slot(void);
 
@@ -74,6 +89,29 @@ ClusterInfo old_cluster,
 			new_cluster;
 OSInfo		os_info;
 
+/*
+ * Track directories created by --initdb and the original permissions of
+ * existing target and external WAL directories. Automatic cleanup uses
+ * this state to remove initialized data and newly created directories,
+ * preserve pre-existing directories, and restore their permissions.
+ */
+static char *initdb_target;
+static char *initdb_state_file;
+static char *initdb_waldir;
+static char *initdb_wal_parent;
+static bool initdb_wal_existed;
+static mode_t initdb_wal_mode;
+static bool initdb_succeeded;
+static bool initdb_keep_cluster;
+static bool initdb_target_created;
+static bool initdb_output_root_created;
+static mode_t initdb_target_mode;
+static bool initdb_restore_mode;
+static char **initdb_created_parents;
+static int	initdb_num_created_parents;
+
+/* Old cluster's archive_command copied by --initdb, or NULL. */
+static char *old_cluster_archive_command = NULL;
 char	   *output_files[] = {
 	SERVER_LOG_FILE,
 #ifdef WIN32
@@ -90,7 +128,9 @@ int
 main(int argc, char **argv)
 {
 	char	   *deletion_script_file_name = NULL;
+	bool		perform_handoff;
 	bool		migrate_logical_slots;
+	UpgradePreparation *preparation = NULL;
 
 	/*
 	 * pg_upgrade doesn't currently use common/logging.c, but initialize it
@@ -106,12 +146,27 @@ main(int argc, char **argv)
 
 	get_restricted_token();
 
+	if (user_opts.initdb_new_cluster)
+		prepare_new_cluster_initdb(argv[0]);
+
 	adjust_data_dir(&old_cluster);
-	adjust_data_dir(&new_cluster);
+	set_old_cluster_endpoint();
+	perform_handoff = user_opts.wal_upgrade && !user_opts.check &&
+		!user_opts.live_check;
+	if (perform_handoff)
+		prepare_pg_upgrade_handoff();
+
+	if (user_opts.initdb_new_cluster)
+	{
+		prepare_initdb();
+		create_new_cluster_via_initdb();
+	}
+	else
+		adjust_data_dir(&new_cluster);
 
 	/*
-	 * Set mask based on PGDATA permissions, needed for the creation of the
-	 * output directories with correct permissions.
+	 * Use the permissions selected by initdb, including explicit group
+	 * access.
 	 */
 	if (!GetDataDirectoryCreatePerm(new_cluster.pgdata))
 		pg_fatal("could not read permissions of directory \"%s\": %m",
@@ -119,11 +174,16 @@ main(int argc, char **argv)
 
 	umask(pg_mode_mask);
 
-	/*
-	 * This needs to happen after adjusting the data directory of the new
-	 * cluster in adjust_data_dir().
-	 */
-	make_outputdirs(new_cluster.pgdata);
+	if (user_opts.initdb_new_cluster)
+	{
+		for (int i = 0; i < initdb_num_created_parents; i++)
+			set_initdb_directory_permissions(initdb_created_parents[i]);
+		set_output_permissions();
+		if (initdb_output_root_created)
+			set_initdb_directory_permissions(log_opts.rootdir);
+	}
+	else
+		make_outputdirs(new_cluster.pgdata);
 
 	setup(argv[0]);
 
@@ -136,14 +196,36 @@ main(int argc, char **argv)
 
 	check_cluster_compatibility();
 
-	check_and_dump_old_cluster();
-
+	if (user_opts.wal_upgrade && !user_opts.check)
+		preparation = create_upgrade_preparation(&old_cluster, &new_cluster,
+												 user_opts.transfer_mode);
+	check_and_dump_old_cluster(preparation);
 
 	/* -- NEW -- */
+	/* Start the new-major server for new-cluster compatibility checks. */
 	start_postmaster(&new_cluster, true);
 
 	check_new_cluster();
 	report_clusters_compatible();
+	/* --check exits above. Retain the new cluster once the upgrade begins. */
+	initdb_keep_cluster = true;
+
+	/*
+	 * Perform HANDOFF after the new-cluster checks pass, then record the
+	 * old cluster's final shutdown checkpoint end LSN in START.
+	 */
+	if (perform_handoff)
+	{
+		stop_postmaster(false);
+		perform_pg_upgrade_handoff();
+	}
+
+	if (user_opts.wal_upgrade && !user_opts.check)
+		prepare_upgrade_old_cluster(preparation);
+
+	/* Restart the new-major server for new-cluster preparation after HANDOFF. */
+	if (perform_handoff)
+		start_postmaster(&new_cluster, true);
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -165,22 +247,17 @@ main(int argc, char **argv)
 
 	/* New now using xids of the old system */
 
-	/* -- NEW -- */
 	start_postmaster(&new_cluster, true);
 
 	prepare_new_globals();
 
-	create_new_objects();
+	create_new_objects(preparation);
+
+	if (user_opts.wal_upgrade && old_cluster_archive_command != NULL)
+		configure_upgrade_archive(old_cluster_archive_command);
 
 	stop_postmaster(false);
 
-	/*
-	 * Most failures happen in create_new_objects(), which has completed at
-	 * this point.  We do this here because it is just before file transfer,
-	 * which for --link will make it unsafe to start the old cluster once the
-	 * new cluster is started, and for --swap will make it unsafe to start the
-	 * old cluster at all.
-	 */
 	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
 		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
 		disable_old_cluster(user_opts.transfer_mode);
@@ -188,20 +265,89 @@ main(int argc, char **argv)
 	transfer_all_new_tablespaces(&old_cluster.dbarr, &new_cluster.dbarr,
 								 old_cluster.pgdata, new_cluster.pgdata);
 
-	/*
-	 * Assuming OIDs are only used in system tables, there is no need to
-	 * restore the OID counter because we have not transferred any OIDs from
-	 * the old system, but we do it anyway just in case.  We do it late here
-	 * because there is no need to have the schema load use new oids.
-	 */
-	prep_status("Setting next OID for new cluster");
-	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -o %" PRIu64 " \"%s\"",
-			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
-			  new_cluster.pgdata);
-	check_ok();
-
+	if (user_opts.wal_upgrade)
+	{
+		prep_status("Setting next OID and preparing upgrade WAL");
+		/*
+		 * Write the new cluster's initial checkpoint in the first whole WAL
+		 * segment after the old cluster's final shutdown checkpoint ends,
+		 * using the old cluster's timeline.
+		 */
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" --wal-upgrade-exact -o %" PRIu64 " -l %s \"%s\"",
+				  new_cluster.bindir,
+				  old_cluster.controldata.chkpnt_nxtoid,
+				  old_cluster.controldata.upgrade_start_wal_file,
+				  new_cluster.pgdata);
+		prepare_upgrade_archive(old_cluster_archive_command != NULL);
+		check_ok();
+	}
+	else
+	{
+		prep_status("Setting next OID for new cluster");
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" -o %" PRIu64 " \"%s\"",
+				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+				  new_cluster.pgdata);
+		check_ok();
+	}
 	migrate_logical_slots = count_old_cluster_logical_slots();
+
+	if (user_opts.wal_upgrade)
+	{
+		PGconn	   *conn;
+
+		/*
+		 * Add the new cluster's system identifier and checksum the relink
+		 * file after resetting WAL and before starting the new cluster for
+		 * WAL emission.
+		 */
+		finish_upgrade_preparation(preparation);
+
+		/* Start the new cluster to emit the upgrade WAL. */
+		start_postmaster(&new_cluster, true);
+		conn = connectToServer(&new_cluster, "template1");
+
+		/*
+		 * Recreate and reserve each physical slot before emitting the upgrade
+		 * transaction.
+		 */
+		for (int slotnum = 0; slotnum < old_cluster.phys_slot_arr.nslots; slotnum++)
+		{
+			const char *slotname = old_cluster.phys_slot_arr.slotnames[slotnum];
+
+			pg_log(PG_VERBOSE, "migrating physical replication slot \"%s\"",
+				   slotname);
+
+			PQclear(executeQueryOrDie(conn,
+									  "SELECT pg_create_physical_replication_slot('%s', true, false)",
+									  slotname));
+		}
+
+		emit_upgrade_wal(preparation, conn);
+
+		free_upgrade_preparation(preparation);
+
+		if (old_cluster_archive_command != NULL)
+		{
+			/*
+			 * Mark the new cluster as upgrade-finalized in a shutdown
+			 * checkpoint.
+			 */
+			PQfinish(conn);
+			stop_postmaster(false);
+
+			/* Restart before switching WAL past the completion checkpoint. */
+			start_postmaster(&new_cluster, true);
+			conn = connectToServer(&new_cluster, "template1");
+		}
+
+		PQclear(executeQueryOrDie(conn, "SELECT pg_switch_wal()"));
+
+		PQfinish(conn);
+
+		stop_postmaster(false);
+	}
 
 	/*
 	 * Migrate replication slots to the new cluster.
@@ -237,22 +383,13 @@ main(int argc, char **argv)
 		stop_postmaster(false);
 	}
 
-	if (user_opts.do_sync)
-	{
-		prep_status("Sync data directory to disk");
-		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/initdb\" --sync-only %s \"%s\" --sync-method %s",
-				  new_cluster.bindir,
-				  (user_opts.transfer_mode == TRANSFER_MODE_SWAP) ?
-				  "--no-sync-data-files" : "",
-				  new_cluster.pgdata,
-				  user_opts.sync_method);
-		check_ok();
-	}
+	sync_new_cluster(user_opts.transfer_mode != TRANSFER_MODE_SWAP ||
+					 user_opts.wal_upgrade);
 
 	create_script_for_old_cluster_deletion(&deletion_script_file_name);
 
-	issue_warnings_and_set_wal_level();
+	if (!user_opts.wal_upgrade)
+		issue_warnings_and_set_wal_level();
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -269,12 +406,38 @@ main(int argc, char **argv)
 }
 
 /*
+ * Sync the new cluster after shutdown, unless --no-sync is specified.
+ * A completed --swap upgrade can skip syncing data files here because they
+ * have already been synced.
+ */
+void
+sync_new_cluster(bool sync_data_files)
+{
+	if (!user_opts.do_sync)
+		return;
+
+	prep_status("Sync data directory to disk");
+#ifdef USE_ASSERT_CHECKING
+	pg_upgrade_test_wait("PG_UPGRADE_TEST_PAUSE_BEFORE_SYNC",
+						 "test pause before upgrade synchronization");
+#endif
+	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+			  "\"%s/initdb\" --sync-only %s \"%s\" --sync-method %s",
+			  new_cluster.bindir,
+			  sync_data_files ? "" : "--no-sync-data-files",
+			  new_cluster.pgdata,
+			  user_opts.sync_method);
+	check_ok();
+}
+
+
+/*
  * Create and assign proper permissions to the set of output directories
  * used to store any data generated internally, filling in log_opts in
  * the process.
  */
 static void
-make_outputdirs(char *pgdata)
+make_outputdirs(const char *output_root)
 {
 	FILE	   *fp;
 	char	  **filename;
@@ -286,7 +449,7 @@ make_outputdirs(char *pgdata)
 	int			len;
 
 	log_opts.rootdir = (char *) pg_malloc0(MAXPGPATH);
-	len = snprintf(log_opts.rootdir, MAXPGPATH, "%s/%s", pgdata, BASE_OUTPUTDIR);
+	len = snprintf(log_opts.rootdir, MAXPGPATH, "%s/%s", output_root, BASE_OUTPUTDIR);
 	if (len >= MAXPGPATH)
 		pg_fatal("directory path for new cluster is too long");
 
@@ -358,6 +521,454 @@ make_outputdirs(char *pgdata)
 }
 
 
+/*
+ * resolve_new_bindir()
+ *
+ * If new_cluster.bindir was not set by -B or PGBINNEW, derive it from the
+ * path of the currently executing pg_upgrade binary.  Safe to call more than
+ * once.
+ */
+static void
+resolve_new_bindir(const char *argv0)
+{
+	if (!new_cluster.bindir)
+	{
+		char		exec_path[MAXPGPATH];
+
+		if (find_my_exec(argv0, exec_path) < 0)
+			pg_fatal("%s: could not find own program executable", argv0);
+		/* Trim off program name and keep just path */
+		*last_dir_separator(exec_path) = '\0';
+		canonicalize_path(exec_path);
+		new_cluster.bindir = pg_strdup(exec_path);
+	}
+}
+
+
+/*
+ * Validate local binaries before creating output files, adjusting data
+ * directories, or starting either cluster.
+ */
+static void
+prepare_new_cluster_initdb(const char *argv0)
+{
+	check_pghost_envvar();
+	resolve_new_bindir(argv0);
+	check_bin_dir(&old_cluster, false);
+	check_bin_dir(&new_cluster, true);
+}
+
+
+/*
+ * Before creating logs or changing permissions, check that the target
+ * directory is missing or empty except for pg_upgrade_output.d.
+ */
+static void
+prepare_initdb(void)
+{
+	int			status = pg_check_dir_except(new_cluster.pgdata, BASE_OUTPUTDIR);
+	struct stat st;
+
+	if (status < 0)
+		pg_fatal("could not access directory \"%s\": %m", new_cluster.pgdata);
+	if (status > 1)
+		pg_fatal("new cluster data directory \"%s\" is not empty",
+				 new_cluster.pgdata);
+
+	initdb_target = make_absolute_path(new_cluster.pgdata);
+	if (!initdb_target)
+		exit(1);
+	{
+		char	   *output_root = psprintf("%s/%s", initdb_target, BASE_OUTPUTDIR);
+
+		initdb_output_root_created = stat(output_root, &st) != 0 && errno == ENOENT;
+		pg_free(output_root);
+	}
+	if (status != 0)
+	{
+		if (stat(initdb_target, &st) != 0)
+			pg_fatal("could not read permissions of directory \"%s\": %m",
+					 initdb_target);
+		initdb_target_mode = st.st_mode & 07777;
+	}
+
+	/*
+	 * atexit() runs handlers in reverse registration order. Register these
+	 * before starting a server so its shutdown handler runs before data
+	 * cleanup. Restore the target's original permissions last so cleanup can
+	 * still access the directory.
+	 */
+	atexit(finalize_initdb);
+	atexit(cleanup_initdb_cluster);
+	if (status == 0)
+	{
+		char	   *parent = pg_strdup(initdb_target);
+
+		get_parent_directory(parent);
+		create_initdb_parents(parent);
+		pg_free(parent);
+		if (mkdir(initdb_target, PG_DIR_MODE_OWNER) != 0)
+			pg_fatal("could not create directory \"%s\": %m", initdb_target);
+		initdb_target_created = true;
+	}
+	else
+	{
+		if (chmod(initdb_target, PG_DIR_MODE_OWNER) != 0)
+			pg_fatal("could not change permissions of directory \"%s\": %m",
+					 initdb_target);
+		initdb_restore_mode = true;
+	}
+
+	/* Keep early logs private until initdb's selected permissions are known. */
+	make_outputdirs(initdb_target);
+
+	initdb_state_file = psprintf("%s/initdb_state", log_opts.logdir);
+	pg_free(new_cluster.pgdata);
+	new_cluster.pgdata = new_cluster.pgconfig = initdb_target;
+}
+
+/*
+ * Track parent directories created by this run so we can apply initdb's
+ * permissions and remove them during cleanup if empty.
+ */
+static void
+create_initdb_parents(char *path)
+{
+	struct stat st;
+	char	   *parent;
+	char	   *created;
+
+	if (stat(path, &st) == 0)
+	{
+		if (!S_ISDIR(st.st_mode))
+			pg_fatal("\"%s\" is not a directory", path);
+		return;
+	}
+	if (errno != ENOENT)
+		pg_fatal("could not access directory \"%s\": %m", path);
+	parent = pg_strdup(path);
+	get_parent_directory(parent);
+	if (parent[0] == '\0' || strcmp(parent, path) == 0)
+		pg_fatal("could not access directory \"%s\"", path);
+	create_initdb_parents(parent);
+	pg_free(parent);
+
+	created = pg_strdup(path);
+	initdb_created_parents = pg_realloc_array(initdb_created_parents, char *,
+											  initdb_num_created_parents + 1);
+	if (mkdir(path, PG_DIR_MODE_OWNER) != 0)
+	{
+		if (errno != EEXIST || stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+			pg_fatal("could not create directory \"%s\": %m", path);
+		pg_free(created);
+		return;
+	}
+	initdb_created_parents[initdb_num_created_parents++] = created;
+}
+
+/* Runs after log cleanup on success; failed checks keep their logs. */
+static void
+finalize_initdb(void)
+{
+	bool		failed = false;
+
+	if (initdb_keep_cluster)
+		return;
+	for (int i = initdb_num_created_parents; i >= 0; i--)
+	{
+		const char *path = i == initdb_num_created_parents ? initdb_target :
+			initdb_created_parents[i];
+
+		if (i == initdb_num_created_parents && !initdb_target_created)
+			continue;
+		if (rmdir(path) != 0 && errno != ENOENT &&
+			errno != ENOTEMPTY && errno != EEXIST)
+		{
+			pg_log(PG_WARNING, "could not remove directory \"%s\": %m", path);
+			failed = true;
+		}
+	}
+	if (initdb_restore_mode)
+	{
+		if (chmod(initdb_target, initdb_target_mode) != 0)
+		{
+			pg_log(PG_WARNING, "could not restore permissions of directory \"%s\": %m",
+				   initdb_target);
+			failed = true;
+		}
+		else
+			initdb_restore_mode = false;
+	}
+	if (failed)
+	{
+		fflush(NULL);
+		_exit(1);
+	}
+}
+
+/* Apply initdb's permissions without clearing inherited setgid. */
+static void
+set_initdb_directory_permissions(const char *path)
+{
+	mode_t		mode = pg_dir_create_mode;
+#ifndef WIN32
+	struct stat st;
+
+	/* Keep the group inheritance of directories we created under setgid. */
+	if (stat(path, &st) != 0)
+		pg_fatal("could not read permissions of directory \"%s\": %m", path);
+	mode |= st.st_mode & S_ISGID;
+#endif
+	if (chmod(path, mode) != 0)
+		pg_fatal("could not change permissions of directory \"%s\": %m", path);
+}
+
+/*
+ * Set permissions on this run's output directory, its log and dump
+ * subdirectories, and log files to match initdb's selected permissions.
+ */
+static void
+set_output_permissions(void)
+{
+	const char *dirs[] = {log_opts.basedir, log_opts.dumpdir, log_opts.logdir, NULL};
+	char		path[MAXPGPATH];
+
+	for (const char **dir = dirs; *dir; dir++)
+		set_initdb_directory_permissions(*dir);
+	for (char **file = output_files; *file; file++)
+	{
+		snprintf(path, sizeof(path), "%s/%s", log_opts.logdir, *file);
+		if (chmod(path, pg_file_create_mode) != 0)
+			pg_fatal("could not change permissions of file \"%s\": %m", path);
+	}
+}
+
+/*
+ * Before initdb, the target contained only pg_upgrade_output.d.
+ * Remove initialized data after --check or failed compatibility checks,
+ * preserving that log directory. Later upgrade failures retain the cluster.
+ */
+void
+cleanup_initdb_cluster(void)
+{
+	struct stat st;
+	char		path[MAXPGPATH];
+
+	if (initdb_keep_cluster || !initdb_succeeded)
+		return;
+
+	snprintf(path, sizeof(path), "%s/postmaster.pid", initdb_target);
+	if (os_info.running_cluster == &new_cluster ||
+		lstat(path, &st) == 0 || (errno != ENOENT && errno != ENOTDIR))
+	{
+		pg_log(PG_WARNING, "cannot confirm new server shutdown, retaining cluster at \"%s\"", initdb_target);
+		goto fail;
+	}
+
+	if (initdb_waldir[0])
+	{
+		if (!rmtree(initdb_waldir, !initdb_wal_existed) ||
+			(initdb_wal_existed && chmod(initdb_waldir, initdb_wal_mode) != 0))
+			goto fail;
+		strlcpy(path, initdb_waldir, sizeof(path));
+		get_parent_directory(path);
+		while (!initdb_wal_existed && strcmp(path, initdb_wal_parent) != 0)
+		{
+			if (rmdir(path) != 0 && errno != ENOENT)
+			{
+				if (errno == ENOTEMPTY || errno == EEXIST)
+					break;
+				pg_log(PG_WARNING, "could not remove directory \"%s\": %m", path);
+				goto fail;
+			}
+			get_parent_directory(path);
+		}
+	}
+
+	if (!rmtree_except(initdb_target, BASE_OUTPUTDIR))
+		goto fail;
+	initdb_succeeded = false;
+	return;
+
+fail:
+	pg_log(PG_WARNING, "could not clean up initialization under \"%s\"", initdb_target);
+	/* _exit() skips the finalizer registered to restore target permissions. */
+	finalize_initdb();
+	fflush(NULL);
+	_exit(1);
+}
+
+
+/*
+ * Read the old cluster's control data and template0 settings for initdb.
+ */
+static void
+get_old_cluster_initdb_info(void)
+{
+	bool		keep_old_running = user_opts.wal_upgrade && !user_opts.check;
+
+	old_cluster.major_version = get_pg_version(old_cluster.pgdata,
+											   &old_cluster.major_version_str);
+	if (old_cluster.bin_version == 0)
+		old_cluster.bin_version = old_cluster.major_version;
+
+	if (!old_cluster.sockdir)
+		old_cluster.sockdir = user_opts.socketdir ? user_opts.socketdir : ".";
+
+	/* Allow a running old server for --check, as setup() does. */
+	if (pid_lock_file_exists(old_cluster.pgdata))
+	{
+		if (start_postmaster(&old_cluster, false))
+			stop_postmaster(false);
+		else if (!user_opts.check)
+			pg_fatal("There seems to be a postmaster servicing the old cluster.\n"
+					 "Please shutdown that postmaster and try again.");
+		else
+			user_opts.live_check = true;
+	}
+
+	get_sock_dir(&old_cluster);
+	get_control_data(&old_cluster);
+
+	prep_status("Examining old cluster settings");
+	if (!user_opts.live_check)
+		start_postmaster(&old_cluster, true);
+
+	get_template0_info(&old_cluster);
+	if (user_opts.wal_upgrade)
+		old_cluster_archive_command = get_old_cluster_archive_command();
+	/* Keep the old server running for checks, dump, and HANDOFF. */
+	if (!user_opts.live_check && !keep_old_running)
+		stop_postmaster(false);
+	check_ok();
+}
+
+
+/*
+ * Build the initdb command using the old cluster's settings and any
+ * arguments supplied with --initdb-options.
+ */
+static void
+build_new_cluster_initdb_cmd(PQExpBuffer cmd)
+{
+	DbLocaleInfo *locale = old_cluster.template0;
+	const char *encoding_name = pg_encoding_to_char(locale->db_encoding);
+	char		initdb_path[MAXPGPATH];
+
+	snprintf(initdb_path, sizeof(initdb_path), "%s/initdb", new_cluster.bindir);
+
+	prep_status("Constructing new cluster initdb command");
+
+	initPQExpBuffer(cmd);
+
+	/*
+	 * Build the command with appendShellString() for every value that comes
+	 * from outside our control: the username is from the command line, and
+	 * the encoding and locale strings are read from the old cluster's
+	 * template0. This prevents shell metacharacters in any of them from
+	 * breaking out of their argument when the command is run through the
+	 * shell.
+	 */
+	appendShellString(cmd, initdb_path);
+	appendPQExpBufferStr(cmd, " --for-pg-upgrade=");
+	appendShellString(cmd, initdb_state_file);
+	appendPQExpBufferStr(cmd, " -N -D ");
+	appendShellString(cmd, new_cluster.pgdata);
+	appendPQExpBufferStr(cmd, " -U ");
+	appendShellString(cmd, os_info.user);
+	appendPQExpBuffer(cmd, " --wal-segsize=%u",
+					  old_cluster.controldata.walseg / (1024 * 1024));
+
+	/*
+	 * Pass --data-checksums or --no-data-checksums explicitly.  Starting from
+	 * PG18, initdb enables checksums by default, so we must mirror the old
+	 * cluster's setting to avoid a mismatch that check_control_data() would
+	 * reject.
+	 */
+	if (old_cluster.controldata.data_checksum_version != 0)
+		appendPQExpBufferStr(cmd, " --data-checksums");
+	else
+		appendPQExpBufferStr(cmd, " --no-data-checksums");
+
+	appendPQExpBufferStr(cmd, " --encoding=");
+	appendShellString(cmd, encoding_name);
+	appendPQExpBufferStr(cmd, " --locale-provider=");
+	appendShellString(cmd, collprovider_name(locale->db_collprovider));
+	appendPQExpBufferStr(cmd, " --lc-collate=");
+	appendShellString(cmd, locale->db_collate);
+	appendPQExpBufferStr(cmd, " --lc-ctype=");
+	appendShellString(cmd, locale->db_ctype);
+
+	if (locale->db_locale)
+	{
+		if (locale->db_collprovider == COLLPROVIDER_ICU)
+		{
+			appendPQExpBufferStr(cmd, " --icu-locale=");
+			appendShellString(cmd, locale->db_locale);
+		}
+		else if (locale->db_collprovider == COLLPROVIDER_BUILTIN)
+		{
+			appendPQExpBufferStr(cmd, " --builtin-locale=");
+			appendShellString(cmd, locale->db_locale);
+		}
+	}
+
+	for (int i = 0; i < user_opts.num_initdb_options; i++)
+	{
+		appendPQExpBufferChar(cmd, ' ');
+		appendShellString(cmd, user_opts.initdb_options[i]);
+	}
+
+	check_ok();
+}
+
+
+/* Initialize the new cluster before checking compatibility with the old cluster. */
+static void
+create_new_cluster_via_initdb(void)
+{
+	PQExpBufferData cmd;
+
+	get_old_cluster_initdb_info();
+	build_new_cluster_initdb_cmd(&cmd);
+
+	prep_status("Creating new cluster with initdb");
+
+	exec_prog(UTILITY_LOG_FILE, NULL, true, true, "%s", cmd.data);
+
+	/*
+	 * --initdb-options may override -D. Confirm that initdb populated the
+	 * requested target before allowing cleanup to remove its contents.
+	 */
+	check_data_dir(&new_cluster);
+	{
+		FILE	   *state = fopen(initdb_state_file, "r");
+		char	   *header = state ? pg_get_line(state, NULL) : NULL;
+		int			existed;
+		unsigned int mode;
+
+		initdb_waldir = state ? pg_get_line(state, NULL) : NULL;
+		initdb_wal_parent = state ? pg_get_line(state, NULL) : NULL;
+		if (!header || !initdb_waldir || !initdb_wal_parent ||
+			sscanf(header, "%d %o", &existed, &mode) != 2 ||
+			(existed != 0 && existed != 1))
+			pg_fatal("could not read initialization state from \"%s\", retaining cluster",
+					 initdb_state_file);
+		if (fclose(state) != 0)
+			pg_fatal("could not close file \"%s\": %m", initdb_state_file);
+		pg_strip_crlf(initdb_waldir);
+		pg_strip_crlf(initdb_wal_parent);
+		initdb_wal_existed = existed;
+		initdb_wal_mode = mode;
+		pg_free(header);
+	}
+	initdb_succeeded = true;
+
+	termPQExpBuffer(&cmd);
+	check_ok();
+}
+
+
 static void
 setup(char *argv0)
 {
@@ -372,22 +983,13 @@ setup(char *argv0)
 	 * with -B, default to using the path of the currently executed pg_upgrade
 	 * binary.
 	 */
-	if (!new_cluster.bindir)
-	{
-		char		exec_path[MAXPGPATH];
-
-		if (find_my_exec(argv0, exec_path) < 0)
-			pg_fatal("%s: could not find own program executable", argv0);
-		/* Trim off program name and keep just path */
-		*last_dir_separator(exec_path) = '\0';
-		canonicalize_path(exec_path);
-		new_cluster.bindir = pg_strdup(exec_path);
-	}
+	resolve_new_bindir(argv0);
 
 	verify_directories();
 
 	/* no postmasters should be running, except for a live check */
-	if (pid_lock_file_exists(old_cluster.pgdata))
+	if (os_info.running_cluster != &old_cluster &&
+		pid_lock_file_exists(old_cluster.pgdata))
 	{
 		/*
 		 * If we have a postmaster.pid file, try to start the server.  If it
@@ -593,10 +1195,14 @@ prepare_new_globals(void)
 
 
 static void
-create_new_objects(void)
+create_new_objects(UpgradePreparation *preparation)
 {
 	int			dbnum;
 	PGconn	   *conn_new_template1;
+
+	PGresult   *lsn_res;
+	uint64		lsn_before = 0,
+				lsn_after = 0;
 
 	prep_status_progress("Restoring database schemas in the new cluster");
 
@@ -609,6 +1215,15 @@ create_new_objects(void)
 	 */
 	conn_new_template1 = connectToServer(&new_cluster, "template1");
 	PQclear(executeQueryOrDie(conn_new_template1, "CHECKPOINT"));
+
+	if (user_opts.wal_upgrade)
+	{
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_before = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+	}
+
 	PQfinish(conn_new_template1);
 
 	/*
@@ -714,8 +1329,33 @@ create_new_objects(void)
 	end_progress_output();
 	check_ok();
 
+	if (user_opts.wal_upgrade)
+	{
+		conn_new_template1 = connectToServer(&new_cluster, "template1");
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_after = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+		PQfinish(conn_new_template1);
+
+		log_opts.pg_upgrade_wal_bytes = lsn_after - lsn_before;
+		pg_log(PG_VERBOSE, "pg_upgrade_wal_bytes: " UINT64_FORMAT,
+			   log_opts.pg_upgrade_wal_bytes);
+	}
+
+#if defined(USE_ASSERT_CHECKING) && defined(USE_INJECTION_POINTS)
+	/* Include test functions in the inventory before streaming starts. */
+	if (user_opts.wal_upgrade && getenv("PG_UPGRADE_TEST_INJECTION_POINTS") != NULL)
+	{
+		conn_new_template1 = connectToServer(&new_cluster, "template1");
+		PQclear(executeQueryOrDie(conn_new_template1,
+								 "CREATE EXTENSION injection_points WITH SCHEMA public"));
+		PQfinish(conn_new_template1);
+	}
+#endif
+
 	/* update new_cluster info now that we have objects in the databases */
-	get_db_rel_and_slot_infos(&new_cluster);
+	get_db_rel_and_slot_infos(&new_cluster, preparation);
 }
 
 /*
@@ -800,7 +1440,7 @@ copy_xact_xlog_xid(void)
 
 	/* Copy or convert pg_multixact files */
 	Assert(new_cluster.controldata.cat_ver >= MULTIXACTOFFSET_FORMATCHANGE_CAT_VER);
-	if (old_cluster.controldata.cat_ver >= MULTIXACTOFFSET_FORMATCHANGE_CAT_VER)
+	if (old_cluster.controldata.chkpnt_nxtmxoff_size == (int) sizeof(uint64))
 	{
 		/* No change in multixact format, just copy the files */
 		MultiXactId new_nxtmulti = old_cluster.controldata.chkpnt_nxtmulti;
@@ -822,7 +1462,8 @@ copy_xact_xlog_xid(void)
 				  new_cluster.pgdata);
 		check_ok();
 	}
-	else
+	else if (old_cluster.controldata.chkpnt_nxtmxoff_size ==
+			 (int) sizeof(uint32))
 	{
 		/* Conversion is needed */
 		MultiXactId nxtmulti;
@@ -862,8 +1503,10 @@ copy_xact_xlog_xid(void)
 				  new_cluster.pgdata);
 		check_ok();
 	}
+	else
+		pg_fatal("old cluster has unsupported multixact offset width %d",
+				 old_cluster.controldata.chkpnt_nxtmxoff_size);
 
-	/* now reset the wal archives in the new cluster */
 	prep_status("Resetting WAL archives");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 	/* use timeline 1 to match controldata and no WAL history file */

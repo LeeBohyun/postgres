@@ -5848,6 +5848,10 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 	if (!BufferIsValid(buffer))
 		elog(ERROR, "bad buffer ID: %d", buffer);
 
+	/* Do not dirty buffers for hint changes during binary upgrade. */
+	if (IsBinaryUpgrade)
+		return;
+
 	if (BufferIsLocal(buffer))
 	{
 		MarkLocalBufferDirty(buffer);

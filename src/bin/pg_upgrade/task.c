@@ -50,7 +50,7 @@
 
 /*
  * dbs_complete stores the number of databases that we have completed
- * processing.  When this value equals the number of databases in the cluster,
+ * processing.  When this value equals the number of databases in this run,
  * the task is finished.
  */
 static int	dbs_complete;
@@ -233,7 +233,8 @@ process_query_result(const ClusterInfo *cluster, UpgradeTaskSlot *slot,
  * Advances the state machine for a given slot as necessary.
  */
 static void
-process_slot(const ClusterInfo *cluster, UpgradeTaskSlot *slot, const UpgradeTask *task)
+process_slot(const ClusterInfo *cluster, UpgradeTaskSlot *slot,
+			 const UpgradeTask *task, int end_db)
 {
 	PostgresPollingStatusType status;
 
@@ -245,10 +246,10 @@ process_slot(const ClusterInfo *cluster, UpgradeTaskSlot *slot, const UpgradeTas
 		case FREE:
 
 			/*
-			 * If all of the databases in the cluster have been processed or
+			 * If all of the databases in this run have been processed or
 			 * are currently being processed by other slots, we are done.
 			 */
-			if (dbs_processing >= cluster->dbarr.ndbs)
+			if (dbs_processing >= end_db)
 				return;
 
 			/*
@@ -319,7 +320,7 @@ process_slot(const ClusterInfo *cluster, UpgradeTaskSlot *slot, const UpgradeTas
 			memset(slot, 0, sizeof(UpgradeTaskSlot));
 			slot->ready = true;
 
-			process_slot(cluster, slot, task);
+			process_slot(cluster, slot, task, end_db);
 
 			return;
 	}
@@ -420,11 +421,22 @@ wait_on_slots(UpgradeTaskSlot *slots, int numslots)
 void
 upgrade_task_run(const UpgradeTask *task, const ClusterInfo *cluster)
 {
+	upgrade_task_run_range(task, cluster, 0, cluster->dbarr.ndbs);
+}
+
+/* Run the task for database indices [first_db, end_db). */
+void
+upgrade_task_run_range(const UpgradeTask *task, const ClusterInfo *cluster,
+					   int first_db, int end_db)
+{
 	int			jobs = Max(1, user_opts.jobs);
 	UpgradeTaskSlot *slots = pg_malloc0_array(UpgradeTaskSlot, jobs);
 
+	Assert(first_db >= 0 && first_db <= end_db);
+	Assert(end_db <= cluster->dbarr.ndbs);
+
 	dbs_complete = 0;
-	dbs_processing = 0;
+	dbs_processing = first_db;
 
 	/*
 	 * Process every slot the first time round.
@@ -432,10 +444,10 @@ upgrade_task_run(const UpgradeTask *task, const ClusterInfo *cluster)
 	for (int i = 0; i < jobs; i++)
 		slots[i].ready = true;
 
-	while (dbs_complete < cluster->dbarr.ndbs)
+	while (dbs_complete < end_db - first_db)
 	{
 		for (int i = 0; i < jobs; i++)
-			process_slot(cluster, &slots[i], task);
+			process_slot(cluster, &slots[i], task, end_db);
 
 		wait_on_slots(slots, jobs);
 	}

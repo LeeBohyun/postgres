@@ -19,6 +19,7 @@
  */
 #include "postgres.h"
 
+#include "access/pgupgrade_wal.h"
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -250,6 +251,9 @@ StartupProcessMain(const void *startup_data, size_t startup_data_len)
 	 * Unblock signals (they were blocked when the postmaster forked us)
 	 */
 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+
+	/* Arm upgrade recovery before StartupXLOG selects its redo start. */
+	PerformWalUpgradeIfNeeded();
 
 	/*
 	 * Do what we came for.

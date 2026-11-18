@@ -10,17 +10,10 @@
 #include "postgres_fe.h"
 
 #include <sys/stat.h>
-#include <limits.h>
 #include <fcntl.h>
-#ifdef HAVE_COPYFILE_H
-#include <copyfile.h>
-#endif
-#ifdef __linux__
-#include <sys/ioctl.h>
-#include <linux/fs.h>
-#endif
 
 #include "common/file_perm.h"
+#include "common/file_utils.h"
 #include "pg_upgrade.h"
 
 
@@ -32,39 +25,20 @@
  * schemaName/relName are relation's SQL name (used for error messages only).
  */
 void
-cloneFile(const char *src, const char *dst,
+cloneFile(const char *source, const char *dst,
 		  const char *schemaName, const char *relName)
 {
-#if defined(HAVE_COPYFILE) && defined(COPYFILE_CLONE_FORCE)
-	if (copyfile(src, dst, NULL, COPYFILE_CLONE_FORCE) < 0)
-		pg_fatal("error while cloning relation \"%s.%s\" (\"%s\" to \"%s\"): %m",
-				 schemaName, relName, src, dst);
-#elif defined(__linux__) && defined(FICLONE)
-	int			src_fd;
-	int			dest_fd;
+	int			save_errno;
 
-	if ((src_fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
-		pg_fatal("error while cloning relation \"%s.%s\": could not open file \"%s\": %m",
-				 schemaName, relName, src);
-
-	if ((dest_fd = open(dst, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
-						pg_file_create_mode)) < 0)
-		pg_fatal("error while cloning relation \"%s.%s\": could not create file \"%s\": %m",
-				 schemaName, relName, dst);
-
-	if (ioctl(dest_fd, FICLONE, src_fd) < 0)
+	switch (pg_clone_file(source, dst, &save_errno))
 	{
-		int			save_errno = errno;
-
-		unlink(dst);
-
-		pg_fatal("error while cloning relation \"%s.%s\" (\"%s\" to \"%s\"): %s",
-				 schemaName, relName, src, dst, strerror(save_errno));
+		case PG_REFLINK_OK:
+		case PG_REFLINK_UNSUPPORTED:
+			break;
+		case PG_REFLINK_ERROR:
+			pg_fatal("error while cloning relation \"%s.%s\" (\"%s\" to \"%s\"): %s",
+					 schemaName, relName, source, dst, strerror(save_errno));
 	}
-
-	close(src_fd);
-	close(dest_fd);
-#endif
 }
 
 
@@ -144,35 +118,20 @@ copyFile(const char *src, const char *dst,
  * schemaName/relName are relation's SQL name (used for error messages only).
  */
 void
-copyFileByRange(const char *src, const char *dst,
+copyFileByRange(const char *source, const char *dst,
 				const char *schemaName, const char *relName)
 {
-#ifdef HAVE_COPY_FILE_RANGE
-	int			src_fd;
-	int			dest_fd;
-	ssize_t		nbytes;
+	int			save_errno;
 
-	if ((src_fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
-		pg_fatal("error while copying relation \"%s.%s\": could not open file \"%s\": %m",
-				 schemaName, relName, src);
-
-	if ((dest_fd = open(dst, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
-						pg_file_create_mode)) < 0)
-		pg_fatal("error while copying relation \"%s.%s\": could not create file \"%s\": %m",
-				 schemaName, relName, dst);
-
-	do
+	switch (pg_copy_file_range_all(source, dst, &save_errno))
 	{
-		nbytes = copy_file_range(src_fd, NULL, dest_fd, NULL, SSIZE_MAX, 0);
-		if (nbytes < 0)
-			pg_fatal("error while copying relation \"%s.%s\": could not copy file range from \"%s\" to \"%s\": %m",
-					 schemaName, relName, src, dst);
+		case PG_REFLINK_OK:
+		case PG_REFLINK_UNSUPPORTED:
+			break;
+		case PG_REFLINK_ERROR:
+			pg_fatal("error while copying relation \"%s.%s\": could not copy file range from \"%s\" to \"%s\": %s",
+					 schemaName, relName, source, dst, strerror(save_errno));
 	}
-	while (nbytes > 0);
-
-	close(src_fd);
-	close(dest_fd);
-#endif
 }
 
 
@@ -197,37 +156,22 @@ check_file_clone(void)
 {
 	char		existing_file[MAXPGPATH];
 	char		new_link_file[MAXPGPATH];
+	int			save_errno;
 
 	snprintf(existing_file, sizeof(existing_file), "%s/PG_VERSION", old_cluster.pgdata);
 	snprintf(new_link_file, sizeof(new_link_file), "%s/PG_VERSION.clonetest", new_cluster.pgdata);
 	unlink(new_link_file);		/* might fail */
 
-#if defined(HAVE_COPYFILE) && defined(COPYFILE_CLONE_FORCE)
-	if (copyfile(existing_file, new_link_file, NULL, COPYFILE_CLONE_FORCE) < 0)
-		pg_fatal("could not clone file between old and new data directories: %m");
-#elif defined(__linux__) && defined(FICLONE)
+	switch (pg_clone_file(existing_file, new_link_file, &save_errno))
 	{
-		int			src_fd;
-		int			dest_fd;
-
-		if ((src_fd = open(existing_file, O_RDONLY | PG_BINARY, 0)) < 0)
-			pg_fatal("could not open file \"%s\": %m",
-					 existing_file);
-
-		if ((dest_fd = open(new_link_file, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
-							pg_file_create_mode)) < 0)
-			pg_fatal("could not create file \"%s\": %m",
-					 new_link_file);
-
-		if (ioctl(dest_fd, FICLONE, src_fd) < 0)
+		case PG_REFLINK_OK:
+			break;
+		case PG_REFLINK_UNSUPPORTED:
+			pg_fatal("file cloning not supported on this platform");
+		case PG_REFLINK_ERROR:
+			errno = save_errno;
 			pg_fatal("could not clone file between old and new data directories: %m");
-
-		close(src_fd);
-		close(dest_fd);
 	}
-#else
-	pg_fatal("file cloning not supported on this platform");
-#endif
 
 	unlink(new_link_file);
 }
@@ -237,34 +181,22 @@ check_copy_file_range(void)
 {
 	char		existing_file[MAXPGPATH];
 	char		new_link_file[MAXPGPATH];
+	int			save_errno;
 
 	snprintf(existing_file, sizeof(existing_file), "%s/PG_VERSION", old_cluster.pgdata);
 	snprintf(new_link_file, sizeof(new_link_file), "%s/PG_VERSION.copy_file_range_test", new_cluster.pgdata);
 	unlink(new_link_file);		/* might fail */
 
-#if defined(HAVE_COPY_FILE_RANGE)
+	switch (pg_copy_file_range_all(existing_file, new_link_file, &save_errno))
 	{
-		int			src_fd;
-		int			dest_fd;
-
-		if ((src_fd = open(existing_file, O_RDONLY | PG_BINARY, 0)) < 0)
-			pg_fatal("could not open file \"%s\": %m",
-					 existing_file);
-
-		if ((dest_fd = open(new_link_file, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
-							pg_file_create_mode)) < 0)
-			pg_fatal("could not create file \"%s\": %m",
-					 new_link_file);
-
-		if (copy_file_range(src_fd, NULL, dest_fd, NULL, SSIZE_MAX, 0) < 0)
+		case PG_REFLINK_OK:
+			break;
+		case PG_REFLINK_UNSUPPORTED:
+			pg_fatal("copy_file_range not supported on this platform");
+		case PG_REFLINK_ERROR:
+			errno = save_errno;
 			pg_fatal("could not copy file range between old and new data directories: %m");
-
-		close(src_fd);
-		close(dest_fd);
 	}
-#else
-	pg_fatal("copy_file_range not supported on this platform");
-#endif
 
 	unlink(new_link_file);
 }

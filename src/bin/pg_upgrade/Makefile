@@ -3,7 +3,7 @@
 PGFILEDESC = "pg_upgrade - an in-place binary upgrade utility"
 PGAPPICON = win32
 
-EXTRA_INSTALL=contrib/test_decoding src/test/modules/dummy_seclabel src/test/modules/test_extensions
+EXTRA_INSTALL=contrib/test_decoding src/test/modules/dummy_seclabel src/test/modules/test_extensions src/test/modules/test_slru
 
 subdir = src/bin/pg_upgrade
 top_builddir = ../../..
@@ -18,6 +18,7 @@ OBJS = \
 	file.o \
 	function.o \
 	info.o \
+	relink_file.o \
 	multixact_read_v18.o \
 	multixact_rewrite.o \
 	option.o \
@@ -29,7 +30,8 @@ OBJS = \
 	tablespace.o \
 	task.o \
 	util.o \
-	version.o
+	version.o \
+	prepare_upgrade.o
 
 override CPPFLAGS := -I$(srcdir) -I$(libpq_srcdir) $(CPPFLAGS)
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)

@@ -27,6 +27,7 @@
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "commands/trigger.h"
+#include "common/file_utils.h"
 #include "common/pg_lzcompress.h"
 #include "executor/executor.h"
 #include "executor/functions.h"
@@ -1279,6 +1280,22 @@ binary_coercible(PG_FUNCTION_ARGS)
 	Oid			targettype = PG_GETARG_OID(1);
 
 	PG_RETURN_BOOL(IsBinaryCoercible(srctype, targettype));
+}
+
+PG_FUNCTION_INFO_V1(test_pg_upgrade_directory_paths);
+Datum
+test_pg_upgrade_directory_paths(PG_FUNCTION_ARGS)
+{
+	EXPECT_TRUE(path_is_safe_for_extraction("base"));
+	EXPECT_TRUE(path_is_safe_for_extraction("base/5"));
+	EXPECT_TRUE(path_is_safe_for_extraction("pg_multixact/offsets"));
+	EXPECT_TRUE(!path_is_safe_for_extraction("/base"));
+	EXPECT_TRUE(!path_is_safe_for_extraction(".."));
+	EXPECT_TRUE(!path_is_safe_for_extraction("../base"));
+	EXPECT_TRUE(path_is_safe_for_extraction("base/../global"));
+	EXPECT_TRUE(path_is_safe_for_extraction("base/.."));
+
+	PG_RETURN_BOOL(true);
 }
 
 /*

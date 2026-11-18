@@ -11,6 +11,7 @@
 
 #include "postgres.h"
 
+#include "access/pgupgrade_emit.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/binary_upgrade.h"
@@ -444,5 +445,13 @@ binary_upgrade_create_conflict_detection_slot(PG_FUNCTION_ARGS)
 
 	ReplicationSlotRelease();
 
+	PG_RETURN_VOID();
+}
+
+Datum
+binary_upgrade_emit_wal_file(PG_FUNCTION_ARGS)
+{
+	CHECK_IS_BINARY_UPGRADE;
+	PgUpgradeEmitWalFile();
 	PG_RETURN_VOID();
 }
