@@ -9,6 +9,11 @@
 
 #include "postgres_fe.h"
 
+#ifndef WIN32
+#include <signal.h>
+#include <sys/wait.h>
+#endif
+
 #include "common/connect.h"
 #include "fe_utils/string_utils.h"
 #include "lib/stringinfo.h"
@@ -16,6 +21,10 @@
 #include "pg_upgrade.h"
 
 static PGconn *get_db_conn(ClusterInfo *cluster, const char *db_name);
+static PGconn *pg_upgrade_handoff_shutdown_guard = NULL;
+#ifndef WIN32
+static void stop_postmaster_for_handoff(ClusterInfo *cluster);
+#endif
 
 
 /*
@@ -153,6 +162,8 @@ executeQueryOrDie(PGconn *conn, const char *fmt, ...)
 		pg_log(PG_REPORT, "SQL command failed\n%s\n%s", query.data,
 			   PQerrorMessage(conn));
 		PQclear(result);
+		if (conn == pg_upgrade_handoff_shutdown_guard)
+			pg_upgrade_handoff_shutdown_guard = NULL;
 		PQfinish(conn);
 		printf(_("Failure, exiting\n"));
 		exit(1);
@@ -166,6 +177,30 @@ static void
 stop_postmaster_atexit(void)
 {
 	stop_postmaster(true);
+	cleanup_pg_upgrade_handoff_after_stop();
+}
+
+
+static bool postmaster_stop_started = false;
+
+
+/*
+ * Start smart shutdown with an open old-primary connection holding it before
+ * the shutdown checkpoint.
+ */
+PGconn *
+begin_postmaster_stop_for_handoff(ClusterInfo *cluster)
+{
+	Assert(cluster == &old_cluster);
+	Assert(pg_upgrade_handoff_shutdown_guard == NULL);
+
+	pg_upgrade_handoff_shutdown_guard = connectToServer(cluster, "template1");
+	exec_prog(SERVER_STOP_LOG_FILE, NULL, true, true,
+			  "\"%s/pg_ctl\" -W -D \"%s\" -o \"%s\" -m smart stop",
+			  cluster->bindir, cluster->pgconfig,
+			  cluster->pgopts ? cluster->pgopts : "");
+
+	return pg_upgrade_handoff_shutdown_guard;
 }
 
 
@@ -190,7 +225,8 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	initPQExpBuffer(&socket_options);
 
 #if !defined(WIN32)
-	appendPQExpBufferStr(&socket_options, " -c listen_addresses=''");
+	if (!(cluster == &old_cluster && old_cluster.listen_addresses != NULL))
+		appendPQExpBufferStr(&socket_options, " -c listen_addresses=''");
 	appendPQExpBufferStr(&socket_options,
 						 " -c unix_socket_permissions=0700");
 
@@ -200,6 +236,18 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 						  " -c unix_socket_directories='%s'",
 						  cluster->sockdir);
 #endif
+
+	if (cluster == &old_cluster && old_cluster.listen_addresses != NULL)
+	{
+		PQExpBufferData listen_option;
+
+		initPQExpBuffer(&listen_option);
+		appendPQExpBuffer(&listen_option, "listen_addresses=%s",
+						  old_cluster.listen_addresses);
+		appendPQExpBufferStr(&socket_options, " -c ");
+		appendShellString(&socket_options, listen_option.data);
+		termPQExpBuffer(&listen_option);
+	}
 
 	initPQExpBuffer(&pgoptions);
 
@@ -285,7 +333,10 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	 * during the upgrade.
 	 */
 	if (pg_ctl_return)
+	{
 		os_info.running_cluster = cluster;
+		postmaster_stop_started = false;
+	}
 
 	/*
 	 * pg_ctl -w might have failed because the server couldn't be started, or
@@ -332,8 +383,7 @@ void
 stop_postmaster(bool in_atexit)
 {
 	ClusterInfo *cluster;
-	PQExpBufferData options;
-	bool		stopped;
+	bool		handoff_guarded_stop = false;
 
 	if (os_info.running_cluster == &old_cluster)
 		cluster = &old_cluster;
@@ -342,24 +392,128 @@ stop_postmaster(bool in_atexit)
 	else
 		return;					/* no cluster running */
 
-	initPQExpBuffer(&options);
-	appendShellString(&options, cluster->pgopts ? cluster->pgopts : "");
-	stopped = exec_prog(SERVER_STOP_LOG_FILE, NULL, !in_atexit, !in_atexit,
-						"\"%s/pg_ctl\" -w -D \"%s\" -o %s %s stop",
-						cluster->bindir, cluster->pgconfig,
-						options.data, in_atexit ? "-m fast" : "-m smart");
-	termPQExpBuffer(&options);
-
-	/*
-	 * Clear the running-cluster marker only after confirmed shutdown.
-	 * Otherwise, --initdb cleanup could delete data still in use.
-	 */
-	if (!stopped)
+	/* During atexit, repeat only an incomplete HANDOFF stop. */
+	if (in_atexit && postmaster_stop_started &&
+		!pg_upgrade_handoff_requires_immediate_stop())
 		return;
+	postmaster_stop_started = true;
+
+	if (pg_upgrade_handoff_shutdown_guard != NULL)
+	{
+		Assert(cluster == &old_cluster);
+		handoff_guarded_stop = true;
+
+		/*
+		 * Outside atexit, request fast shutdown before closing the connection
+		 * that holds smart shutdown before its checkpoint.
+		 */
+		if (!in_atexit)
+			exec_prog(SERVER_STOP_LOG_FILE, NULL, true, true,
+					  "\"%s/pg_ctl\" -W -D \"%s\" -o \"%s\" -m fast stop",
+					  cluster->bindir, cluster->pgconfig,
+					  cluster->pgopts ? cluster->pgopts : "");
+		PQfinish(pg_upgrade_handoff_shutdown_guard);
+		pg_upgrade_handoff_shutdown_guard = NULL;
+	}
+
+#ifndef WIN32
+	if (!in_atexit && pg_upgrade_handoff_requires_immediate_stop())
+		stop_postmaster_for_handoff(cluster);
+	else
+#endif
+	if (!in_atexit && handoff_guarded_stop)
+	{
+		bool		stopped;
+
+		stopped = exec_prog(SERVER_STOP_LOG_FILE, NULL, true, false,
+							"\"%s/pg_ctl\" -w -D \"%s\" -o \"%s\" -m fast stop",
+							cluster->bindir, cluster->pgconfig,
+							cluster->pgopts ? cluster->pgopts : "");
+		if (!stopped && pid_lock_file_exists(cluster->pgdata))
+			pg_fatal("could not stop the old postmaster during pg_upgrade handoff");
+	}
+	else
+	{
+		PQExpBufferData options;
+		bool		stopped;
+
+		initPQExpBuffer(&options);
+		appendShellString(&options, cluster->pgopts ? cluster->pgopts : "");
+		stopped = exec_prog(SERVER_STOP_LOG_FILE, NULL, !in_atexit, !in_atexit,
+							"\"%s/pg_ctl\" -w -D \"%s\" -o %s %s stop",
+							cluster->bindir, cluster->pgconfig,
+							options.data, in_atexit ?
+							(pg_upgrade_handoff_requires_immediate_stop() ||
+							 (cluster == &old_cluster &&
+							  old_cluster.listen_addresses != NULL) ?
+							 "-m immediate" : "-m fast") : "-m smart");
+		termPQExpBuffer(&options);
+
+		/* Failed shutdown must prevent --initdb cleanup of data still in use. */
+		if (!stopped)
+			return;
+	}
 
 	os_info.running_cluster = NULL;
 }
 
+#ifndef WIN32
+/*
+ * Run pg_ctl in a subprocess and kill its process group after a frontend
+ * signal.
+ */
+static void
+stop_postmaster_for_handoff(ClusterInfo *cluster)
+{
+	pid_t		child;
+	int			status;
+
+	fflush(NULL);
+	child = fork();
+	if (child < 0)
+		pg_fatal("could not create process to stop the old postmaster: %m");
+	if (child == 0)
+	{
+		if (setpgid(0, 0) != 0)
+			_exit(EXIT_FAILURE);
+		os_info.running_cluster = NULL;
+		_exit(exec_prog(SERVER_STOP_LOG_FILE, NULL, true, false,
+						"\"%s/pg_ctl\" -w -D \"%s\" -o \"%s\" -m fast stop",
+						cluster->bindir, cluster->pgconfig,
+						cluster->pgopts ? cluster->pgopts : "") ?
+			  EXIT_SUCCESS : EXIT_FAILURE);
+	}
+
+	/* Place the subprocess in its process group from this process too. */
+	if (setpgid(child, child) != 0 && errno != EACCES && errno != ESRCH)
+	{
+		int			save_errno = errno;
+
+		(void) kill(child, SIGKILL);
+		(void) waitpid(child, &status, 0);
+		errno = save_errno;
+		pg_fatal("could not create process group to stop the old postmaster: %m");
+	}
+
+	for (;;)
+	{
+		pid_t		result = waitpid(child, &status, WNOHANG);
+		int			signal_status = pg_upgrade_handoff_signal_status();
+
+		if (result == child)
+			break;
+		if (result < 0 && errno != EINTR)
+			pg_fatal("could not wait for process stopping the old postmaster: %m");
+		if (signal_status != 0)
+			(void) kill(-child, SIGKILL);
+		pg_usleep(10000L);
+	}
+
+	if ((!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) &&
+		pid_lock_file_exists(cluster->pgdata))
+		pg_fatal("could not stop the old postmaster during pg_upgrade handoff");
+}
+#endif
 
 /*
  * check_pghost_envvar()

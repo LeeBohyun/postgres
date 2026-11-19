@@ -28,6 +28,8 @@
 
 #include "access/pgupgrade_config.h"
 #include "access/pgupgrade_control.h"
+#include "access/pgupgrade_handoff.h"
+#include "access/pgupgrade_handoff_receipt.h"
 #include "access/pgupgrade_wal.h"
 #include "access/timeline.h"
 #include "access/xact.h"
@@ -72,11 +74,18 @@ PgUpgradeCheckRecoveryFinish(void)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot finish recovery before pg_upgrade is finalized"),
 				 errhint("Discard this new-version attempt and retry from the retained old cluster.")));
+	if (XLogRecPtrIsValid(GetPgUpgradeHandoffRetention()))
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot finish recovery while pg_upgrade handoff is active")));
 }
 
 void
 PgUpgradeCheckRecoveryTarget(void)
 {
+	if (XLogRecPtrIsValid(GetPgUpgradeHandoffRetention()))
+		ereport(FATAL,
+				(errmsg("requested recovery stop point is before the pg_upgrade handoff checkpoint")));
 	if (replay_in_progress)
 		ereport(FATAL,
 				(errmsg("requested recovery stop point is inside a pg_upgrade transaction"),
@@ -97,6 +106,12 @@ typedef enum PgUpgradeCheckpointState
 	PG_UPGRADE_CHECKPOINT_PENDING,
 	PG_UPGRADE_CHECKPOINT_REPLAYED
 } PgUpgradeCheckpointState;
+
+/* HANDOFF checkpoint state until its restartpoint is durable. */
+static PgUpgradeCheckpointState handoff_checkpoint_state;
+static XLogRecPtr handoff_checkpoint_lsn = InvalidXLogRecPtr;
+static TimeLineID handoff_checkpoint_tli = 0;
+static uint32 handoff_new_major = 0;
 
 /*
  * Finalize the committed upgrade transaction after its shutdown checkpoint
@@ -448,7 +463,7 @@ inherited_filename(const xl_pg_upgrade_key *key, uint32 segment, char *path)
 
 	if (old_datadir == NULL || !old_datadir_at_boundary)
 		elog(PANIC, "segment transfer requires the old data directory at "
-			 "its final shutdown checkpoint");
+			 "its final HANDOFF checkpoint");
 	if (segment != 0)
 		snprintf(suffix, sizeof(suffix), ".%u", segment);
 	storage_root_path(key->tablespace_oid, true, root);
@@ -861,11 +876,16 @@ pg_upgrade_redo(XLogReaderState *record)
 	xl_pg_upgrade_marker marker;
 	const char *marker_error = NULL;
 
-	/* Upgrade records must have the same transaction ID as START. */
+	/*
+	 * Except for HANDOFF, upgrade records must have the same upgrade
+	 * transaction ID as START.
+	 *
+	 * Reject other upgrade record types until the last RELINK batch is replayed.
+	 */
 	if (upgrade_record_state != UPGRADE_RECORD_NONE &&
+		info != XLOG_UPGRADE_HANDOFF &&
 		XLogRecGetXid(record) != upgrade_xid)
 		elog(PANIC, "upgrade record has no matching START");
-	/* Reject other record types until the last RELINK batch is replayed. */
 	if (relink_state != RELINK_INACTIVE && info != XLOG_UPGRADE_RELINK)
 		elog(PANIC, "record interrupts an upgrade RELINK scope");
 
@@ -930,6 +950,32 @@ pg_upgrade_redo(XLogReaderState *record)
 	}
 	else if (info == XLOG_UPGRADE_RELINK)
 		ReplayUpgradeRelink(record);
+	else if (info == XLOG_UPGRADE_HANDOFF)
+	{
+		xl_pg_upgrade_handoff *xlrec =
+			(xl_pg_upgrade_handoff *) XLogRecGetData(record);
+
+		if (XLogRecGetDataLen(record) != SizeOfPgUpgradeHandoff)
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid pg_upgrade handoff record length")));
+		if (xlrec->old_major_version != PG_VERSION_NUM / 10000)
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("pg_upgrade handoff record has old major version %u, expected %u",
+							xlrec->old_major_version,
+							PG_VERSION_NUM / 10000)));
+
+		if (StandbyMode)
+		{
+			BeginPgUpgradeHandoff(record->ReadRecPtr);
+			handoff_checkpoint_state = PG_UPGRADE_CHECKPOINT_PENDING;
+			handoff_new_major = xlrec->new_major_version;
+			ereport(LOG,
+					(errmsg("reached pg_upgrade handoff on standby; waiting for "
+							"the final shutdown checkpoint")));
+		}
+	}
 	else if (info == XLOG_UPGRADE_RAWFILE)
 	{
 		/*
@@ -1011,11 +1057,37 @@ replay_complete(XLogReaderState *record)
 	upgrade_complete_checkpoint_state = PG_UPGRADE_CHECKPOINT_PENDING;
 }
 
-/* Remember the completion shutdown checkpoint for restartpoint verification. */
+/*
+ * Remember the pending HANDOFF or completion shutdown checkpoint for
+ * restartpoint verification.
+ */
 void
 PgUpgradeCheckpointReplayed(const CheckPoint *checkpoint,
 							XLogReaderState *record)
 {
+	if (handoff_checkpoint_state == PG_UPGRADE_CHECKPOINT_PENDING)
+	{
+		XLogRecPtr	handoff_lsn = GetPgUpgradeHandoffRetention();
+
+		if (XLogRecGetPrev(record) != handoff_lsn)
+		{
+			ereport(LOG,
+					(errmsg("shutdown checkpoint supersedes an incomplete pg_upgrade handoff")));
+			handoff_checkpoint_state = PG_UPGRADE_CHECKPOINT_NONE;
+			CancelPgUpgradeHandoff();
+			return;
+		}
+		if (checkpoint->redo != record->ReadRecPtr)
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("shutdown checkpoint after pg_upgrade handoff has an "
+							"invalid REDO location")));
+
+		handoff_checkpoint_lsn = record->ReadRecPtr;
+		handoff_checkpoint_tli = checkpoint->ThisTimeLineID;
+		handoff_checkpoint_state = PG_UPGRADE_CHECKPOINT_REPLAYED;
+	}
+
 	if (upgrade_complete_checkpoint_state == PG_UPGRADE_CHECKPOINT_PENDING)
 	{
 		if (checkpoint->redo != record->ReadRecPtr ||
@@ -1030,14 +1102,49 @@ PgUpgradeCheckpointReplayed(const CheckPoint *checkpoint,
 	}
 }
 
-/* Persist the completion restartpoint and mark upgrade replay finalized. */
+/*
+ * Persist and verify a restartpoint for the replayed shutdown checkpoint.
+ * HANDOFF then persists each physical slot's receipt LSN and either cancels on
+ * a resume request or enters durable pause. COMPLETE removes pg_upgrade.signal
+ * and marks replay finalized.
+ */
 void
 PgUpgradeCheckpointApplied(void)
 {
-	if (upgrade_complete_checkpoint_state != PG_UPGRADE_CHECKPOINT_REPLAYED)
+	if (handoff_checkpoint_state != PG_UPGRADE_CHECKPOINT_REPLAYED &&
+		upgrade_complete_checkpoint_state != PG_UPGRADE_CHECKPOINT_REPLAYED)
 		return;
 
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST | CHECKPOINT_WAIT);
+
+	if (handoff_checkpoint_state == PG_UPGRADE_CHECKPOINT_REPLAYED)
+	{
+		VerifyUpgradeRestartPoint(handoff_checkpoint_lsn,
+								  handoff_checkpoint_tli);
+		handoff_checkpoint_state = PG_UPGRADE_CHECKPOINT_NONE;
+
+		if (!HotStandbyActive())
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("reached the final pg_upgrade checkpoint before hot standby was active"),
+					 errdetail("The primary is upgrading to major version %u.",
+							   handoff_new_major)));
+
+		if (!PgUpgradeWaitForHandoffSlots(GetXLogReplayRecPtr(NULL)))
+		{
+			CancelPgUpgradeHandoff();
+			ereport(LOG,
+					(errmsg("cancelled the pg_upgrade handoff at operator request")));
+			return;
+		}
+		CompletePgUpgradeHandoff();
+		ereport(LOG,
+				(errmsg("reached the final old-major shutdown checkpoint; "
+						"pausing recovery for pg_upgrade"),
+				 errhint("Provision the new-version standby from this retained "
+						 "data directory, or resume recovery to roll back the "
+						 "upgrade attempt.")));
+	}
 
 	if (upgrade_complete_checkpoint_state == PG_UPGRADE_CHECKPOINT_REPLAYED)
 	{

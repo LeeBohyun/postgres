@@ -20,6 +20,9 @@
 /* Maximum relink input entries read together. */
 #define PG_UPGRADE_RELINK_INPUT_BUFFER_ENTRIES 4096
 
+#define PG_UPGRADE_ENDPOINT_FILE "pg_upgrade_endpoint"
+#define PG_UPGRADE_HANDOFF_SIGNAL_FILE "pg_upgrade_handoff.pending"
+
 /*
  * Preparation creates this file. pg_upgrade attempts to remove it after the
  * upgrade transaction commits.

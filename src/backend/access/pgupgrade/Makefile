@@ -16,6 +16,8 @@ OBJS = \
 	config.o \
 	control.o \
 	emit.o \
+	handoff.o \
+	handoff_receipt.o \
 	records.o \
 	replay.o \
 	retention_slots.o \

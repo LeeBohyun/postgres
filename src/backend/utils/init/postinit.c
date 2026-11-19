@@ -22,6 +22,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/pgupgrade_config.h"
 #include "access/session.h"
 #include "access/tableam.h"
 #include "access/xact.h"
@@ -727,6 +728,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
 	bool		am_superuser;
+	bool		binary_upgrade_replication = false;
 	char	   *fullpath;
 	char		dbname[NAMEDATALEN];
 	int			nfree = 0;
@@ -963,10 +965,13 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		pgstat_bestart_security();
 	}
 
-	/*
-	 * Binary upgrades only allowed super-user connections
-	 */
-	if (IsBinaryUpgrade && !am_superuser)
+	if (IsBinaryUpgrade && MyProcPort != NULL)
+		binary_upgrade_replication =
+			PgUpgradeValidateConnection(MyProcPort);
+
+	/* Binary upgrades otherwise allow only superuser connections. */
+	if (IsBinaryUpgrade && !am_superuser &&
+		!binary_upgrade_replication)
 	{
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),

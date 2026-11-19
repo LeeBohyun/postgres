@@ -15,6 +15,9 @@ use File::Copy qw(copy);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use WalUpgradeTest qw(require_wal_upgrade_source);
 
 # pg_upgrade writes its output files in the current directory.
 chdir ${PostgreSQL::Test::Utils::tmp_check};
@@ -193,6 +196,7 @@ sub add_conn_conf
 	my $old =
 	  PostgreSQL::Test::Cluster->new('old_pitr',
 		install_path => $ENV{oldinstall});
+	require_wal_upgrade_source($old);
 	if (defined($ENV{oldinstall}))
 	{
 		$old->init(

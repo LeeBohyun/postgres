@@ -16,9 +16,13 @@
 
 #define PG_UPGRADE_XFER_MIRROR (-1)
 
+struct Port;
+
 extern PGDLLIMPORT int pg_upgrade_standby_transfer_mode;
 extern PGDLLIMPORT char *pg_upgrade_standby_old_datadir;
 
 extern PGDLLIMPORT const struct config_enum_entry pg_upgrade_standby_transfer_mode_options[];
+extern bool PgUpgradeValidateConnection(const struct Port *port);
+extern bool PgUpgradeRefreshEndpointFile(void);
 
 #endif							/* PGUPGRADE_CONFIG_H */

@@ -983,7 +983,7 @@ get_old_cluster_physical_slot_infos(void)
 
 	/*
 	 * Collect persistent physical slots that must be valid and streaming
-	 * before upgrade and recreated in the new cluster.
+	 * before HANDOFF and recreated in the new cluster.
 	 */
 	res = executeQueryOrDie(conn,
 							"SELECT slot_name, restart_lsn::text AS restart_lsn, "

@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Check primary-side upgrade WAL emission without depending on standby replay
-# or automatic HANDOFF. The following tests in this series exercise replay.
+# Check primary-side upgrade WAL emission and startup. Standby and archive
+# recovery are exercised separately.
 
 use strict;
 use warnings FATAL => 'all';
@@ -9,6 +9,9 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use WalUpgradeTest qw(require_wal_upgrade_source);
 
 sub configure_new_cluster
 {
@@ -22,6 +25,7 @@ sub configure_new_cluster
 
 my $old = PostgreSQL::Test::Cluster->new('old_emission',
 	install_path => $ENV{oldinstall});
+require_wal_upgrade_source($old);
 $old->init(extra => ['--data-checksums'], allows_streaming => 1);
 $old->start;
 $old->safe_psql('postgres', q{

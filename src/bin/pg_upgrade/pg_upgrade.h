@@ -310,6 +310,8 @@ typedef struct
 	char	   *bindir;			/* pathname for cluster's executable directory */
 	char	   *pgopts;			/* options to pass to the server, like pg_ctl
 								 * -o */
+	char	   *listen_addresses;	/* effective old-cluster TCP listen
+									 * addresses */
 	char	   *sockdir;		/* directory for Unix Domain socket, if any */
 	unsigned short port;		/* port number where postmaster is waiting */
 	uint32		major_version;	/* PG_VERSION of cluster */
@@ -369,6 +371,7 @@ typedef struct
 	int			num_initdb_options;
 
 	bool		wal_upgrade;
+	bool		old_port_specified;
 } UserOpts;
 
 typedef struct
@@ -408,7 +411,13 @@ extern OSInfo os_info;
 
 void		output_check_banner(void);
 struct UpgradePreparation;
+void		prepare_pg_upgrade_handoff(void);
+void		perform_pg_upgrade_handoff(void);
 void		check_and_dump_old_cluster(struct UpgradePreparation *preparation);
+bool		pg_upgrade_handoff_requires_immediate_stop(void);
+int			pg_upgrade_handoff_signal_status(void);
+void		cleanup_pg_upgrade_handoff_after_stop(void);
+PGconn	   *begin_postmaster_stop_for_handoff(ClusterInfo *cluster);
 void		check_new_cluster(void);
 void		report_clusters_compatible(void);
 void		issue_warnings_and_set_wal_level(void);
@@ -483,6 +492,7 @@ void		get_subscription_info(ClusterInfo *cluster);
 
 void		parseCommandLine(int argc, char *argv[]);
 void		adjust_data_dir(ClusterInfo *cluster);
+void		set_old_cluster_endpoint(void);
 void		get_sock_dir(ClusterInfo *cluster);
 
 /* pg_upgrade.c */

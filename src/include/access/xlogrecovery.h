@@ -11,6 +11,8 @@
 #ifndef XLOGRECOVERY_H
 #define XLOGRECOVERY_H
 
+#include "access/pgupgrade_handoff.h"
+
 #include "access/xlogreader.h"
 #include "catalog/pg_control.h"
 #include "lib/stringinfo.h"
@@ -124,6 +126,13 @@ typedef struct XLogRecoveryCtlData
 	TimestampTz currentChunkStartTime;
 	/* Recovery pause state */
 	RecoveryPauseState recoveryPauseState;
+	/* HANDOFF WAL remains retained until its durable pause is resumed. */
+	PgUpgradeHandoffPhase pgUpgradeHandoffPhase;
+	XLogRecPtr	pgUpgradeHandoffRetainLSN;
+	/* True if HANDOFF issued the most recent recovery pause request. */
+	bool		pgUpgradeHandoffOwnsPause;
+	/* Set by pg_wal_replay_resume() while HANDOFF is pending or paused. */
+	bool		pgUpgradeHandoffCancelRequested;
 	ConditionVariable recoveryNotPausedCV;
 
 	slock_t		info_lck;		/* locks shared variables shown above */
@@ -219,6 +228,8 @@ extern void RemovePromoteSignalFiles(void);
 extern bool HotStandbyActive(void);
 extern bool HotStandbyActiveInReplay(void);
 extern XLogRecPtr GetXLogReplayRecPtr(TimeLineID *replayTLI);
+extern void EnsurePgUpgradeHandoffWalReceiver(TimeLineID tli,
+											  XLogRecPtr recptr);
 extern RecoveryPauseState GetRecoveryPauseState(void);
 extern void SetRecoveryPause(bool recoveryPause);
 extern void GetXLogReceiptTime(TimestampTz *rtime, bool *fromStream);

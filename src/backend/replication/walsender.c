@@ -52,6 +52,7 @@
 #include <unistd.h>
 
 #include "access/timeline.h"
+#include "access/pgupgrade_handoff.h"
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xact.h"
@@ -147,6 +148,10 @@ int			wal_sender_timeout = 60 * 1000; /* maximum time to send one WAL
 int			wal_sender_shutdown_timeout = -1;	/* maximum time to wait during
 												 * shutdown for WAL
 												 * replication */
+
+#define PG_UPGRADE_HANDOFF_REPLY_INTERVAL_MS 1000
+
+static bool pg_upgrade_handoff_pending = false;
 
 bool		log_replication_commands = false;
 
@@ -854,6 +859,12 @@ HandleUploadManifestPacket(StringInfo buf, off_t *offset,
 	return false;
 }
 
+static bool
+WalSndInPgUpgradeHandoff(void)
+{
+	return pg_upgrade_handoff_pending;
+}
+
 /*
  * Handle START_REPLICATION command.
  *
@@ -903,6 +914,10 @@ StartReplication(StartReplicationCmd *cmd)
 		 * WAL segment doesn't exist, we'll fail later.
 		 */
 	}
+	else if (IsBinaryUpgrade || WalSndInPgUpgradeHandoff())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("upgrade handoff replication requires a named physical replication slot")));
 
 	/*
 	 * Select the timeline. If it was given explicitly by the client, use
@@ -2211,6 +2226,16 @@ exec_replication_command(const char *cmd_string)
 								 parse_rc)));
 	replication_scanner_finish(scanner);
 
+	if ((IsBinaryUpgrade || WalSndInPgUpgradeHandoff()) &&
+		cmd_node->type != T_IdentifySystemCmd &&
+		cmd_node->type != T_ReadReplicationSlotCmd &&
+		cmd_node->type != T_StartReplicationCmd &&
+		cmd_node->type != T_TimeLineHistoryCmd &&
+		cmd_node->type != T_VariableShowStmt)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("replication command is not allowed during upgrade handoff")));
+
 	/*
 	 * Report query to various monitoring facilities.  For this purpose, we
 	 * report replication commands just like SQL commands.
@@ -2523,10 +2548,22 @@ static void
 PhysicalConfirmReceivedLocation(XLogRecPtr lsn)
 {
 	bool		changed = false;
+	bool		serialize_handoff;
 	ReplicationSlot *slot = MyReplicationSlot;
 
 	Assert(XLogRecPtrIsValid(lsn));
+	/* Serialize active floors and saved-LSN retreats with floor clearing. */
 	SpinLockAcquire(&slot->mutex);
+	serialize_handoff =
+		XLogRecPtrIsValid(slot->handoff_restart_lsn_floor) ||
+		(XLogRecPtrIsValid(slot->last_saved_restart_lsn) &&
+		 slot->last_saved_restart_lsn > lsn);
+	if (serialize_handoff)
+	{
+		SpinLockRelease(&slot->mutex);
+		LWLockAcquire(ReplicationSlotAllocationLock, LW_SHARED);
+		SpinLockAcquire(&slot->mutex);
+	}
 	if (slot->data.restart_lsn != lsn)
 	{
 		changed = true;
@@ -2535,8 +2572,12 @@ PhysicalConfirmReceivedLocation(XLogRecPtr lsn)
 	SpinLockRelease(&slot->mutex);
 
 	if (changed)
-	{
 		ReplicationSlotMarkDirty();
+	if (serialize_handoff)
+		LWLockRelease(ReplicationSlotAllocationLock);
+
+	if (changed)
+	{
 		ReplicationSlotsComputeRequiredLSN();
 		PhysicalWakeupLogicalWalSnd();
 	}
@@ -3050,6 +3091,9 @@ WalSndCheckShutdownTimeout(void)
 	/* Do nothing if shutdown has not been requested yet */
 	if (!(got_STOPPING || got_SIGUSR2))
 		return;
+	/* Keep the HANDOFF walsender alive until its final cycle. */
+	if (pg_upgrade_handoff_pending && got_STOPPING && !got_SIGUSR2)
+		return;
 
 	/* Terminate immediately if the timeout is set to 0 */
 	if (wal_sender_shutdown_timeout == 0)
@@ -3096,6 +3140,8 @@ WalSndLoop(WalSndSendDataCallback send_data)
 	 */
 	for (;;)
 	{
+		bool		handoff_reply_pending;
+
 		/* Clear any already-pending wakeups */
 		ResetLatch(MyLatch);
 
@@ -3130,6 +3176,25 @@ WalSndLoop(WalSndSendDataCallback send_data)
 		/* Try to flush pending output to the client */
 		if (pq_flush_if_writable() != 0)
 			WalSndShutdown();
+
+		handoff_reply_pending =
+			send_data == XLogSendPhysical &&
+			WalSndCaughtUp && !pq_is_send_pending() &&
+			sentPtr > MyWalSnd->flush &&
+			WalSndInPgUpgradeHandoff();
+
+		/*
+		 * Request feedback until the standby reports the HANDOFF checkpoint
+		 * flushed.
+		 */
+		if (handoff_reply_pending && !waiting_for_ping_response &&
+			TimestampDifferenceExceeds(last_reply_timestamp, last_processing,
+									   PG_UPGRADE_HANDOFF_REPLY_INTERVAL_MS))
+		{
+			WalSndKeepalive(true, InvalidXLogRecPtr);
+			if (pq_flush_if_writable() != 0)
+				WalSndShutdown();
+		}
 
 		/* If nothing remains to be sent right now ... */
 		if (WalSndCaughtUp && !pq_is_send_pending())
@@ -3202,6 +3267,9 @@ WalSndLoop(WalSndSendDataCallback send_data)
 			 */
 			now = GetCurrentTimestamp();
 			sleeptime = WalSndComputeSleeptime(now);
+			if (handoff_reply_pending)
+				sleeptime = Min(sleeptime,
+								PG_UPGRADE_HANDOFF_REPLY_INTERVAL_MS);
 
 			if (pq_is_send_pending())
 				wakeEvents |= WL_SOCKET_WRITEABLE;
@@ -3991,6 +4059,8 @@ void
 HandleWalSndInitStopping(void)
 {
 	Assert(am_walsender);
+	if (!pg_upgrade_handoff_pending && PgUpgradeHandoffIsArmed())
+		pg_upgrade_handoff_pending = true;
 
 	/*
 	 * If replication has not yet started, die like with SIGTERM. If
@@ -4004,6 +4074,13 @@ HandleWalSndInitStopping(void)
 		got_STOPPING = true;
 
 	/* latch will be set by procsignal_sigusr1_handler */
+}
+
+/* Mark a physical replication connection admitted during HANDOFF shutdown. */
+void
+WalSndMarkPgUpgradeHandoff(void)
+{
+	pg_upgrade_handoff_pending = true;
 }
 
 /*
@@ -4234,6 +4311,12 @@ WalSndWaitStopping(void)
 	{
 		int			i;
 		bool		all_stopped = true;
+
+		/*
+		 * Include physical walsenders that reconnect during HANDOFF shutdown.
+		 */
+		if (PgUpgradeHandoffIsArmed())
+			WalSndInitStopping();
 
 		for (i = 0; i < max_wal_senders; i++)
 		{

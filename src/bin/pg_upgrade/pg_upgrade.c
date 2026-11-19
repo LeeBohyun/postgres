@@ -127,6 +127,7 @@ int
 main(int argc, char **argv)
 {
 	char	   *deletion_script_file_name = NULL;
+	bool		perform_handoff;
 	bool		migrate_logical_slots;
 	UpgradePreparation *preparation = NULL;
 
@@ -157,6 +158,11 @@ main(int argc, char **argv)
 	check_bin_dirs(argv[0]);
 
 	adjust_data_dir(&old_cluster);
+	set_old_cluster_endpoint();
+	perform_handoff = user_opts.wal_upgrade && !user_opts.check &&
+		!user_opts.live_check;
+	if (perform_handoff)
+		prepare_pg_upgrade_handoff();
 
 	if (user_opts.initdb_new_cluster)
 	{
@@ -217,17 +223,22 @@ main(int argc, char **argv)
 	/* --check exits above. Retain the new cluster once the upgrade begins. */
 	initdb_keep_cluster = true;
 
-	if (user_opts.wal_upgrade && !user_opts.check)
+	/*
+	 * Perform HANDOFF after the new-cluster checks pass, then record the
+	 * old cluster's final shutdown checkpoint end LSN in START.
+	 */
+	if (perform_handoff)
 	{
-		int			multixact_offset_size =
-			old_cluster.controldata.chkpnt_nxtmxoff_size;
-
-		/* The old-cluster checks stopped the source at a new checkpoint. */
-		memset(&old_cluster.controldata, 0, sizeof(old_cluster.controldata));
-		get_control_data(&old_cluster);
-		old_cluster.controldata.chkpnt_nxtmxoff_size = multixact_offset_size;
-		prepare_upgrade_old_cluster(preparation);
+		stop_postmaster(false);
+		perform_pg_upgrade_handoff();
 	}
+
+	if (user_opts.wal_upgrade && !user_opts.check)
+		prepare_upgrade_old_cluster(preparation);
+
+	/* Restart the new-major server for new-cluster preparation after HANDOFF. */
+	if (perform_handoff)
+		start_postmaster(&new_cluster, true);
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -797,6 +808,8 @@ fail:
 static void
 get_old_cluster_initdb_info(void)
 {
+	bool		keep_old_running = user_opts.wal_upgrade && !user_opts.check;
+
 	old_cluster.major_version = get_pg_version(old_cluster.pgdata,
 											   &old_cluster.major_version_str);
 
@@ -827,7 +840,8 @@ get_old_cluster_initdb_info(void)
 	get_template0_info(&old_cluster);
 	if (user_opts.wal_upgrade)
 		old_cluster_archive_command = get_old_cluster_archive_command();
-	if (!user_opts.live_check)
+	/* Keep the old server running for checks, dump, and HANDOFF. */
+	if (!user_opts.live_check && !keep_old_running)
 		stop_postmaster(false);
 	check_ok();
 }
@@ -962,7 +976,8 @@ static void
 check_clusters_stopped(void)
 {
 	/* no postmasters should be running, except for a live check */
-	if (pid_lock_file_exists(old_cluster.pgdata))
+	if (os_info.running_cluster != &old_cluster &&
+		pid_lock_file_exists(old_cluster.pgdata))
 	{
 		/*
 		 * If we have a postmaster.pid file, try to start the server.  If it

@@ -86,7 +86,8 @@ parseCommandLine(int argc, char *argv[])
 	os_info.progname = get_progname(argv[0]);
 
 	/* Process libpq env. variables; load values here for usage() output */
-	old_cluster.port = getenv("PGPORTOLD") ?
+	user_opts.old_port_specified = getenv("PGPORTOLD") != NULL;
+	old_cluster.port = user_opts.old_port_specified ?
 		parse_port(getenv("PGPORTOLD"), "old") : DEF_PGUPORT;
 	new_cluster.port = getenv("PGPORTNEW") ?
 		parse_port(getenv("PGPORTNEW"), "new") : DEF_PGUPORT;
@@ -183,6 +184,7 @@ parseCommandLine(int argc, char *argv[])
 
 			case 'p':
 				old_cluster.port = parse_port(optarg, "old");
+				user_opts.old_port_specified = true;
 				break;
 
 			case 'P':
@@ -335,6 +337,56 @@ parse_port(const char *value, const char *description)
 		port == 0 || port > 65535)
 		pg_fatal("invalid %s port number", description);
 	return (unsigned short) port;
+}
+
+
+/* Preserve the TCP endpoint that the old standbys already use. */
+void
+set_old_cluster_endpoint(void)
+{
+	char		path[MAXPGPATH];
+	char		contents[MAX_STRING + 1];
+	FILE	   *fp;
+	size_t		len;
+	char	   *addresses;
+	unsigned short port;
+
+	if (!user_opts.wal_upgrade || user_opts.check)
+		return;
+
+	snprintf(path, sizeof(path), "%s/%s", old_cluster.pgdata,
+			 PG_UPGRADE_ENDPOINT_FILE);
+	if ((fp = fopen(path, PG_BINARY_R)) == NULL)
+	{
+		if (errno == ENOENT)
+			return;
+		pg_fatal("could not open old primary endpoint file \"%s\": %m",
+				 path);
+	}
+	len = fread(contents, 1, sizeof(contents), fp);
+	if (ferror(fp) || fclose(fp) != 0)
+		pg_fatal("could not read old primary endpoint file \"%s\": %m",
+				 path);
+	if (len > MAX_STRING)
+		pg_fatal("old primary endpoint file \"%s\" is too long", path);
+	if (memchr(contents, '\0', len) != NULL)
+		pg_fatal("old primary endpoint file \"%s\" is malformed", path);
+	contents[len] = '\0';
+	addresses = strchr(contents, '\n');
+	if (addresses == NULL)
+		pg_fatal("old primary endpoint file \"%s\" is malformed", path);
+	*addresses++ = '\0';
+	port = parse_port(contents, "old primary's previous");
+	if (user_opts.old_port_specified &&
+		old_cluster.port != port)
+		pg_fatal("specified old-cluster port %hu does not match the old "
+				 "primary's previous port %hu",
+				 old_cluster.port, port);
+	if (strpbrk(addresses, "'\"\\`$\r\n") != NULL)
+		pg_fatal("old primary listen addresses cannot be represented safely");
+	old_cluster.port = port;
+	if (addresses[0] != '\0')
+		old_cluster.listen_addresses = pg_strdup(addresses);
 }
 
 

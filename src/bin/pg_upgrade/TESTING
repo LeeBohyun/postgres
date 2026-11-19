@@ -74,3 +74,10 @@ and ordinary startup of the upgraded primary. 014_wal_upgrade_replay.pl
 checks streaming replay from a retained source datadir. 010_wal_upgrade.pl
 checks recovery from an old base backup and a WAL archive, including an
 incomplete upgrade and a missing completion checkpoint.
+
+011_wal_upgrade_standby.pl and 012_wal_upgrade_validation.pl add automatic
+HANDOFF, physical-slot safety checks, and failure cleanup. These HANDOFF
+tests require source binaries with HANDOFF support. The emission, streaming,
+and archive tests have the same source requirement once automatic HANDOFF is
+enabled. Set oldinstall for cross-version runs with a suitably patched old
+installation. The validation test always uses the new installation as source.

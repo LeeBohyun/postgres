@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Replay an upgrade using a cold source copy at the final checkpoint. This
-# exercises standby replay independently of automatic HANDOFF coordination.
+# Replay an upgrade from a retained old-version standby and verify the
+# upgraded data, completion restartpoint, subsequent WAL, and promotion.
 
 use strict;
 use warnings FATAL => 'all';
@@ -9,9 +9,13 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use WalUpgradeTest qw(require_wal_upgrade_source);
 
 my $old = PostgreSQL::Test::Cluster->new('old_manual_replay',
 	install_path => $ENV{oldinstall});
+require_wal_upgrade_source($old);
 $old->init(extra => ['--data-checksums'], allows_streaming => 1);
 $old->start;
 $old->safe_psql('postgres', q{
@@ -26,6 +30,16 @@ my $fingerprint = $old->safe_psql('postgres', q{
 	SELECT count(*), md5(string_agg(id::text || payload, '' ORDER BY id))
 	FROM upgrade_data;
 });
+$old->safe_psql('postgres',
+	"SELECT pg_create_physical_replication_slot('manual_replay_slot', true)");
+$old->backup('replay_source');
+my $retained = PostgreSQL::Test::Cluster->new('retained_manual_replay',
+	install_path => $ENV{oldinstall});
+$retained->init_from_backup($old, 'replay_source', has_streaming => 1);
+$retained->append_conf('postgresql.auto.conf',
+	"primary_slot_name = 'manual_replay_slot'");
+$retained->start;
+$old->wait_for_replay_catchup($retained);
 $old->stop;
 
 my $primary = PostgreSQL::Test::Cluster->new('primary_manual_replay');
@@ -42,18 +56,10 @@ command_ok([
 	'--new-port' => $primary->port ],
 	'primary emits the upgrade transaction');
 
-# pg_upgrade starts and stops the source during checks. Copy it only after
-# those checks so the retained copy has the checkpoint recorded in START.
-$old->backup_fs_cold('final_source');
-my $retained = PostgreSQL::Test::Cluster->new('retained_manual_replay',
-	install_path => $ENV{oldinstall});
-$retained->init_from_backup($old, 'final_source');
-$retained->set_standby_mode;
-$retained->start;
-$retained->poll_query_until('postgres', q{
-	SELECT pg_is_in_recovery() AND pg_last_wal_replay_lsn() > checkpoint_lsn
-	FROM pg_control_checkpoint();
-}) or die 'retained standby did not replay the final source checkpoint';
+# HANDOFF persists the final old checkpoint before pausing this standby.
+$retained->poll_query_until('postgres',
+	"SELECT pg_get_wal_replay_pause_state() = 'paused'")
+	or die 'retained standby did not pause at the final source checkpoint';
 $retained->stop;
 
 my $listen = $PostgreSQL::Test::Cluster::use_tcp ? $primary->host : '';

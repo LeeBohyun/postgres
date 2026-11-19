@@ -510,6 +510,13 @@ pg_upgrade --initdb --initdb-options='-c huge_pages=off --waldir=/wal/new' ...
         after old-version recovery reaches the final source checkpoint.
        </para>
        <para>
+        Before conversion, <application>pg_upgrade</application> coordinates
+        a HANDOFF record and the final old-version shutdown checkpoint with
+        physical standbys. Persistent physical slots must be valid, streaming,
+        and caught up. Each required standby durably receives the final
+        checkpoint and pauses recovery so its old-version data can be retained.
+       </para>
+       <para>
         While migrated physical slots are inactive, configure
         <varname>max_slot_wal_keep_size</varname> to <literal>-1</literal> and
         <varname>idle_replication_slot_timeout</varname> to <literal>0</literal>

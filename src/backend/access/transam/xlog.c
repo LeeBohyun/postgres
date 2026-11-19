@@ -51,6 +51,8 @@
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/pgupgrade_control.h"
+#include "access/pgupgrade_handoff.h"
+#include "access/pgupgrade_handoff_receipt.h"
 #include "access/pgupgrade_retention_slots.h"
 #include "access/pgupgrade_wal.h"
 #include "access/rewriteheap.h"
@@ -6329,6 +6331,8 @@ StartupXLOG(void)
 					 errmsg("control file contains invalid database cluster state")));
 	}
 
+	PgUpgradeDiscardStaleHandoff(ControlFile->state);
+
 	/* This is just to allow attaching to startup process with a debugger */
 #ifdef XLOG_REPLAY_DELAY
 	if (ControlFile->state != DB_SHUTDOWNED)
@@ -7859,6 +7863,7 @@ CreateCheckPoint(int flags)
 	int			nvxids;
 	int			oldXLogAllowed = 0;
 	XLogRecPtr	upgrade_complete_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	handoff_lsn = InvalidXLogRecPtr;
 
 	/*
 	 * An end-of-recovery checkpoint is really a shutdown checkpoint, just
@@ -7894,6 +7899,10 @@ CreateCheckPoint(int flags)
 	/* Run these points outside the critical section. */
 	INJECTION_POINT("create-checkpoint-initial", NULL);
 	INJECTION_POINT_LOAD("create-checkpoint-run");
+
+	/* HANDOFF must be the shutdown checkpoint's preceding WAL record. */
+	if (flags & CHECKPOINT_IS_SHUTDOWN)
+		handoff_lsn = PgUpgradeEmitHandoffIfArmed();
 
 	/*
 	 * Use a critical section to force system panic if we have trouble.
@@ -8254,6 +8263,17 @@ CreateCheckPoint(int flags)
 	 */
 	if (shutdown)
 		upgrade_complete_lsn = PgUpgradeGetCompletionLSN(ProcLastRecPtr);
+
+	/*
+	 * Save each snapshotted persistent physical slot with restart_lsn no
+	 * lower than its HANDOFF floor before publishing DB_SHUTDOWNED.
+	 */
+	if (XLogRecPtrIsValid(handoff_lsn))
+	{
+		END_CRIT_SECTION();
+		(void) PgUpgradeWaitForHandoffSlots(recptr);
+		START_CRIT_SECTION();
+	}
 
 	/*
 	 * Remember the prior checkpoint's redo ptr for
@@ -9117,7 +9137,13 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 		 * slots were to be invalidated because of this, it would not be
 		 * possible to preserve logical ones during the upgrade.
 		 */
-		if (max_slot_wal_keep_size_mb >= 0 && !IsBinaryUpgrade)
+
+		/*
+		 * HANDOFF WAL retention and HANDOFF slot freezing also skip this
+		 * limit.
+		 */
+		if (max_slot_wal_keep_size_mb >= 0 && !IsBinaryUpgrade &&
+			!PgUpgradeHandoffSlotsAreFrozen())
 		{
 			uint64		slot_keep_segs;
 

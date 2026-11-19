@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/pgupgrade_handoff.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -552,6 +553,7 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 	bool		nulls[2];
 	HeapTuple	tuple;
 	Datum		result;
+	bool		handoff_lock_held = false;
 
 	Assert(!MyReplicationSlot);
 
@@ -577,6 +579,19 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 
 	/* Acquire the slot so we "own" it */
 	ReplicationSlotAcquire(NameStr(*slotname), true, true);
+	if (SlotIsPhysical(MyReplicationSlot) &&
+		MyReplicationSlot->data.persistency == RS_PERSISTENT &&
+		strcmp(NameStr(MyReplicationSlot->data.name),
+			   CONFLICT_DETECTION_SLOT) != 0)
+	{
+		/* Hold the allocation lock across the HANDOFF check and slot advance. */
+		LWLockAcquire(ReplicationSlotAllocationLock, LW_SHARED);
+		handoff_lock_held = true;
+		if (PgUpgradeHandoffSlotsAreFrozen())
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot advance a persistent physical replication slot during pg_upgrade handoff")));
+	}
 
 	/* A slot whose restart_lsn has never been reserved cannot be advanced */
 	if (!XLogRecPtrIsValid(MyReplicationSlot->data.restart_lsn))
@@ -619,6 +634,8 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 	ReplicationSlotsComputeRequiredXmin(false);
 	ReplicationSlotsComputeRequiredLSN();
 
+	if (handoff_lock_held)
+		LWLockRelease(ReplicationSlotAllocationLock);
 	ReplicationSlotRelease();
 
 	/* Return the reached position. */

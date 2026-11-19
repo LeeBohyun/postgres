@@ -309,7 +309,7 @@ copy_wal_timeline_history(void)
 	closedir(dir);
 }
 
-/* Stage the segment containing the final old checkpoint. */
+/* Stage the segment containing HANDOFF and the final old checkpoint. */
 static void
 stage_old_checkpoint_wal(void)
 {

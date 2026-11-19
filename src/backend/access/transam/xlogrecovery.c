@@ -30,6 +30,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "access/pgupgrade_handoff.h"
 #include "access/pgupgrade_wal.h"
 #include "access/timeline.h"
 #include "access/transam.h"
@@ -498,6 +499,7 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 	 * the flag.
 	 */
 	reachedConsistency = false;
+	PgUpgradeResetHandoffRecovery();
 
 	/*
 	 * Initialize on the assumption we want to recover to the latest timeline
@@ -763,6 +765,9 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		}
 		memcpy(&checkPoint, XLogRecGetData(xlogreader), sizeof(CheckPoint));
 		wasShutdown = ((record->xl_info & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_SHUTDOWN);
+		PgUpgradeFindPersistedHandoff(ControlFile, xlogreader,
+									  &checkPoint, CheckPointTLI, expectedTLEs,
+									  StandbyModeRequested);
 
 		/* Make sure that REDO location exists. */
 		if (checkPoint.redo < CheckPointLoc)
@@ -1673,6 +1678,7 @@ PerformWalRecovery(void)
 	XLogRecoveryCtl->recoveryLastXTime = 0;
 	XLogRecoveryCtl->currentChunkStartTime = 0;
 	XLogRecoveryCtl->recoveryPauseState = RECOVERY_NOT_PAUSED;
+	PgUpgradeInitializeHandoffRecovery();
 	SpinLockRelease(&XLogRecoveryCtl->info_lck);
 
 	/* Also ensure XLogReceiptTime has a sane value */
@@ -1689,6 +1695,9 @@ PerformWalRecovery(void)
 	 * Allow read-only connections immediately if we're consistent already.
 	 */
 	CheckRecoveryConsistency();
+
+	if (PgUpgradeRestoreHandoff(minRecoveryPoint))
+		recoveryPausesHere(false);
 
 	/*
 	 * Find the first record that logically follows the checkpoint --- it
@@ -2995,6 +3004,8 @@ recoveryPausesHere(bool endOfRecovery)
 									WAIT_EVENT_RECOVERY_PAUSE);
 	}
 	ConditionVariableCancelSleep();
+
+	PgUpgradeCancelHandoffIfRequested();
 }
 
 /*
@@ -3127,11 +3138,15 @@ SetRecoveryPause(bool recoveryPause)
 		XLogRecoveryCtl->recoveryPauseState = RECOVERY_NOT_PAUSED;
 	else if (XLogRecoveryCtl->recoveryPauseState == RECOVERY_NOT_PAUSED)
 		XLogRecoveryCtl->recoveryPauseState = RECOVERY_PAUSE_REQUESTED;
+	PgUpgradeUpdateHandoffPause(recoveryPause);
 
 	SpinLockRelease(&XLogRecoveryCtl->info_lck);
 
 	if (!recoveryPause)
+	{
 		ConditionVariableBroadcast(&XLogRecoveryCtl->recoveryNotPausedCV);
+		SetLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
+	}
 }
 
 /*
@@ -4504,6 +4519,7 @@ CheckForStandbyTrigger(void)
 
 	if (IsPromoteSignaled() && CheckPromoteSignal())
 	{
+		PgUpgradeCheckPromotion();
 		ereport(LOG, (errmsg("received promote request")));
 		RemovePromoteSignalFiles();
 		ResetPromoteSignaled();
@@ -4642,6 +4658,43 @@ GetXLogReplayRecPtr(TimeLineID *replayTLI)
 	if (replayTLI)
 		*replayTLI = tli;
 	return recptr;
+}
+
+/*
+ * Restart upstream streaming while HANDOFF waits for physical-slot checkpoint
+ * receipt.
+ */
+void
+EnsurePgUpgradeHandoffWalReceiver(TimeLineID tli, XLogRecPtr recptr)
+{
+	static TimestampTz last_request = 0;
+	TimestampTz now;
+	WalRcvState state;
+
+	if (PrimaryConnInfo == NULL || PrimaryConnInfo[0] == '\0')
+		return;
+
+	state = WalRcvGetState();
+	if (state != WALRCV_STOPPED && state != WALRCV_WAITING)
+		return;
+
+	now = GetCurrentTimestamp();
+	if (last_request != 0 &&
+		!TimestampDifferenceExceeds(last_request, now,
+									wal_retrieve_retry_interval))
+		return;
+	last_request = now;
+
+	if (recoveryTargetTimeLineGoal == RECOVERY_TARGET_TIMELINE_LATEST)
+		rescanLatestTimeLine(tli, recptr);
+	tli = tliOfPointInHistory(recptr, expectedTLEs);
+	SetInstallXLogFileSegmentActive();
+	RequestXLogStreaming(tli, recptr, PrimaryConnInfo, PrimarySlotName,
+						 wal_receiver_create_temp_slot);
+	flushedUpto = InvalidXLogRecPtr;
+	curFileTLI = tli;
+	currentSource = XLOG_FROM_STREAM;
+	lastSourceFailed = false;
 }
 
 /*

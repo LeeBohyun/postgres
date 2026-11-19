@@ -76,6 +76,8 @@ tests += {
       't/013_wal_upgrade_emission.pl',
       't/010_wal_upgrade.pl',
       't/014_wal_upgrade_replay.pl',
+      't/011_wal_upgrade_standby.pl',
+      't/012_wal_upgrade_validation.pl',
     ],
     'deps': [test_ext],
     'test_kwargs': {'priority': 40}, # pg_upgrade tests are slow

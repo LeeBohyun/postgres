@@ -270,6 +270,9 @@ typedef struct ReplicationSlot
 	 */
 	XLogRecPtr	last_saved_restart_lsn;
 
+	/* Minimum restart_lsn saved for this slot while HANDOFF WAL is retained. */
+	XLogRecPtr	handoff_restart_lsn_floor;
+
 	/*
 	 * Reason for the most recent slot synchronization skip.
 	 *
@@ -345,6 +348,7 @@ extern void ReplicationSlotRelease(void);
 extern void ReplicationSlotCleanup(bool synced_only);
 extern void ReplicationSlotSave(void);
 extern void ReplicationSlotMarkDirty(void);
+extern void ReplicationSlotsClearPgUpgradeHandoffFloors(void);
 
 /* misc stuff */
 extern void ReplicationSlotInitialize(void);
