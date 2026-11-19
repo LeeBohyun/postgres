@@ -266,6 +266,14 @@ extern uint64 GetSystemIdentifier(void);
 extern char *GetMockAuthenticationNonce(void);
 extern void GetControlFileCopy(struct ControlFileData *copy);
 extern void XLogReportCurrentControlState(void);
+extern void InitControlFileData(struct ControlFileData *control_file,
+								uint64 sysidentifier,
+								uint32 data_checksum_version,
+								int control_wal_segment_size,
+								int elevel);
+extern void WriteControlFileData(struct ControlFileData *control_file,
+								 const char *path, bool exclusive,
+								 int elevel);
 extern bool DataChecksumsNeedWrite(void);
 extern bool DataChecksumsNeedVerify(void);
 extern XLogRecPtr GetLastChecksumChangeRecPtr(void);
@@ -353,6 +361,8 @@ extern SessionBackupState get_backup_status(void);
 #define RECOVERY_SIGNAL_FILE	"recovery.signal"
 #define STANDBY_SIGNAL_FILE		"standby.signal"
 #define BACKUP_LABEL_FILE		"backup_label"
+#define PG_UPGRADE_SIGNAL_FILE			"pg_upgrade.signal"
+
 #define BACKUP_LABEL_OLD		"backup_label.old"
 
 #define TABLESPACE_MAP			"tablespace_map"

@@ -74,6 +74,8 @@ tests += {
       't/009_composite_types.pl',
       't/009_initdb_option.pl',
       't/013_wal_upgrade_emission.pl',
+      't/010_wal_upgrade.pl',
+      't/014_wal_upgrade_replay.pl',
     ],
     'deps': [test_ext],
     'test_kwargs': {'priority': 40}, # pg_upgrade tests are slow

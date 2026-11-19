@@ -433,7 +433,8 @@ usage(void)
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
 	printf(_("  --copy                        copy files to new cluster (default)\n"));
 	printf(_("  --copy-file-range             copy files to new cluster with copy_file_range\n"));
-	printf(_("  --wal-upgrade                 capture the whole upgrade as WAL\n"));
+	printf(_("  --wal-upgrade                 capture the whole upgrade as WAL, replayable\n"
+			 "                                and streamable to standbys\n"));
 	printf(_("  --initdb                      create the new cluster with initdb before\n"
 			 "                                checking or upgrading, using old cluster settings\n"));
 	printf(_("  --initdb-options=OPTIONS      options to pass to initdb (requires --initdb)\n"));

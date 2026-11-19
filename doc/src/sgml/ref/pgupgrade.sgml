@@ -501,9 +501,13 @@ pg_upgrade --initdb --initdb-options='-c huge_pages=off --waldir=/wal/new' ...
         transaction. This option can be combined with <option>--initdb</option>.
        </para>
        <para>
-        This patch adds emission and inspection with <application>pg_waldump</application>.
-        Replay support is added by the following patch in the series. Until
-        then, recovery explicitly rejects upgrade WAL records.
+        A new-version standby replays the transaction using the retained
+        old-version data directory specified by
+        <xref linkend="guc-pg-upgrade-standby-old-datadir"/>. An empty
+        <filename>pg_upgrade.signal</filename> enables this startup path.
+        Do not start the old cluster or modify its retained files while the
+        upgrade is in progress. Archive recovery can also replay the upgrade
+        after old-version recovery reaches the final source checkpoint.
        </para>
        <para>
         While migrated physical slots are inactive, configure

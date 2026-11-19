@@ -30,6 +30,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "access/pgupgrade_wal.h"
 #include "access/timeline.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -304,6 +305,8 @@ static bool backupEndRequired = false;
  */
 bool		reachedConsistency = false;
 
+static bool recoverySettingsInitialized = false;
+
 /* Buffers dedicated to consistency checks of size BLCKSZ */
 static char *replay_image_masked = NULL;
 static char *primary_image_masked = NULL;
@@ -436,6 +439,22 @@ EnableStandbyMode(void)
 }
 
 /*
+ * Initialize recovery signals and target timeline once.  Archive upgrade
+ * discovery calls this before selecting the checkpoint for StartupXLOG.
+ */
+void
+InitWalRecoverySettings(TimeLineID default_tli)
+{
+	if (recoverySettingsInitialized)
+		return;
+
+	recoveryTargetTLI = default_tli;
+	readRecoverySignalFile();
+	validateRecoveryParameters();
+	recoverySettingsInitialized = true;
+}
+
+/*
  * Prepare the system for WAL recovery, if needed.
  *
  * This is called by StartupXLOG() which coordinates the server startup
@@ -484,17 +503,8 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 	 * Initialize on the assumption we want to recover to the latest timeline
 	 * that's active according to pg_control.
 	 */
-	if (ControlFile->minRecoveryPointTLI >
-		ControlFile->checkPointCopy.ThisTimeLineID)
-		recoveryTargetTLI = ControlFile->minRecoveryPointTLI;
-	else
-		recoveryTargetTLI = ControlFile->checkPointCopy.ThisTimeLineID;
-
-	/*
-	 * Check for signal files, and if so set up state for offline recovery
-	 */
-	readRecoverySignalFile();
-	validateRecoveryParameters();
+	InitWalRecoverySettings(Max(ControlFile->minRecoveryPointTLI,
+								ControlFile->checkPointCopy.ThisTimeLineID));
 
 	/*
 	 * Take ownership of the wakeup latch if we're going to sleep during
@@ -1438,10 +1448,13 @@ read_tablespace_map(List **tablespaces)
 EndOfWalRecoveryInfo *
 FinishWalRecovery(void)
 {
-	EndOfWalRecoveryInfo *result = palloc_object(EndOfWalRecoveryInfo);
+	EndOfWalRecoveryInfo *result;
 	XLogRecPtr	lastRec;
 	TimeLineID	lastRecTLI;
 	XLogRecPtr	endOfLog;
+
+	PgUpgradeCheckRecoveryFinish();
+	result = palloc_object(EndOfWalRecoveryInfo);
 
 	/*
 	 * Kill WAL receiver, if it's still running, before we continue to write
@@ -1823,6 +1836,14 @@ PerformWalRecovery(void)
 				break;
 			}
 
+			/*
+			 * Honor a pause requested while applying this record before
+			 * reading another.
+			 */
+			if (((volatile XLogRecoveryCtlData *) XLogRecoveryCtl)->recoveryPauseState !=
+				RECOVERY_NOT_PAUSED)
+				recoveryPausesHere(false);
+
 			/* Else, try to fetch the next WAL record */
 			record = ReadRecord(xlogprefetcher, LOG, false, replayTLI);
 		} while (record != NULL);
@@ -1836,6 +1857,7 @@ PerformWalRecovery(void)
 			if (!reachedConsistency)
 				ereport(FATAL,
 						(errmsg("requested recovery stop point is before consistent recovery point")));
+			PgUpgradeCheckRecoveryTarget();
 
 			/*
 			 * This is the last point where we can restart recovery with a new
@@ -1985,6 +2007,7 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 		xlogrecovery_redo(xlogreader, *replayTLI);
 
 	/* Now apply the WAL record itself */
+	PgUpgradeReplayCommit(xlogreader);
 	GetRmgr(record->xl_rmid).rm_redo(xlogreader);
 
 	/*
@@ -2007,6 +2030,8 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	XLogRecoveryCtl->lastReplayedEndRecPtr = xlogreader->EndRecPtr;
 	XLogRecoveryCtl->lastReplayedTLI = *replayTLI;
 	SpinLockRelease(&XLogRecoveryCtl->info_lck);
+
+	PgUpgradeCheckpointApplied();
 
 	/* ------
 	 * Wakeup walsenders:
@@ -2253,9 +2278,11 @@ CheckRecoveryConsistency(void)
 	 * run? If so, we can tell postmaster that the database is consistent now,
 	 * enabling connections.
 	 */
+	/* Upgrade replay must persist its completion restartpoint before serving. */
 	if (standbyState == STANDBY_SNAPSHOT_READY &&
 		!LocalHotStandbyActive &&
 		reachedConsistency &&
+		!PgUpgradeReplayIsInProgress() &&
 		IsUnderPostmaster)
 	{
 		SpinLockAcquire(&XLogRecoveryCtl->info_lck);
@@ -4452,6 +4479,7 @@ SetPromoteIsTriggered(void)
 {
 	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
 	XLogRecoveryCtl->SharedPromoteIsTriggered = true;
+	XLogRecoveryCtl->recoveryPauseState = RECOVERY_NOT_PAUSED;
 	SpinLockRelease(&XLogRecoveryCtl->info_lck);
 
 	/*
@@ -4460,7 +4488,7 @@ SetPromoteIsTriggered(void)
 	 * is paused. Otherwise pg_get_wal_replay_pause_state() can mistakenly
 	 * return 'paused' while a promotion is ongoing.
 	 */
-	SetRecoveryPause(false);
+	ConditionVariableBroadcast(&XLogRecoveryCtl->recoveryNotPausedCV);
 
 	LocalPromoteIsTriggered = true;
 }
@@ -4615,7 +4643,6 @@ GetXLogReplayRecPtr(TimeLineID *replayTLI)
 		*replayTLI = tli;
 	return recptr;
 }
-
 
 /*
  * Get position of last applied, or the record being applied.

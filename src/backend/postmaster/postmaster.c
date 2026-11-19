@@ -89,6 +89,7 @@
 #include <pthread.h>
 #endif
 
+#include "access/pgupgrade_control.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
@@ -830,10 +831,7 @@ PostmasterMain(int argc, char *argv[])
 	}
 
 	/* Verify that DataDir looks reasonable */
-	checkDataDir();
-
-	/* Check that pg_control exists */
-	checkControlFile();
+	checkDataDirPermissions();
 
 	/* And switch working directory into it */
 	ChangeToDataDir();
@@ -906,6 +904,13 @@ PostmasterMain(int argc, char *argv[])
 	 * lockfiles go away after CloseServerPorts runs.
 	 */
 	CreateDataDirLockFile(true);
+
+	/* Create upgrade startup files under the data-directory lock. */
+	PgUpgradePrepareStartupFiles();
+	ValidatePgVersion(DataDir);
+
+	/* Check that pg_control exists */
+	checkControlFile();
 
 	/*
 	 * Read the control file (for error checking and config info).

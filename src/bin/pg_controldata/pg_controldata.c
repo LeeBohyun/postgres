@@ -65,6 +65,8 @@ dbState(DBState state)
 			return _("in archive recovery");
 		case DB_IN_PRODUCTION:
 			return _("in production");
+		case DB_IN_UPGRADE:
+			return _("in pg_upgrade");
 	}
 	return _("unrecognized status code");
 }

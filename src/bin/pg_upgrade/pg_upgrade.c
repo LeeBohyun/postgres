@@ -109,6 +109,8 @@ static bool initdb_restore_mode;
 static char **initdb_created_parents;
 static int	initdb_num_created_parents;
 
+/* Old cluster's archive_command copied by --initdb, or NULL. */
+static char *old_cluster_archive_command = NULL;
 char	   *output_files[] = {
 	SERVER_LOG_FILE,
 #ifdef WIN32
@@ -253,6 +255,9 @@ main(int argc, char **argv)
 
 	create_new_objects(preparation);
 
+	if (user_opts.wal_upgrade && old_cluster_archive_command != NULL)
+		configure_upgrade_archive(old_cluster_archive_command);
+
 	stop_postmaster(false);
 
 	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
@@ -276,6 +281,7 @@ main(int argc, char **argv)
 				  old_cluster.controldata.chkpnt_nxtoid,
 				  old_cluster.controldata.upgrade_start_wal_file,
 				  new_cluster.pgdata);
+		prepare_upgrade_archive(old_cluster_archive_command != NULL);
 		check_ok();
 	}
 	else
@@ -323,6 +329,20 @@ main(int argc, char **argv)
 		emit_upgrade_wal(preparation, conn);
 
 		free_upgrade_preparation(preparation);
+
+		if (old_cluster_archive_command != NULL)
+		{
+			/*
+			 * Mark the new cluster as upgrade-finalized in a shutdown
+			 * checkpoint.
+			 */
+			PQfinish(conn);
+			stop_postmaster(false);
+
+			/* Restart before switching WAL past the completion checkpoint. */
+			start_postmaster(&new_cluster, true);
+			conn = connectToServer(&new_cluster, "template1");
+		}
 
 		PQclear(executeQueryOrDie(conn, "SELECT pg_switch_wal()"));
 
@@ -805,6 +825,8 @@ get_old_cluster_initdb_info(void)
 	if (!user_opts.live_check)
 		start_postmaster(&old_cluster, true);
 	get_template0_info(&old_cluster);
+	if (user_opts.wal_upgrade)
+		old_cluster_archive_command = get_old_cluster_archive_command();
 	if (!user_opts.live_check)
 		stop_postmaster(false);
 	check_ok();

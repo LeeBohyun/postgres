@@ -17,6 +17,7 @@
 
 #include "access/transam.h"
 #include "access/xlogdefs.h"
+#include "common/relpath.h"
 #include "pgtime.h"				/* for pg_time_t */
 #include "port/pg_crc32c.h"
 
@@ -103,6 +104,8 @@ typedef enum DBState
 	DB_IN_CRASH_RECOVERY,
 	DB_IN_ARCHIVE_RECOVERY,
 	DB_IN_PRODUCTION,
+
+	DB_IN_UPGRADE,
 } DBState;
 
 /*
@@ -270,10 +273,10 @@ typedef struct ControlFileData
 	 */
 	bool		default_char_signedness;
 
-	/* The completion checkpoint is durable. */
+	/* The completion checkpoint or restartpoint is durable. */
 	bool		upgrade_finalized;
 
-	/* WAL-upgrade emission reserved this new cluster. */
+	/* Emission reserved this new cluster, or recovery replayed START. */
 	bool		upgrade_started;
 
 	/*

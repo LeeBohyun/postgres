@@ -66,6 +66,11 @@ databases.  In case of trouble, manually comparing those dump files may
 help to isolate the problem.
 
 
+WAL-UPGRADE TESTS
+-----------------
+
 013_wal_upgrade_emission.pl checks upgrade WAL emission, storage validation,
-and ordinary startup of the upgraded primary. Replay tests are added with
-the recovery support in the next patch.
+and ordinary startup of the upgraded primary. 014_wal_upgrade_replay.pl
+checks streaming replay from a retained source datadir. 010_wal_upgrade.pl
+checks recovery from an old base backup and a WAL archive, including an
+incomplete upgrade and a missing completion checkpoint.

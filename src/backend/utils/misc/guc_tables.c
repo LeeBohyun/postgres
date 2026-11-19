@@ -30,6 +30,7 @@
 #endif
 
 #include "access/commit_ts.h"
+#include "access/pgupgrade_config.h"
 #include "access/gin.h"
 #include "access/htup_details.h"
 #include "access/slru.h"

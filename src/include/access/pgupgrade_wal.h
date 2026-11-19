@@ -15,6 +15,7 @@
 #define PGUPGRADE_WAL_H
 
 #include "access/xlogreader.h"
+#include "catalog/pg_control.h"
 #include "common/pg_upgrade_records.h"
 #include "lib/stringinfo.h"
 
@@ -44,7 +45,49 @@ extern XLogRecPtr PgUpgradeInsertRawFileRecord(const char *path,
 											   uint64 offset);
 extern bool PgUpgradeStartMatchesServer(const xl_pg_upgrade_start *start);
 
+extern void PerformWalUpgradeIfNeeded(void);
+
+typedef enum UpgradeRecoveryMode
+{
+	UPGRADE_RECOVERY_NONE,
+	UPGRADE_RECOVERY_ARCHIVE,
+	UPGRADE_RECOVERY_STANDBY
+} UpgradeRecoveryMode;
+
+extern UpgradeRecoveryMode GetUpgradeRecoveryMode(void);
+extern int	GetUpgradeArchiveWalSegmentSize(void);
+
+/* Old-cluster fields read with that installation's pg_controldata. */
+typedef struct OldUpgradeControlData
+{
+	uint64		system_identifier;
+	uint32		major_version;	/* server_version_num units */
+	uint32		control_version;
+	uint32		catalog_version;
+	uint32		block_size;
+	uint32		blocks_per_segment;
+	uint32		wal_block_size;
+	XLogRecPtr	checkpoint_lsn; /* checkPoint */
+	XLogRecPtr	checkpoint_redo;	/* checkPointCopy.redo */
+	XLogRecPtr	checkpoint_end_lsn; /* minRecoveryPoint */
+	TimeLineID	checkpoint_tli; /* checkPointCopy.ThisTimeLineID */
+	TimeLineID	checkpoint_end_tli; /* minRecoveryPointTLI */
+	int			wal_segment_size;	/* xlog_seg_size in bytes */
+} OldUpgradeControlData;
+
+extern void ReadOldUpgradeControlData(const char *old_datadir,
+									  OldUpgradeControlData *result);
+extern void ReadArchiveUpgradeControlData(const char *old_datadir,
+										  OldUpgradeControlData *result);
 extern void pg_upgrade_redo(XLogReaderState *record);
+extern void PgUpgradeReplayCommit(XLogReaderState *record);
+extern void PgUpgradeCheckpointReplayed(const CheckPoint *checkpoint,
+										XLogReaderState *record);
+extern void PgUpgradeCheckpointApplied(void);
+extern bool PgUpgradeReplayIsInProgress(void);
+extern void PgUpgradeSelectReplay(void);
+extern void PgUpgradeCheckRecoveryFinish(void);
+extern void PgUpgradeCheckRecoveryTarget(void);
 extern void pg_upgrade_desc(StringInfo buf, XLogReaderState *record);
 extern const char *pg_upgrade_identify(uint8 info);
 
