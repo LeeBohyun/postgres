@@ -50,6 +50,7 @@
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/pgupgrade_control.h"
 #include "access/rewriteheap.h"
 #include "access/subtrans.h"
 #include "access/timeline.h"
@@ -746,6 +747,7 @@ static void CleanupAfterArchiveRecovery(TimeLineID EndOfLogTLI,
 										XLogRecPtr EndOfLog,
 										TimeLineID newTLI);
 static void CheckRequiredParameterValues(void);
+static XLogRecPtr XLogInsertParameterChange(void);
 static void XLogReportParameters(void);
 static int	LocalSetXLogInsertAllowed(void);
 static void CreateEndOfRecoveryRecord(void);
@@ -4706,6 +4708,35 @@ UpdateControlFile(void)
 	update_controlfile(DataDir, ControlFile, true);
 }
 
+void
+GetControlFileCopy(ControlFileData *copy)
+{
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	memcpy(copy, ControlFile, sizeof(*copy));
+	LWLockRelease(ControlFileLock);
+}
+
+/* Reserve this new cluster before inserting the upgrade START record. */
+void
+BeginControlFileUpgrade(void)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (ControlFile->upgrade_started || ControlFile->upgrade_finalized)
+	{
+		LWLockRelease(ControlFileLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("an upgrade transaction has already been started for "
+						"this new cluster"),
+				 errhint("Use a fresh new cluster for another upgrade attempt.")));
+	}
+	ControlFile->upgrade_started = true;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+}
+
 /*
  * Returns the unique system identifier from control file.
  */
@@ -6107,6 +6138,22 @@ StartupXLOG(void)
 	Assert(CurrentResourceOwner == NULL ||
 		   CurrentResourceOwner == AuxProcessResourceOwner);
 	CurrentResourceOwner = AuxProcessResourceOwner;
+
+	/* Do not serve a target whose upgrade was not durably finalized. */
+	if (!IsBinaryUpgrade)
+	{
+		if (ControlFile->upgrade_finalized && !ControlFile->upgrade_started)
+			ereport(FATAL,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("pg_control has an invalid pg_upgrade state"),
+					 errdetail("The upgrade is finalized but was never started.")));
+		if (ControlFile->upgrade_started && !ControlFile->upgrade_finalized)
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("the pg_upgrade transaction was only partially applied"),
+					 errhint("Discard this new-version skeleton and retry the "
+							 "upgrade with a fresh skeleton.")));
+	}
 
 	/*
 	 * Check that contents look valid.
@@ -7703,6 +7750,7 @@ CreateCheckPoint(int flags)
 	VirtualTransactionId *vxids;
 	int			nvxids;
 	int			oldXLogAllowed = 0;
+	XLogRecPtr	upgrade_complete_lsn = InvalidXLogRecPtr;
 
 	/*
 	 * An end-of-recovery checkpoint is really a shutdown checkpoint, just
@@ -8091,6 +8139,10 @@ CreateCheckPoint(int flags)
 		ereport(PANIC,
 				(errmsg("concurrent write-ahead log activity while database system is shutting down")));
 
+	/* A committed upgrade is finalized by its following shutdown checkpoint. */
+	if (shutdown)
+		upgrade_complete_lsn = PgUpgradeGetCompletionLSN(ProcLastRecPtr);
+
 	/*
 	 * Remember the prior checkpoint's redo ptr for
 	 * UpdateCheckPointDistanceEstimate()
@@ -8108,6 +8160,12 @@ CreateCheckPoint(int flags)
 	/* crash recovery should always recover to the end of WAL */
 	ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
 	ControlFile->minRecoveryPointTLI = 0;
+	if (!XLogRecPtrIsInvalid(upgrade_complete_lsn))
+	{
+		if (!ControlFile->upgrade_started || ControlFile->upgrade_finalized)
+			elog(PANIC, "invalid pg_upgrade state at completion checkpoint");
+		ControlFile->upgrade_finalized = true;
+	}
 
 	/*
 	 * Persist the data checksum state this node runs under into the control
@@ -8153,6 +8211,8 @@ CreateCheckPoint(int flags)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+	if (!XLogRecPtrIsInvalid(upgrade_complete_lsn))
+		PgUpgradeClearCompletionLSN();
 
 	/*
 	 * We are now done with critical updates; no need for system panic if we
@@ -9095,6 +9155,26 @@ XLogAssignLSN(void)
 	return XLogInsert(RM_XLOG_ID, XLOG_ASSIGN_LSN);
 }
 
+/* Insert the current parameters that are critical for hot standby. */
+static XLogRecPtr
+XLogInsertParameterChange(void)
+{
+	xl_parameter_change xlrec;
+
+	xlrec.MaxConnections = MaxConnections;
+	xlrec.max_worker_processes = max_worker_processes;
+	xlrec.max_wal_senders = max_wal_senders;
+	xlrec.max_prepared_xacts = max_prepared_xacts;
+	xlrec.max_locks_per_xact = max_locks_per_xact;
+	xlrec.wal_level = wal_level;
+	xlrec.wal_log_hints = wal_log_hints;
+	xlrec.track_commit_timestamp = track_commit_timestamp;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	return XLogInsert(RM_XLOG_ID, XLOG_PARAMETER_CHANGE);
+}
+
 /*
  * Check if any of the GUC parameters that are critical for hot standby
  * have changed, and update the value in pg_control file if necessary.
@@ -9120,22 +9200,8 @@ XLogReportParameters(void)
 		 */
 		if (wal_level != ControlFile->wal_level || XLogIsNeeded())
 		{
-			xl_parameter_change xlrec;
-			XLogRecPtr	recptr;
+			XLogRecPtr	recptr = XLogInsertParameterChange();
 
-			xlrec.MaxConnections = MaxConnections;
-			xlrec.max_worker_processes = max_worker_processes;
-			xlrec.max_wal_senders = max_wal_senders;
-			xlrec.max_prepared_xacts = max_prepared_xacts;
-			xlrec.max_locks_per_xact = max_locks_per_xact;
-			xlrec.wal_level = wal_level;
-			xlrec.wal_log_hints = wal_log_hints;
-			xlrec.track_commit_timestamp = track_commit_timestamp;
-
-			XLogBeginInsert();
-			XLogRegisterData(&xlrec, sizeof(xlrec));
-
-			recptr = XLogInsert(RM_XLOG_ID, XLOG_PARAMETER_CHANGE);
 			XLogFlush(recptr);
 		}
 
@@ -9201,6 +9267,22 @@ XLogChecksums(uint32 new_type)
 	XLogFlush(recptr);
 
 	return recptr;
+}
+
+/*
+ * Record the current runtime control values for a receiver that starts with a
+ * different control file.  XLogChecksums() flushes both records.
+ */
+void
+XLogReportCurrentControlState(void)
+{
+	uint32		checksum_state;
+
+	(void) XLogInsertParameterChange();
+	SpinLockAcquire(&XLogCtl->info_lck);
+	checksum_state = XLogCtl->data_checksum_version;
+	SpinLockRelease(&XLogCtl->info_lck);
+	XLogChecksums(checksum_state);
 }
 
 /*

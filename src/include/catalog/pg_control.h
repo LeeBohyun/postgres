@@ -22,7 +22,7 @@
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	2001
+#define PG_CONTROL_VERSION	2002
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
@@ -269,6 +269,12 @@ typedef struct ControlFileData
 	 * the cluster is initialized.
 	 */
 	bool		default_char_signedness;
+
+	/* The completion checkpoint is durable. */
+	bool		upgrade_finalized;
+
+	/* WAL-upgrade emission reserved this new cluster. */
+	bool		upgrade_started;
 
 	/*
 	 * Random nonce, used in authentication requests that need to proceed

@@ -355,6 +355,8 @@ main(int argc, char *argv[])
 		   (ControlFile->data_checksum_is_local ? _("yes") : _("no")));
 	printf(_("Default char data signedness:         %s\n"),
 		   (ControlFile->default_char_signedness ? _("signed") : _("unsigned")));
+	printf(_("wal-upgrade transaction finalized:    %s\n"),
+		   (ControlFile->upgrade_finalized ? _("yes") : _("no")));
 	printf(_("Mock authentication nonce:            %s\n"),
 		   mock_auth_nonce_str);
 	return 0;

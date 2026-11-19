@@ -23,6 +23,7 @@
 
 static void usage(void);
 static void parse_initdb_options(const char *options);
+static unsigned short parse_port(const char *value, const char *description);
 static void check_required_directory(char **dirpath,
 									 const char *envVarName, bool useCwd,
 									 const char *cmdLineOption, const char *description,
@@ -68,6 +69,7 @@ parseCommandLine(int argc, char *argv[])
 		{"swap", no_argument, NULL, 7},
 		{"initdb", no_argument, NULL, 8},
 		{"initdb-options", required_argument, NULL, 9},
+		{"wal-upgrade", no_argument, NULL, 10},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -84,8 +86,10 @@ parseCommandLine(int argc, char *argv[])
 	os_info.progname = get_progname(argv[0]);
 
 	/* Process libpq env. variables; load values here for usage() output */
-	old_cluster.port = getenv("PGPORTOLD") ? atoi(getenv("PGPORTOLD")) : DEF_PGUPORT;
-	new_cluster.port = getenv("PGPORTNEW") ? atoi(getenv("PGPORTNEW")) : DEF_PGUPORT;
+	old_cluster.port = getenv("PGPORTOLD") ?
+		parse_port(getenv("PGPORTOLD"), "old") : DEF_PGUPORT;
+	new_cluster.port = getenv("PGPORTNEW") ?
+		parse_port(getenv("PGPORTNEW"), "new") : DEF_PGUPORT;
 
 	os_user_effective_id = get_user_info(&os_info.user);
 	/* we override just the database user name;  we got the OS id above */
@@ -178,13 +182,11 @@ parseCommandLine(int argc, char *argv[])
 				break;
 
 			case 'p':
-				if ((old_cluster.port = atoi(optarg)) <= 0)
-					pg_fatal("invalid old port number");
+				old_cluster.port = parse_port(optarg, "old");
 				break;
 
 			case 'P':
-				if ((new_cluster.port = atoi(optarg)) <= 0)
-					pg_fatal("invalid new port number");
+				new_cluster.port = parse_port(optarg, "new");
 				break;
 
 			case 'r':
@@ -243,6 +245,10 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.initdb_new_cluster = true;
 				break;
 
+			case 10:
+				user_opts.wal_upgrade = true;
+				break;
+
 			case 9:
 				user_opts.initdb_options_given = true;
 				parse_initdb_options(optarg);
@@ -284,10 +290,10 @@ parseCommandLine(int argc, char *argv[])
 	/* Get values from env if not already set */
 	check_required_directory(&old_cluster.bindir, "PGBINOLD", false,
 							 "-b", _("old cluster binaries reside"), false);
-	check_required_directory(&new_cluster.bindir, "PGBINNEW", false,
-							 "-B", _("new cluster binaries reside"), true);
 	check_required_directory(&old_cluster.pgdata, "PGDATAOLD", false,
 							 "-d", _("old cluster data resides"), false);
+	check_required_directory(&new_cluster.bindir, "PGBINNEW", false,
+							 "-B", _("new cluster binaries reside"), true);
 	check_required_directory(&new_cluster.pgdata, "PGDATANEW", false,
 							 "-D", _("new cluster data resides"), false);
 	check_required_directory(&user_opts.socketdir, "PGSOCKETDIR", true,
@@ -314,6 +320,21 @@ parseCommandLine(int argc, char *argv[])
 			pg_fatal("cannot run pg_upgrade from inside the new cluster data directory on Windows");
 	}
 #endif
+}
+
+
+static unsigned short
+parse_port(const char *value, const char *description)
+{
+	char	   *end;
+	unsigned long port;
+
+	errno = 0;
+	port = strtoul(value, &end, 10);
+	if (errno != 0 || value[0] == '\0' || end[0] != '\0' ||
+		port == 0 || port > 65535)
+		pg_fatal("invalid %s port number", description);
+	return (unsigned short) port;
 }
 
 
@@ -412,6 +433,7 @@ usage(void)
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
 	printf(_("  --copy                        copy files to new cluster (default)\n"));
 	printf(_("  --copy-file-range             copy files to new cluster with copy_file_range\n"));
+	printf(_("  --wal-upgrade                 capture the whole upgrade as WAL\n"));
 	printf(_("  --initdb                      create the new cluster with initdb before\n"
 			 "                                checking or upgrading, using old cluster settings\n"));
 	printf(_("  --initdb-options=OPTIONS      options to pass to initdb (requires --initdb)\n"));

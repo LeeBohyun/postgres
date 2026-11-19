@@ -490,6 +490,30 @@ pg_upgrade --initdb --initdb-options='-c huge_pages=off --waldir=/wal/new' ...
       <listitem><para>show help, then exit</para></listitem>
      </varlistentry>
 
+
+     <varlistentry>
+      <term><option>--wal-upgrade</option></term>
+      <listitem>
+       <para>
+        Capture the upgrade as a WAL transaction containing the relation-file
+        inventory, new system catalogs, relation maps, and transaction-status
+        files. Validate the new cluster's storage before committing the
+        transaction. This option can be combined with <option>--initdb</option>.
+       </para>
+       <para>
+        This patch adds emission and inspection with <application>pg_waldump</application>.
+        Replay support is added by the following patch in the series. Until
+        then, recovery explicitly rejects upgrade WAL records.
+       </para>
+       <para>
+        While migrated physical slots are inactive, configure
+        <varname>max_slot_wal_keep_size</varname> to <literal>-1</literal> and
+        <varname>idle_replication_slot_timeout</varname> to <literal>0</literal>
+        in the new cluster. Provide enough <varname>max_replication_slots</varname>
+        for both migrated physical and logical slots.
+       </para>
+      </listitem>
+     </varlistentry>
     </variablelist>
    </para>
 

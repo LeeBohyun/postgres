@@ -54,6 +54,7 @@
 #include "fe_utils/version.h"
 #include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
+#include "prepare_upgrade.h"
 
 /*
  * Maximum number of pg_restore actions (TOC entries) to process within one
@@ -66,7 +67,7 @@ static void set_new_cluster_char_signedness(void);
 static void set_locale_and_encoding(void);
 static void prepare_new_cluster(void);
 static void prepare_new_globals(void);
-static void create_new_objects(void);
+static void create_new_objects(UpgradePreparation *preparation);
 static void copy_xact_xlog_xid(void);
 static void set_frozenxids(void);
 static void make_outputdirs(const char *output_root);
@@ -125,6 +126,7 @@ main(int argc, char **argv)
 {
 	char	   *deletion_script_file_name = NULL;
 	bool		migrate_logical_slots;
+	UpgradePreparation *preparation = NULL;
 
 	/*
 	 * pg_upgrade doesn't currently use common/logging.c, but initialize it
@@ -169,6 +171,7 @@ main(int argc, char **argv)
 	if (!GetDataDirectoryCreatePerm(new_cluster.pgdata))
 		pg_fatal("could not read permissions of directory \"%s\": %m",
 				 new_cluster.pgdata);
+
 	umask(pg_mode_mask);
 
 	if (user_opts.initdb_new_cluster)
@@ -198,16 +201,31 @@ main(int argc, char **argv)
 
 	check_cluster_compatibility();
 
-	check_and_dump_old_cluster();
-
+	if (user_opts.wal_upgrade && !user_opts.check)
+		preparation = create_upgrade_preparation(&old_cluster, &new_cluster,
+												 user_opts.transfer_mode);
+	check_and_dump_old_cluster(preparation);
 
 	/* -- NEW -- */
+	/* Start the new-major server for new-cluster compatibility checks. */
 	start_postmaster(&new_cluster, true);
 
 	check_new_cluster();
 	report_clusters_compatible();
 	/* --check exits above. Retain the new cluster once the upgrade begins. */
 	initdb_keep_cluster = true;
+
+	if (user_opts.wal_upgrade && !user_opts.check)
+	{
+		int			multixact_offset_size =
+			old_cluster.controldata.chkpnt_nxtmxoff_size;
+
+		/* The old-cluster checks stopped the source at a new checkpoint. */
+		memset(&old_cluster.controldata, 0, sizeof(old_cluster.controldata));
+		get_control_data(&old_cluster);
+		old_cluster.controldata.chkpnt_nxtmxoff_size = multixact_offset_size;
+		prepare_upgrade_old_cluster(preparation);
+	}
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -229,22 +247,14 @@ main(int argc, char **argv)
 
 	/* New now using xids of the old system */
 
-	/* -- NEW -- */
 	start_postmaster(&new_cluster, true);
 
 	prepare_new_globals();
 
-	create_new_objects();
+	create_new_objects(preparation);
 
 	stop_postmaster(false);
 
-	/*
-	 * Most failures happen in create_new_objects(), which has completed at
-	 * this point.  We do this here because it is just before file transfer,
-	 * which for --link will make it unsafe to start the old cluster once the
-	 * new cluster is started, and for --swap will make it unsafe to start the
-	 * old cluster at all.
-	 */
 	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
 		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
 		disable_old_cluster(user_opts.transfer_mode);
@@ -252,20 +262,74 @@ main(int argc, char **argv)
 	transfer_all_new_tablespaces(&old_cluster.dbarr, &new_cluster.dbarr,
 								 old_cluster.pgdata, new_cluster.pgdata);
 
-	/*
-	 * Assuming OIDs are only used in system tables, there is no need to
-	 * restore the OID counter because we have not transferred any OIDs from
-	 * the old system, but we do it anyway just in case.  We do it late here
-	 * because there is no need to have the schema load use new oids.
-	 */
-	prep_status("Setting next OID for new cluster");
-	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -o %" PRIu64 " \"%s\"",
-			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
-			  new_cluster.pgdata);
-	check_ok();
-
+	if (user_opts.wal_upgrade)
+	{
+		prep_status("Setting next OID and preparing upgrade WAL");
+		/*
+		 * Write the new cluster's initial checkpoint in the first whole WAL
+		 * segment after the old cluster's final shutdown checkpoint ends,
+		 * using the old cluster's timeline.
+		 */
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" --wal-upgrade-exact -o %" PRIu64 " -l %s \"%s\"",
+				  new_cluster.bindir,
+				  old_cluster.controldata.chkpnt_nxtoid,
+				  old_cluster.controldata.upgrade_start_wal_file,
+				  new_cluster.pgdata);
+		check_ok();
+	}
+	else
+	{
+		prep_status("Setting next OID for new cluster");
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" -o %" PRIu64 " \"%s\"",
+				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+				  new_cluster.pgdata);
+		check_ok();
+	}
 	migrate_logical_slots = count_old_cluster_logical_slots();
+
+	if (user_opts.wal_upgrade)
+	{
+		PGconn	   *conn;
+
+		/*
+		 * Add the new cluster's system identifier and checksum the relink
+		 * file after resetting WAL and before starting the new cluster for
+		 * WAL emission.
+		 */
+		finish_upgrade_preparation(preparation);
+
+		/* Start the new cluster to emit the upgrade WAL. */
+		start_postmaster(&new_cluster, true);
+		conn = connectToServer(&new_cluster, "template1");
+
+		/*
+		 * Recreate and reserve each physical slot before emitting the upgrade
+		 * transaction.
+		 */
+		for (int slotnum = 0; slotnum < old_cluster.phys_slot_arr.nslots; slotnum++)
+		{
+			const char *slotname = old_cluster.phys_slot_arr.slotnames[slotnum];
+
+			pg_log(PG_VERBOSE, "migrating physical replication slot \"%s\"",
+				   slotname);
+
+			PQclear(executeQueryOrDie(conn,
+									  "SELECT pg_create_physical_replication_slot('%s', true, false)",
+									  slotname));
+		}
+
+		emit_upgrade_wal(preparation, conn);
+
+		free_upgrade_preparation(preparation);
+
+		PQclear(executeQueryOrDie(conn, "SELECT pg_switch_wal()"));
+
+		PQfinish(conn);
+
+		stop_postmaster(false);
+	}
 
 	/*
 	 * Migrate replication slots to the new cluster.
@@ -301,11 +365,13 @@ main(int argc, char **argv)
 		stop_postmaster(false);
 	}
 
-	sync_new_cluster(user_opts.transfer_mode != TRANSFER_MODE_SWAP);
+	sync_new_cluster(user_opts.transfer_mode != TRANSFER_MODE_SWAP ||
+					 user_opts.wal_upgrade);
 
 	create_script_for_old_cluster_deletion(&deletion_script_file_name);
 
-	issue_warnings_and_set_wal_level();
+	if (!user_opts.wal_upgrade)
+		issue_warnings_and_set_wal_level();
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -333,6 +399,10 @@ sync_new_cluster(bool sync_data_files)
 		return;
 
 	prep_status("Sync data directory to disk");
+#ifdef USE_ASSERT_CHECKING
+	pg_upgrade_test_wait("PG_UPGRADE_TEST_PAUSE_BEFORE_SYNC",
+						 "test pause before upgrade synchronization");
+#endif
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 			  "\"%s/initdb\" --sync-only %s \"%s\" --sync-method %s",
 			  new_cluster.bindir,
@@ -866,8 +936,6 @@ create_new_cluster_via_initdb(void)
 }
 
 
-
-
 static void
 check_clusters_stopped(void)
 {
@@ -1070,10 +1138,14 @@ prepare_new_globals(void)
 
 
 static void
-create_new_objects(void)
+create_new_objects(UpgradePreparation *preparation)
 {
 	int			dbnum;
 	PGconn	   *conn_new_template1;
+
+	PGresult   *lsn_res;
+	uint64		lsn_before = 0,
+				lsn_after = 0;
 
 	prep_status_progress("Restoring database schemas in the new cluster");
 
@@ -1086,6 +1158,15 @@ create_new_objects(void)
 	 */
 	conn_new_template1 = connectToServer(&new_cluster, "template1");
 	PQclear(executeQueryOrDie(conn_new_template1, "CHECKPOINT"));
+
+	if (user_opts.wal_upgrade)
+	{
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_before = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+	}
+
 	PQfinish(conn_new_template1);
 
 	/*
@@ -1191,8 +1272,33 @@ create_new_objects(void)
 	end_progress_output();
 	check_ok();
 
+	if (user_opts.wal_upgrade)
+	{
+		conn_new_template1 = connectToServer(&new_cluster, "template1");
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_after = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+		PQfinish(conn_new_template1);
+
+		log_opts.pg_upgrade_wal_bytes = lsn_after - lsn_before;
+		pg_log(PG_VERBOSE, "pg_upgrade_wal_bytes: " UINT64_FORMAT,
+			   log_opts.pg_upgrade_wal_bytes);
+	}
+
+#if defined(USE_ASSERT_CHECKING) && defined(USE_INJECTION_POINTS)
+	/* Include test functions in the inventory before streaming starts. */
+	if (user_opts.wal_upgrade && getenv("PG_UPGRADE_TEST_INJECTION_POINTS") != NULL)
+	{
+		conn_new_template1 = connectToServer(&new_cluster, "template1");
+		PQclear(executeQueryOrDie(conn_new_template1,
+								 "CREATE EXTENSION injection_points WITH SCHEMA public"));
+		PQfinish(conn_new_template1);
+	}
+#endif
+
 	/* update new_cluster info now that we have objects in the databases */
-	get_db_rel_and_slot_infos(&new_cluster);
+	get_db_rel_and_slot_infos(&new_cluster, preparation);
 }
 
 /*
@@ -1277,7 +1383,7 @@ copy_xact_xlog_xid(void)
 
 	/* Copy or convert pg_multixact files */
 	Assert(new_cluster.controldata.cat_ver >= MULTIXACTOFFSET_FORMATCHANGE_CAT_VER);
-	if (old_cluster.controldata.cat_ver >= MULTIXACTOFFSET_FORMATCHANGE_CAT_VER)
+	if (old_cluster.controldata.chkpnt_nxtmxoff_size == (int) sizeof(uint64))
 	{
 		/* No change in multixact format, just copy the files */
 		MultiXactId new_nxtmulti = old_cluster.controldata.chkpnt_nxtmulti;
@@ -1299,7 +1405,8 @@ copy_xact_xlog_xid(void)
 				  new_cluster.pgdata);
 		check_ok();
 	}
-	else
+	else if (old_cluster.controldata.chkpnt_nxtmxoff_size ==
+			 (int) sizeof(uint32))
 	{
 		/* Conversion is needed */
 		MultiXactId nxtmulti;
@@ -1339,8 +1446,10 @@ copy_xact_xlog_xid(void)
 				  new_cluster.pgdata);
 		check_ok();
 	}
+	else
+		pg_fatal("old cluster has unsupported multixact offset width %d",
+				 old_cluster.controldata.chkpnt_nxtmxoff_size);
 
-	/* now reset the wal archives in the new cluster */
 	prep_status("Resetting WAL archives");
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
 	/* use timeline 1 to match controldata and no WAL history file */

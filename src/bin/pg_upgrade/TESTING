@@ -64,3 +64,8 @@ and then try to pg_upgrade it to the new version.  Success is reported
 if pg_dumpall output matches between the pre-upgrade and post-upgrade
 databases.  In case of trouble, manually comparing those dump files may
 help to isolate the problem.
+
+
+013_wal_upgrade_emission.pl checks upgrade WAL emission, storage validation,
+and ordinary startup of the upgraded primary. Replay tests are added with
+the recovery support in the next patch.

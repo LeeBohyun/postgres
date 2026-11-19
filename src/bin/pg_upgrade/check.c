@@ -14,12 +14,16 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_class_d.h"
+#include "common/string.h"
 #include "fe_utils/string_utils.h"
 #include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
+#include "prepare_upgrade.h"
 #include "common/unicode_version.h"
 
 static void check_new_cluster_is_empty(void);
+static char *get_new_cluster_setting(const char *name);
+static int	get_new_cluster_int_setting(const char *name);
 static void check_is_install_user(ClusterInfo *cluster);
 static void check_for_unsupported_encodings(ClusterInfo *cluster);
 static void check_for_connection_status(ClusterInfo *cluster);
@@ -563,13 +567,62 @@ output_check_banner(void)
 	}
 }
 
+/* Read a persistent new-cluster setting with postgres -C. */
+static char *
+get_new_cluster_setting(const char *name)
+{
+	PQExpBufferData cmd;
+	char	   *line;
+	char		postgres_path[MAXPGPATH];
+	FILE	   *output;
+	int			rc;
+
+	snprintf(postgres_path, sizeof(postgres_path), "%s/postgres",
+			 new_cluster.bindir);
+	initPQExpBuffer(&cmd);
+	appendShellString(&cmd, postgres_path);
+	appendPQExpBufferStr(&cmd, " -D ");
+	appendShellString(&cmd, new_cluster.pgconfig);
+	appendPQExpBuffer(&cmd, " -C %s", name);
+
+	fflush(NULL);
+	output = popen(cmd.data, "r");
+	if (output == NULL)
+		pg_fatal("could not read new-cluster setting \"%s\"", name);
+	line = pg_get_line(output, NULL);
+	rc = pclose(output);
+	if (line == NULL || rc != 0)
+		pg_fatal("could not read new-cluster setting \"%s\" using %s: %s",
+				 name, cmd.data, wait_result_to_str(rc));
+
+	(void) pg_strip_crlf(line);
+	termPQExpBuffer(&cmd);
+	return line;
+}
+
+static int
+get_new_cluster_int_setting(const char *name)
+{
+	char	   *end;
+	char	   *value = get_new_cluster_setting(name);
+	int			result;
+
+	errno = 0;
+	result = strtoint(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0')
+		pg_fatal("new-cluster setting \"%s\" has invalid value \"%s\"",
+				 name, value);
+	pg_free(value);
+	return result;
+}
 
 void
-check_and_dump_old_cluster(void)
+check_and_dump_old_cluster(UpgradePreparation * preparation)
 {
 	/* -- OLD -- */
 
-	if (!user_opts.live_check)
+	if (!user_opts.live_check &&
+		os_info.running_cluster != &old_cluster)
 		start_postmaster(&old_cluster, true);
 
 	/*
@@ -577,6 +630,7 @@ check_and_dump_old_cluster(void)
 	 * fail in later stages.
 	 */
 	check_for_connection_status(&old_cluster);
+	get_multixact_offset_type_size(&old_cluster);
 
 	/*
 	 * Check for encodings that are no longer supported.
@@ -595,7 +649,9 @@ check_and_dump_old_cluster(void)
 	 * Extract a list of databases, tables, and logical replication slots from
 	 * the old cluster.
 	 */
-	get_db_rel_and_slot_infos(&old_cluster);
+	get_db_rel_and_slot_infos(&old_cluster, preparation);
+
+	get_old_cluster_physical_slot_infos();
 
 	init_tablespaces();
 
@@ -699,11 +755,10 @@ check_and_dump_old_cluster(void)
 		stop_postmaster(false);
 }
 
-
 void
 check_new_cluster(void)
 {
-	get_db_rel_and_slot_infos(&new_cluster);
+	get_db_rel_and_slot_infos(&new_cluster, NULL);
 
 	check_new_cluster_is_empty();
 
@@ -799,6 +854,11 @@ output_completion_banner(char *deletion_script_file_name)
 		appendShellString(&user_specification, os_info.user);
 		appendPQExpBufferChar(&user_specification, ' ');
 	}
+
+	if (user_opts.wal_upgrade)
+		pg_log(PG_REPORT,
+			   "WAL generated during schema restore: " UINT64_FORMAT " bytes",
+			   log_opts.pg_upgrade_wal_bytes);
 
 	pg_log(PG_REPORT,
 		   "Some statistics are not transferred by pg_upgrade.\n"
@@ -2086,92 +2146,153 @@ check_for_unicode_update(ClusterInfo *cluster)
 static void
 check_new_cluster_replication_slots(void)
 {
+	static const struct
+	{
+		const char *name;
+		int			required;
+	}			retention_settings[] = {
+		{"max_slot_wal_keep_size", -1},
+		{"idle_replication_slot_timeout", 0},
+	};
 	PGresult   *res;
 	PGconn	   *conn;
-	int			nslots_on_old;
+	int			nlogical_slots_on_old;
+	int			nlogical_slots_on_new;
+	int			nphysical_slots_on_old = old_cluster.phys_slot_arr.nslots;
 	int			nslots_on_new;
 	int			rdt_slot_on_new;
 	int			max_replication_slots;
+	int			required_slots;
 	char	   *output_plugin_libraries;
 	char	   *wal_level;
+	int			i_nlogical_slots_on_new;
 	int			i_nslots_on_new;
 	int			i_rdt_slot_on_new;
+	int			i_idle_replication_slot_timeout;
+	int			i_max_replication_slots;
+	int			i_max_slot_wal_keep_size;
+	int			i_output_plugin_libraries;
+	int			i_wal_level;
 
 	/*
 	 * Logical slots can be migrated since PG17 and a physical slot
 	 * CONFLICT_DETECTION_SLOT can be migrated since PG19.
 	 */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 1600)
-		return;
-
-	nslots_on_old = count_old_cluster_logical_slots();
+	nlogical_slots_on_old = count_old_cluster_logical_slots();
 
 	/*
 	 * Quick return if there are no slots to be migrated and no subscriptions
 	 * have the retain_dead_tuples option enabled.
 	 */
-	if (nslots_on_old == 0 && !old_cluster.sub_retain_dead_tuples)
+	if (nlogical_slots_on_old == 0 && nphysical_slots_on_old == 0 &&
+		!old_cluster.sub_retain_dead_tuples)
 		return;
 
 	conn = connectToServer(&new_cluster, "template1");
 
 	prep_status("Checking new cluster replication slots");
 
-	res = executeQueryOrDie(conn, "SELECT %s AS nslots_on_new, %s AS rdt_slot_on_new "
-							"FROM pg_catalog.pg_replication_slots",
-							nslots_on_old > 0
-							? "COUNT(*) FILTER (WHERE slot_type = 'logical' AND temporary IS FALSE)"
-							: "0",
-							old_cluster.sub_retain_dead_tuples
-							? "COUNT(*) FILTER (WHERE slot_name = 'pg_conflict_detection')"
-							: "0");
+	res = executeQueryOrDie(conn,
+							"SELECT slots.*, settings.* "
+							"FROM (SELECT COUNT(*) FILTER (WHERE temporary IS FALSE) AS nslots_on_new, "
+							"             COUNT(*) FILTER (WHERE slot_type = 'logical' AND temporary IS FALSE) AS nlogical_slots_on_new, "
+							"             COUNT(*) FILTER (WHERE slot_name = 'pg_conflict_detection') AS rdt_slot_on_new "
+							"      FROM pg_catalog.pg_replication_slots) slots "
+							"CROSS JOIN (SELECT MAX(setting) FILTER (WHERE name = 'wal_level') AS wal_level, "
+							"                   MAX(setting) FILTER (WHERE name = 'output_plugin_libraries') AS output_plugin_libraries, "
+							"                   MAX(setting) FILTER (WHERE name = 'max_replication_slots') AS max_replication_slots, "
+							"                   MAX(setting) FILTER (WHERE name = 'max_slot_wal_keep_size') AS max_slot_wal_keep_size, "
+							"                   MAX(setting) FILTER (WHERE name = 'idle_replication_slot_timeout') AS idle_replication_slot_timeout "
+							"            FROM pg_catalog.pg_settings "
+							"            WHERE name IN ('wal_level', 'output_plugin_libraries', 'max_replication_slots', "
+							"                           'max_slot_wal_keep_size', 'idle_replication_slot_timeout')) settings");
 
 	if (PQntuples(res) != 1)
 		pg_fatal("could not count the number of replication slots");
 
 	i_nslots_on_new = PQfnumber(res, "nslots_on_new");
+	i_nlogical_slots_on_new = PQfnumber(res, "nlogical_slots_on_new");
 	i_rdt_slot_on_new = PQfnumber(res, "rdt_slot_on_new");
+	i_wal_level = PQfnumber(res, "wal_level");
+	i_output_plugin_libraries = PQfnumber(res, "output_plugin_libraries");
+	i_max_replication_slots = PQfnumber(res, "max_replication_slots");
+	i_max_slot_wal_keep_size = PQfnumber(res, "max_slot_wal_keep_size");
+	i_idle_replication_slot_timeout =
+		PQfnumber(res, "idle_replication_slot_timeout");
 
 	nslots_on_new = atoi(PQgetvalue(res, 0, i_nslots_on_new));
+	nlogical_slots_on_new =
+		atoi(PQgetvalue(res, 0, i_nlogical_slots_on_new));
 
-	if (nslots_on_new)
-	{
-		Assert(nslots_on_old);
+	if (nlogical_slots_on_old > 0 && nlogical_slots_on_new > 0)
 		pg_fatal("expected 0 logical replication slots but found %d",
+				 nlogical_slots_on_new);
+	if (nphysical_slots_on_old > 0 && nslots_on_new > 0)
+		pg_fatal("expected 0 persistent replication slots in the new cluster while migrating physical slots but found %d",
 				 nslots_on_new);
-	}
 
 	rdt_slot_on_new = atoi(PQgetvalue(res, 0, i_rdt_slot_on_new));
 
-	if (rdt_slot_on_new)
-	{
-		Assert(old_cluster.sub_retain_dead_tuples);
+	if (old_cluster.sub_retain_dead_tuples && rdt_slot_on_new)
 		pg_fatal("replication slot \"%s\" already exists in the new cluster", "pg_conflict_detection");
+	required_slots = nslots_on_new + nphysical_slots_on_old +
+		nlogical_slots_on_old +
+		(old_cluster.sub_retain_dead_tuples ? 1 : 0);
+
+	/* Check persistent settings used by normal new-cluster startup. */
+	if (user_opts.wal_upgrade)
+	{
+		int			persistent_max =
+			get_new_cluster_int_setting("max_replication_slots");
+		char	   *persistent_wal_level =
+			get_new_cluster_setting("wal_level");
+
+		if (strcmp(persistent_wal_level, "minimal") == 0)
+			pg_fatal("new-cluster setting \"wal_level\" must be \"replica\" or "
+					 "\"logical\" during normal startup while migrating replication slots");
+
+		if (persistent_max < required_slots)
+			pg_fatal("new-cluster setting \"max_replication_slots\" must be at "
+					 "least %d during normal startup while migrating replication slots",
+					 required_slots);
+
+		pg_free(persistent_wal_level);
+
+		if (nphysical_slots_on_old > 0)
+		{
+			int			effective_values[] = {
+				atoi(PQgetvalue(res, 0, i_max_slot_wal_keep_size)),
+				atoi(PQgetvalue(res, 0, i_idle_replication_slot_timeout)),
+			};
+
+			for (int i = 0; i < lengthof(retention_settings); i++)
+			{
+				int			persistent_value =
+					get_new_cluster_int_setting(retention_settings[i].name);
+
+				if (persistent_value != retention_settings[i].required ||
+					effective_values[i] != retention_settings[i].required)
+					pg_fatal("new-cluster setting \"%s\" must be %d while migrated "
+							 "physical slots are inactive during standby upgrade replay",
+							 retention_settings[i].name,
+							 retention_settings[i].required);
+			}
+		}
 	}
 
-	PQclear(res);
+	wal_level = PQgetvalue(res, 0, i_wal_level);
 
-	res = executeQueryOrDie(conn, "SELECT setting FROM pg_settings "
-							"WHERE name IN ('wal_level', 'output_plugin_libraries', 'max_replication_slots') "
-							"ORDER BY name DESC;");
-
-	if (PQntuples(res) != 3)
-		pg_fatal("could not determine parameter settings on new cluster");
-
-	wal_level = PQgetvalue(res, 0, 0);
-
-	if ((nslots_on_old > 0 || old_cluster.sub_retain_dead_tuples) &&
-		strcmp(wal_level, "minimal") == 0)
+	if (strcmp(wal_level, "minimal") == 0)
 		pg_fatal("\"wal_level\" must be \"replica\" or \"logical\" but is set to \"%s\"",
 				 wal_level);
 
-	output_plugin_libraries = PQgetvalue(res, 1, 0);
+	output_plugin_libraries = PQgetvalue(res, 0, i_output_plugin_libraries);
 
 	/*
 	 * Make sure the output_plugin_libraries setting covers all plugins needed
 	 * by any migrated slots.
 	 */
-	if (nslots_on_old > 0)
+	if (nlogical_slots_on_old > 0)
 	{
 		char	   *guc_copy = pg_strdup(output_plugin_libraries);
 		char	  **allowed_plugins;
@@ -2243,19 +2364,20 @@ check_new_cluster_replication_slots(void)
 		pg_free(guc_copy);
 	}
 
-	max_replication_slots = atoi(PQgetvalue(res, 2, 0));
+	max_replication_slots = atoi(PQgetvalue(res, 0, i_max_replication_slots));
 
-	if (old_cluster.sub_retain_dead_tuples &&
-		nslots_on_old + 1 > max_replication_slots)
-		pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of "
-				 "logical replication slots in the old cluster plus one additional slot required "
-				 "for retaining conflict detection information (%d)",
-				 max_replication_slots, nslots_on_old + 1);
-
-	if (nslots_on_old > max_replication_slots)
-		pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of "
-				 "logical replication slots (%d) in the old cluster",
-				 max_replication_slots, nslots_on_old);
+	if (required_slots > max_replication_slots)
+	{
+		if (nphysical_slots_on_old == 0 && nslots_on_new == 0 &&
+			old_cluster.sub_retain_dead_tuples)
+			pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of logical replication slots in the old cluster plus one additional slot required for retaining conflict detection information (%d)",
+					 max_replication_slots, required_slots);
+		if (nphysical_slots_on_old == 0 && nslots_on_new == 0)
+			pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the number of logical replication slots (%d) in the old cluster",
+					 max_replication_slots, nlogical_slots_on_old);
+		pg_fatal("\"max_replication_slots\" (%d) must be greater than or equal to the combined number of existing and migrated replication slots (%d)",
+				 max_replication_slots, required_slots);
+	}
 
 	PQclear(res);
 	PQfinish(conn);

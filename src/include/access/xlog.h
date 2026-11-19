@@ -222,6 +222,7 @@ typedef enum WALAvailability
 
 struct XLogRecData;
 struct XLogReaderState;
+struct ControlFileData;
 
 extern XLogRecPtr XLogInsertRecord(struct XLogRecData *rdata,
 								   XLogRecPtr fpw_lsn,
@@ -263,6 +264,8 @@ extern XLogRecPtr GetXLogWriteRecPtr(void);
 
 extern uint64 GetSystemIdentifier(void);
 extern char *GetMockAuthenticationNonce(void);
+extern void GetControlFileCopy(struct ControlFileData *copy);
+extern void XLogReportCurrentControlState(void);
 extern bool DataChecksumsNeedWrite(void);
 extern bool DataChecksumsNeedVerify(void);
 extern XLogRecPtr GetLastChecksumChangeRecPtr(void);

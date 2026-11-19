@@ -172,12 +172,12 @@ stop_postmaster_atexit(void)
 bool
 start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 {
-	char		cmd[MAXPGPATH * 4 + 1000];
 	PGconn	   *conn;
 	bool		pg_ctl_return = false;
-	char		socket_string[MAXPGPATH + 200];
+	PQExpBufferData cmd;
+	PQExpBufferData postmaster_options;
+	PQExpBufferData socket_options;
 	PQExpBufferData pgoptions;
-	PQExpBufferData quoted_options;
 
 	static bool exit_hook_registered = false;
 
@@ -187,25 +187,21 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 		exit_hook_registered = true;
 	}
 
-	socket_string[0] = '\0';
+	initPQExpBuffer(&socket_options);
 
 #if !defined(WIN32)
-	/* prevent TCP/IP connections, restrict socket access */
-	strcat(socket_string,
-		   " -c listen_addresses='' -c unix_socket_permissions=0700");
+	appendPQExpBufferStr(&socket_options, " -c listen_addresses=''");
+	appendPQExpBufferStr(&socket_options,
+						 " -c unix_socket_permissions=0700");
 
 	/* Have a sockdir?	Tell the postmaster. */
 	if (cluster->sockdir)
-		snprintf(socket_string + strlen(socket_string),
-				 sizeof(socket_string) - strlen(socket_string),
-				 " -c %s='%s'",
-				 "unix_socket_directories",
-				 cluster->sockdir);
+		appendPQExpBuffer(&socket_options,
+						  " -c unix_socket_directories='%s'",
+						  cluster->sockdir);
 #endif
 
 	initPQExpBuffer(&pgoptions);
-	initPQExpBuffer(&quoted_options);
-	appendPQExpBuffer(&pgoptions, "-p %d -b", cluster->port);
 
 	/*
 	 * Construct a parameter string which is passed to the server process.
@@ -216,23 +212,45 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	 * win on ext4.
 	 */
 	if (cluster == &new_cluster)
-		appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");
+	{
+		appendPQExpBufferStr(&pgoptions,
+							 " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");
+
+		if (user_opts.wal_upgrade)
+		{
+			/*
+			 * Keep slot-retained WAL unbounded and raise automatic checkpoint
+			 * thresholds while emitting the upgrade transaction.
+			 */
+			appendPQExpBufferStr(&pgoptions,
+								 " -c max_slot_wal_keep_size=-1"
+								 " -c max_wal_size=1TB"
+								 " -c checkpoint_timeout=1h");
+
+		}
+	}
 
 	/*
 	 * Use -b to disable autovacuum and logical replication launcher
 	 * (effective in PG17 or later for the latter).
 	 */
-	appendPQExpBuffer(&pgoptions, " %s%s",
-					  cluster->pgopts ? cluster->pgopts : "", socket_string);
-	appendShellString(&quoted_options, pgoptions.data);
-	snprintf(cmd, sizeof(cmd),
-			 "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o %s start",
-			 cluster->bindir,
-			 log_opts.logdir,
-			 SERVER_LOG_FILE, cluster->pgconfig, quoted_options.data);
+	initPQExpBuffer(&postmaster_options);
+	appendPQExpBuffer(&postmaster_options, "-b%s %s%s -p %d",
+					  pgoptions.data,
+					  cluster->pgopts ? cluster->pgopts : "",
+					  socket_options.data, cluster->port);
 
 	termPQExpBuffer(&pgoptions);
-	termPQExpBuffer(&quoted_options);
+	termPQExpBuffer(&socket_options);
+
+	initPQExpBuffer(&cmd);
+	appendPQExpBuffer(&cmd,
+					  "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o ",
+					  cluster->bindir, log_opts.logdir, SERVER_LOG_FILE,
+					  cluster->pgconfig);
+	appendShellString(&cmd, postmaster_options.data);
+	appendPQExpBufferStr(&cmd, " start");
+	termPQExpBuffer(&postmaster_options);
 
 	/*
 	 * Don't throw an error right away, let connecting throw the error because
@@ -244,11 +262,14 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 									  SERVER_START_LOG_FILE) != 0) ?
 							  SERVER_LOG_FILE : NULL,
 							  report_and_exit_on_error, false,
-							  "%s", cmd);
+							  "%s", cmd.data);
 
 	/* Did it fail and we are just testing if the server could be started? */
 	if (!pg_ctl_return && !report_and_exit_on_error)
+	{
+		termPQExpBuffer(&cmd);
 		return false;
+	}
 
 	/*
 	 * We set this here to make sure atexit() shuts down the server, but only
@@ -281,11 +302,11 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 		if (cluster == &old_cluster)
 			pg_fatal("could not connect to source postmaster started with the command:\n"
 					 "%s",
-					 cmd);
+					 cmd.data);
 		else
 			pg_fatal("could not connect to target postmaster started with the command:\n"
 					 "%s",
-					 cmd);
+					 cmd.data);
 	}
 	PQfinish(conn);
 
@@ -302,6 +323,7 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 			pg_fatal("pg_ctl failed to start the target server, or connection failed");
 	}
 
+	termPQExpBuffer(&cmd);
 	return true;
 }
 

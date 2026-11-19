@@ -13,6 +13,7 @@
 #include "catalog/pg_class_d.h"
 #include "pg_upgrade.h"
 #include "pqexpbuffer.h"
+#include "prepare_upgrade.h"
 
 static void create_rel_filename_map(const char *old_data, const char *new_data,
 									const DbInfo *old_db, const DbInfo *new_db,
@@ -22,7 +23,7 @@ static void report_unmatched_relation(const RelInfo *rel, const DbInfo *db,
 									  bool is_new_db);
 static void free_db_and_rel_infos(DbInfoArr *db_arr);
 static void get_db_infos(ClusterInfo *cluster);
-static char *get_rel_infos_query(void);
+static char *get_rel_infos_query(ClusterInfo *cluster, bool collect_relink);
 static void process_rel_infos(DbInfo *dbinfo, PGresult *res, void *arg);
 static void free_rel_infos(RelInfoArr *rel_arr);
 static void print_db_infos(DbInfoArr *db_arr);
@@ -140,6 +141,17 @@ gen_db_file_maps(DbInfo *old_db, DbInfo *new_db,
 		/* OK, create a mapping entry */
 		create_rel_filename_map(old_pgdata, new_pgdata, old_db, new_db,
 								old_rel, new_rel, maps + num_maps);
+		/*
+		 * Mark matched relations for RELINK.  The inventory is written and freed
+		 * before file transfer calls this function again.
+		 */
+		if (new_db->relink_arr.rels != NULL)
+		{
+			Assert(new_rel->relink_index >= 0 &&
+				   new_rel->relink_index < new_db->relink_arr.nrels);
+			new_db->relink_arr.rels[new_rel->relink_index].flags |=
+				PG_UPGRADE_RELINK_TRANSFERRED;
+		}
 		num_maps++;
 		old_relnum++;
 		new_relnum++;
@@ -275,22 +287,25 @@ report_unmatched_relation(const RelInfo *rel, const DbInfo *db, bool is_new_db)
  * on the given "port". Assumes that server is already running.
  */
 void
-get_db_rel_and_slot_infos(ClusterInfo *cluster)
+get_db_rel_and_slot_infos(ClusterInfo *cluster, UpgradePreparation *preparation)
 {
 	UpgradeTask *task = upgrade_task_create();
 	char	   *rel_infos_query = NULL;
 
 	if (cluster->dbarr.dbs != NULL)
 		free_db_and_rel_infos(&cluster->dbarr);
+	pg_free(cluster->shared_relink_arr.rels);
+	cluster->shared_relink_arr.rels = NULL;
+	cluster->shared_relink_arr.nrels = 0;
 
 	get_template0_info(cluster);
 	get_db_infos(cluster);
 
-	rel_infos_query = get_rel_infos_query();
+	rel_infos_query = get_rel_infos_query(cluster, preparation != NULL);
 	upgrade_task_add_step(task,
 						  rel_infos_query,
 						  process_rel_infos,
-						  true, NULL);
+						  true, preparation != NULL ? cluster : NULL);
 
 	/*
 	 * Logical slots are only carried over to the new cluster when the old
@@ -308,7 +323,12 @@ get_db_rel_and_slot_infos(ClusterInfo *cluster)
 							  process_old_cluster_logical_slot_infos,
 							  true, NULL);
 
-	upgrade_task_run(task, cluster);
+	if (preparation != NULL)
+		prepare_upgrade_relink_input(preparation, cluster,
+									 cluster == &old_cluster ? RELINK_INPUT_OLD : RELINK_INPUT_NEW,
+									 task);
+	else
+		upgrade_task_run(task, cluster);
 	upgrade_task_free(task);
 
 	pg_free(rel_infos_query);
@@ -342,13 +362,13 @@ get_template0_info(ClusterInfo *cluster)
 
 	if (GET_MAJOR_VERSION(cluster->major_version) >= 1700)
 		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, datlocprovider, "
+								  "SELECT oid, dattablespace, encoding, datlocprovider, "
 								  "       datcollate, datctype, datlocale, daticurules "
 								  "FROM	pg_catalog.pg_database "
 								  "WHERE datname='template0'");
 	else if (GET_MAJOR_VERSION(cluster->major_version) >= 1500)
 		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, datlocprovider, "
+								  "SELECT oid, dattablespace, encoding, datlocprovider, "
 								  "       datcollate, datctype, daticulocale AS datlocale, "
 								  "       %s AS daticurules "
 								  "FROM	pg_catalog.pg_database "
@@ -357,7 +377,7 @@ get_template0_info(ClusterInfo *cluster)
 								  "daticurules" : "NULL");
 	else
 		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, 'c' AS datlocprovider, "
+								  "SELECT oid, dattablespace, encoding, 'c' AS datlocprovider, "
 								  "       datcollate, datctype, NULL AS datlocale, "
 								  "       NULL AS daticurules "
 								  "FROM	pg_catalog.pg_database "
@@ -376,6 +396,9 @@ get_template0_info(ClusterInfo *cluster)
 	i_datlocale = PQfnumber(dbres, "datlocale");
 	i_daticurules = PQfnumber(dbres, "daticurules");
 
+	locale->db_oid = atooid(PQgetvalue(dbres, 0, PQfnumber(dbres, "oid")));
+	locale->db_tablespace_oid =
+		atooid(PQgetvalue(dbres, 0, PQfnumber(dbres, "dattablespace")));
 	locale->db_encoding = atoi(PQgetvalue(dbres, 0, i_datencoding));
 	locale->db_collprovider = PQgetvalue(dbres, 0, i_datlocprovider)[0];
 	locale->db_collate = pg_strdup(PQgetvalue(dbres, 0, i_datcollate));
@@ -410,13 +433,14 @@ get_db_infos(ClusterInfo *cluster)
 	int			ntups;
 	int			tupnum;
 	DbInfo	   *dbinfos;
-	int			i_oid,
+	int			i_dattablespace,
 				i_datname,
+				i_oid,
 				i_spclocation;
 	char		query[QUERY_ALLOC];
 
 	snprintf(query, sizeof(query),
-			 "SELECT d.oid, d.datname, "
+			 "SELECT d.oid, d.datname, d.dattablespace, "
 			 "pg_catalog.pg_tablespace_location(t.oid) AS spclocation "
 			 "FROM pg_catalog.pg_database d "
 			 " LEFT OUTER JOIN pg_catalog.pg_tablespace t "
@@ -429,6 +453,7 @@ get_db_infos(ClusterInfo *cluster)
 
 	i_oid = PQfnumber(res, "oid");
 	i_datname = PQfnumber(res, "datname");
+	i_dattablespace = PQfnumber(res, "dattablespace");
 	i_spclocation = PQfnumber(res, "spclocation");
 
 	ntups = PQntuples(res);
@@ -440,6 +465,8 @@ get_db_infos(ClusterInfo *cluster)
 		bool		inplace = spcloc[0] && !is_absolute_path(spcloc);
 
 		dbinfos[tupnum].db_oid = atooid(PQgetvalue(res, tupnum, i_oid));
+		dbinfos[tupnum].db_tablespace_oid = atooid(PQgetvalue(res, tupnum,
+															  i_dattablespace));
 		dbinfos[tupnum].db_name = pg_strdup(PQgetvalue(res, tupnum, i_datname));
 
 		/*
@@ -475,9 +502,13 @@ get_db_infos(ClusterInfo *cluster)
  *
  * Note: the result is assumed to be sorted by OID.  This allows later
  * processing to match up old and new databases efficiently.
+ *
+ * For WAL upgrade, also collect physical relations outside the normal
+ * transfer list.  These rows have a NULL all_rels.reloid and are kept
+ * only in the RELINK inventory.
  */
 static char *
-get_rel_infos_query(void)
+get_rel_infos_query(ClusterInfo *cluster, bool collect_relink)
 {
 	PQExpBufferData query;
 
@@ -552,19 +583,34 @@ get_rel_infos_query(void)
 	appendPQExpBufferStr(&query,
 						 "SELECT all_rels.*, n.nspname, c.relname, "
 						 "  c.relfilenode, c.reltablespace, "
-						 "  pg_catalog.pg_tablespace_location(t.oid) AS spclocation "
-						 "FROM (SELECT * FROM regular_heap "
-						 "      UNION ALL "
-						 "      SELECT * FROM toast_heap "
-						 "      UNION ALL "
-						 "      SELECT * FROM all_index) all_rels "
-						 "  JOIN pg_catalog.pg_class c "
-						 "      ON all_rels.reloid = c.oid "
-						 "  JOIN pg_catalog.pg_namespace n "
-						 "     ON c.relnamespace = n.oid "
-						 "  LEFT OUTER JOIN pg_catalog.pg_tablespace t "
-						 "     ON c.reltablespace = t.oid "
-						 "ORDER BY 1");
+						 "  pg_catalog.pg_tablespace_location(t.oid) AS spclocation ");
+	if (collect_relink)
+		appendPQExpBufferStr(&query,
+							 ", pg_catalog.pg_relation_filenode(c.oid) AS filenumber, "
+							 "c.relpersistence, c.relisshared ");
+	appendPQExpBuffer(&query,
+					  "FROM (SELECT * FROM regular_heap "
+					  "      UNION ALL "
+					  "      SELECT * FROM toast_heap "
+					  "      UNION ALL "
+					  "      SELECT * FROM all_index) all_rels "
+					  "  %s JOIN pg_catalog.pg_class c "
+					  "      ON all_rels.reloid = c.oid "
+					  "  %s JOIN pg_catalog.pg_namespace n "
+					  "     ON c.relnamespace = n.oid "
+					  "  LEFT OUTER JOIN pg_catalog.pg_tablespace t "
+					  "     ON c.reltablespace = t.oid ",
+					  collect_relink ? "RIGHT" : "",
+					  collect_relink ? "LEFT OUTER" : "");
+	if (collect_relink)
+		appendPQExpBuffer(&query,
+						  "WHERE c.relkind IN ('r', 'i', 'S', 't', 'm') "
+						  "AND c.relpersistence <> 't' "
+						  "AND (NOT c.relisshared OR "
+						  "(SELECT oid FROM pg_catalog.pg_database "
+						  " WHERE datname = pg_catalog.current_database()) = %u::pg_catalog.oid) ",
+						  cluster->dbarr.dbs[0].db_oid);
+	appendPQExpBuffer(&query, "ORDER BY %s", collect_relink ? "c.oid" : "1");
 
 	return query.data;
 }
@@ -577,8 +623,10 @@ get_rel_infos_query(void)
 static void
 process_rel_infos(DbInfo *dbinfo, PGresult *res, void *arg)
 {
+	ClusterInfo *cluster = arg;
 	int			ntups = PQntuples(res);
-	RelInfo    *relinfos = pg_malloc_array(RelInfo, ntups);
+	RelInfo    *relinfos;
+	bool		collect_relink = cluster != NULL;
 	int			i_reloid = PQfnumber(res, "reloid");
 	int			i_indtable = PQfnumber(res, "indtable");
 	int			i_toastheap = PQfnumber(res, "toastheap");
@@ -587,6 +635,10 @@ process_rel_infos(DbInfo *dbinfo, PGresult *res, void *arg)
 	int			i_relfilenumber = PQfnumber(res, "relfilenode");
 	int			i_reltablespace = PQfnumber(res, "reltablespace");
 	int			i_spclocation = PQfnumber(res, "spclocation");
+	int			i_filenumber = PQfnumber(res, "filenumber");
+	int			i_relpersistence = PQfnumber(res, "relpersistence");
+	int			i_relisshared = PQfnumber(res, "relisshared");
+	int			nrels = ntups;
 	int			num_rels = 0;
 	char	   *nspname = NULL;
 	char	   *relname = NULL;
@@ -594,9 +646,55 @@ process_rel_infos(DbInfo *dbinfo, PGresult *res, void *arg)
 	char	   *last_namespace = NULL;
 	char	   *last_tablespace = NULL;
 
+	if (collect_relink)
+	{
+		int			nshared = 0;
+
+		nrels = 0;
+		for (int relnum = 0; relnum < ntups; relnum++)
+		{
+			if (!PQgetisnull(res, relnum, i_reloid))
+				nrels++;
+			if (PQgetvalue(res, relnum, i_relisshared)[0] == 't')
+				nshared++;
+		}
+		dbinfo->relink_arr.rels = pg_malloc0_array(PgUpgradeRelinkEntry,
+												   ntups - nshared);
+		if (nshared > 0)
+		{
+			Assert(cluster->shared_relink_arr.rels == NULL);
+			cluster->shared_relink_arr.rels =
+				pg_malloc0_array(PgUpgradeRelinkEntry, nshared);
+		}
+	}
+	relinfos = pg_malloc_array(RelInfo, nrels);
+
 	for (int relnum = 0; relnum < ntups; relnum++)
 	{
-		RelInfo    *curr = &relinfos[num_rels++];
+		RelInfo    *curr;
+		int			relink_index = -1;
+
+		if (collect_relink)
+		{
+			bool		shared = PQgetvalue(res, relnum, i_relisshared)[0] == 't';
+			RelinkInfoArr *inventory = shared ?
+				&cluster->shared_relink_arr : &dbinfo->relink_arr;
+			PgUpgradeRelinkEntry *entry = &inventory->rels[inventory->nrels++];
+
+			if (PQgetisnull(res, relnum, i_filenumber))
+				pg_fatal("NULL in catalog query column \"filenumber\"");
+			entry->filenumber = atooid(PQgetvalue(res, relnum, i_filenumber));
+			entry->tablespace_oid = atooid(PQgetvalue(res, relnum, i_reltablespace));
+			if (entry->tablespace_oid == InvalidOid)
+				entry->tablespace_oid = dbinfo->db_tablespace_oid;
+			entry->persistence = PQgetvalue(res, relnum, i_relpersistence)[0];
+			if (PQgetisnull(res, relnum, i_reloid))
+				continue;
+			Assert(!shared);
+			relink_index = inventory->nrels - 1;
+		}
+		curr = &relinfos[num_rels++];
+		curr->relink_index = relink_index;
 
 		curr->reloid = atooid(PQgetvalue(res, relnum, i_reloid));
 		curr->indtable = atooid(PQgetvalue(res, relnum, i_indtable));
@@ -664,6 +762,33 @@ process_rel_infos(DbInfo *dbinfo, PGresult *res, void *arg)
 
 	dbinfo->rel_arr.rels = relinfos;
 	dbinfo->rel_arr.nrels = num_rels;
+}
+
+/* template0 is not in dbarr because it normally disallows connections. */
+RelinkInfoArr
+get_template0_rel_infos(ClusterInfo *cluster)
+{
+	DbInfo		dbinfo = {0};
+	PGconn	   *admin = connectToServer(cluster, "template1");
+	PGconn	   *conn;
+	PGresult   *res;
+	char	   *query = get_rel_infos_query(cluster, true);
+
+	dbinfo.db_name = "template0";
+	dbinfo.db_tablespace_oid = cluster->template0->db_tablespace_oid;
+	PQclear(executeQueryOrDie(admin,
+							  "ALTER DATABASE template0 ALLOW_CONNECTIONS = true"));
+	conn = connectToServer(cluster, "template0");
+	res = executeQueryOrDie(conn, "%s", query);
+	process_rel_infos(&dbinfo, res, cluster);
+	PQclear(res);
+	pg_free(query);
+	PQfinish(conn);
+	PQclear(executeQueryOrDie(admin,
+							  "ALTER DATABASE template0 ALLOW_CONNECTIONS = false"));
+	PQfinish(admin);
+	free_rel_infos(&dbinfo.rel_arr);
+	return dbinfo.relink_arr;
 }
 
 /*
@@ -832,6 +957,101 @@ count_old_cluster_logical_slots(void)
 	return slot_count;
 }
 
+void
+get_old_cluster_physical_slot_infos(void)
+{
+	PGconn	   *conn;
+	PGresult   *res;
+	char	  **slotnames = NULL;
+	int			num_slots;
+	int			i_invalidation_reason;
+	int			i_restart_lsn;
+	int			i_slotname;
+	int			i_wal_status;
+	uint32		old_major_version =
+		GET_MAJOR_VERSION(old_cluster.major_version);
+
+	old_cluster.phys_slot_arr.slotnames = NULL;
+	old_cluster.phys_slot_arr.nslots = 0;
+
+	if (!user_opts.wal_upgrade)
+		return;
+	if (old_major_version < 904)
+		return;
+
+	conn = connectToServer(&old_cluster, "template1");
+
+	/*
+	 * Collect persistent physical slots that must be valid and streaming
+	 * before upgrade and recreated in the new cluster.
+	 */
+	res = executeQueryOrDie(conn,
+							"SELECT slot_name, restart_lsn::text AS restart_lsn, "
+							"       %s AS wal_status, %s AS invalidation_reason "
+							"FROM pg_catalog.pg_replication_slots "
+							"WHERE slot_type = 'physical' AND "
+							"%s AND "
+							"%s "
+							"ORDER BY slot_name",
+							old_major_version >= 1300 ?
+							"wal_status" : "NULL::text",
+							old_major_version >= 1700 ?
+							"invalidation_reason" : "NULL::text",
+							old_major_version >= 1000 ?
+							"temporary IS FALSE" : "true",
+							old_major_version >= 1900 ?
+							"slot_name <> 'pg_conflict_detection'" : "true");
+
+	num_slots = PQntuples(res);
+	i_slotname = PQfnumber(res, "slot_name");
+	i_restart_lsn = PQfnumber(res, "restart_lsn");
+	i_wal_status = PQfnumber(res, "wal_status");
+	i_invalidation_reason = PQfnumber(res, "invalidation_reason");
+
+	if (num_slots)
+	{
+		slotnames = pg_malloc_array(char *, num_slots);
+
+		for (int slotnum = 0; slotnum < num_slots; slotnum++)
+			slotnames[slotnum] =
+				pg_strdup(PQgetvalue(res, slotnum, i_slotname));
+	}
+
+	old_cluster.phys_slot_arr.slotnames = slotnames;
+	old_cluster.phys_slot_arr.nslots = num_slots;
+	if (num_slots > 0 && old_major_version < 1400)
+		pg_fatal("--wal-upgrade cannot migrate physical replication slots from "
+				 "an old cluster before PostgreSQL 14; drop the slots or "
+				 "upgrade the old cluster first");
+
+	for (int slotnum = 0; slotnum < num_slots; slotnum++)
+	{
+		const char *slotname = slotnames[slotnum];
+
+		if (strcmp(slotname, "pg_conflict_detection") == 0)
+			pg_fatal("physical replication slot \"%s\" uses a name reserved by the "
+					 "new cluster; drop or rename the slot before upgrading",
+					 slotname);
+		if (PQgetisnull(res, slotnum, i_restart_lsn))
+			pg_fatal("physical replication slot \"%s\" has no restart LSN; "
+					 "initialize its standby or drop the stale slot before upgrading",
+					 slotname);
+		if (!PQgetisnull(res, slotnum, i_invalidation_reason))
+			pg_fatal("physical replication slot \"%s\" is invalidated (%s); "
+					 "recreate its standby and slot or drop the stale slot before upgrading",
+					 slotname,
+					 PQgetvalue(res, slotnum, i_invalidation_reason));
+		if (!PQgetisnull(res, slotnum, i_wal_status) &&
+			strcmp(PQgetvalue(res, slotnum, i_wal_status), "lost") == 0)
+			pg_fatal("physical replication slot \"%s\" has lost required WAL; "
+					 "recreate its standby and slot or drop the stale slot before upgrading",
+					 slotname);
+	}
+
+	PQclear(res);
+	PQfinish(conn);
+}
+
 /*
  * get_subscription_info()
  *
@@ -873,6 +1093,7 @@ free_db_and_rel_infos(DbInfoArr *db_arr)
 	for (dbnum = 0; dbnum < db_arr->ndbs; dbnum++)
 	{
 		free_rel_infos(&db_arr->dbs[dbnum].rel_arr);
+		pg_free(db_arr->dbs[dbnum].relink_arr.rels);
 		pg_free(db_arr->dbs[dbnum].db_name);
 	}
 	pg_free(db_arr->dbs);
