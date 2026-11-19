@@ -1,7 +1,8 @@
 # Copyright (c) 2025-2026, PostgreSQL Global Development Group
 
-# Exercise copy and link upgrades with one streaming standby. Check
-# reconstruction, restart, and partial-replay rejection.
+# Exercise copy and link upgrades with one streaming standby, then exercise a
+# copy upgrade with a two-level cascade. Check reconstruction, restart, and
+# partial-replay rejection.
 
 use strict;
 use warnings FATAL => 'all';
@@ -440,5 +441,6 @@ $new->stop;
 	$link_new->stop;
 }
 
+require WalUpgradeCascade;
 
 done_testing();

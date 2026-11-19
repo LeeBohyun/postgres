@@ -517,6 +517,12 @@ pg_upgrade --initdb --initdb-options='-c huge_pages=off --waldir=/wal/new' ...
         checkpoint and pauses recovery so its old-version data can be retained.
        </para>
        <para>
+        Cascaded standbys propagate the durable-receipt requirement through
+        their own persistent physical slots before acknowledging HANDOFF
+        upstream. A leaf may still have replay paused after it has durably
+        received the final checkpoint.
+       </para>
+       <para>
         While migrated physical slots are inactive, configure
         <varname>max_slot_wal_keep_size</varname> to <literal>-1</literal> and
         <varname>idle_replication_slot_timeout</varname> to <literal>0</literal>

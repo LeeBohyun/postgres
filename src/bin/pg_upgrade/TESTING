@@ -81,3 +81,6 @@ tests require source binaries with HANDOFF support. The emission, streaming,
 and archive tests have the same source requirement once automatic HANDOFF is
 enabled. Set oldinstall for cross-version runs with a suitably patched old
 installation. The validation test always uses the new installation as source.
+
+The standby test also loads WalUpgradeCascade.pm to exercise a primary,
+relay, and leaf, including durable receipt while leaf replay is paused.
