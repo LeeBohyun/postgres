@@ -11,6 +11,7 @@
 
 #include "common/connect.h"
 #include "fe_utils/string_utils.h"
+#include "lib/stringinfo.h"
 #include "libpq/pqcomm.h"
 #include "pg_upgrade.h"
 
@@ -123,30 +124,41 @@ cluster_conn_opts(ClusterInfo *cluster)
 PGresult *
 executeQueryOrDie(PGconn *conn, const char *fmt, ...)
 {
-	static char query[QUERY_ALLOC];
-	va_list		args;
+	int			save_errno = errno;
+	StringInfoData query;
 	PGresult   *result;
 	ExecStatusType status;
 
-	va_start(args, fmt);
-	vsnprintf(query, sizeof(query), fmt, args);
-	va_end(args);
+	initStringInfo(&query);
+	for (;;)
+	{
+		va_list		args;
+		int			needed;
 
-	pg_log(PG_VERBOSE, "executing: %s", query);
-	result = PQexec(conn, query);
+		errno = save_errno;
+		va_start(args, fmt);
+		needed = appendStringInfoVA(&query, fmt, args);
+		va_end(args);
+		if (needed == 0)
+			break;
+		enlargeStringInfo(&query, needed);
+	}
+
+	pg_log(PG_VERBOSE, "executing: %s", query.data);
+	result = PQexec(conn, query.data);
 	status = PQresultStatus(result);
 
 	if ((status != PGRES_TUPLES_OK) && (status != PGRES_COMMAND_OK))
 	{
-		pg_log(PG_REPORT, "SQL command failed\n%s\n%s", query,
+		pg_log(PG_REPORT, "SQL command failed\n%s\n%s", query.data,
 			   PQerrorMessage(conn));
 		PQclear(result);
 		PQfinish(conn);
 		printf(_("Failure, exiting\n"));
 		exit(1);
 	}
-	else
-		return result;
+	pg_free(query.data);
+	return result;
 }
 
 
@@ -165,6 +177,7 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	bool		pg_ctl_return = false;
 	char		socket_string[MAXPGPATH + 200];
 	PQExpBufferData pgoptions;
+	PQExpBufferData quoted_options;
 
 	static bool exit_hook_registered = false;
 
@@ -191,6 +204,8 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 #endif
 
 	initPQExpBuffer(&pgoptions);
+	initPQExpBuffer(&quoted_options);
+	appendPQExpBuffer(&pgoptions, "-p %d -b", cluster->port);
 
 	/*
 	 * Construct a parameter string which is passed to the server process.
@@ -207,15 +222,17 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	 * Use -b to disable autovacuum and logical replication launcher
 	 * (effective in PG17 or later for the latter).
 	 */
+	appendPQExpBuffer(&pgoptions, " %s%s",
+					  cluster->pgopts ? cluster->pgopts : "", socket_string);
+	appendShellString(&quoted_options, pgoptions.data);
 	snprintf(cmd, sizeof(cmd),
-			 "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o \"-p %d -b%s %s%s\" start",
+			 "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o %s start",
 			 cluster->bindir,
 			 log_opts.logdir,
-			 SERVER_LOG_FILE, cluster->pgconfig, cluster->port,
-			 pgoptions.data,
-			 cluster->pgopts ? cluster->pgopts : "", socket_string);
+			 SERVER_LOG_FILE, cluster->pgconfig, quoted_options.data);
 
 	termPQExpBuffer(&pgoptions);
+	termPQExpBuffer(&quoted_options);
 
 	/*
 	 * Don't throw an error right away, let connecting throw the error because
@@ -293,6 +310,8 @@ void
 stop_postmaster(bool in_atexit)
 {
 	ClusterInfo *cluster;
+	PQExpBufferData options;
+	bool		stopped;
 
 	if (os_info.running_cluster == &old_cluster)
 		cluster = &old_cluster;
@@ -301,11 +320,20 @@ stop_postmaster(bool in_atexit)
 	else
 		return;					/* no cluster running */
 
-	exec_prog(SERVER_STOP_LOG_FILE, NULL, !in_atexit, !in_atexit,
-			  "\"%s/pg_ctl\" -w -D \"%s\" -o \"%s\" %s stop",
-			  cluster->bindir, cluster->pgconfig,
-			  cluster->pgopts ? cluster->pgopts : "",
-			  in_atexit ? "-m fast" : "-m smart");
+	initPQExpBuffer(&options);
+	appendShellString(&options, cluster->pgopts ? cluster->pgopts : "");
+	stopped = exec_prog(SERVER_STOP_LOG_FILE, NULL, !in_atexit, !in_atexit,
+						"\"%s/pg_ctl\" -w -D \"%s\" -o %s %s stop",
+						cluster->bindir, cluster->pgconfig,
+						options.data, in_atexit ? "-m fast" : "-m smart");
+	termPQExpBuffer(&options);
+
+	/*
+	 * Clear the running-cluster marker only after confirmed shutdown.
+	 * Otherwise, --initdb cleanup could delete data still in use.
+	 */
+	if (!stopped)
+		return;
 
 	os_info.running_cluster = NULL;
 }

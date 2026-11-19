@@ -32,7 +32,7 @@
 
 /*
  * Base directories that include all the files generated internally, from the
- * root path of the new cluster.  The paths are dynamically built as of
+ * selected output root.  The paths are dynamically built as of
  * BASE_OUTPUTDIR/$timestamp/{LOG_OUTPUTDIR,DUMP_OUTPUTDIR} to ensure their
  * uniqueness in each run.
  */
@@ -195,6 +195,7 @@ typedef struct
 	char	   *db_ctype;
 	char		db_collprovider;
 	char	   *db_locale;
+	char	   *db_icu_rules;
 	int			db_encoding;
 } DbLocaleInfo;
 
@@ -314,7 +315,8 @@ typedef struct
  */
 typedef struct
 {
-	bool		check;			/* check clusters only, don't change any data */
+	bool		check;			/* check clusters without performing the
+								 * upgrade */
 	bool		live_check;		/* check clusters only, old server is running */
 	bool		do_sync;		/* flush changes to disk */
 	transferMode transfer_mode; /* copy files or link them? */
@@ -325,6 +327,11 @@ typedef struct
 	int			char_signedness;	/* default char signedness: -1 for initial
 									 * value, 1 for "signed" and 0 for
 									 * "unsigned" */
+	bool		initdb_new_cluster; /* run initdb before compatibility checks */
+	bool		initdb_options_given;	/* --initdb-options given, even if
+										 * empty */
+	char	  **initdb_options; /* additional arguments to initdb */
+	int			num_initdb_options;
 } UserOpts;
 
 typedef struct
@@ -425,6 +432,7 @@ FileNameMap *gen_db_file_maps(DbInfo *old_db,
 							  DbInfo *new_db, int *nmaps, const char *old_pgdata,
 							  const char *new_pgdata);
 void		get_db_rel_and_slot_infos(ClusterInfo *cluster);
+void		get_template0_info(ClusterInfo *cluster);
 int			count_old_cluster_logical_slots(void);
 void		get_subscription_info(ClusterInfo *cluster);
 
@@ -433,6 +441,11 @@ void		get_subscription_info(ClusterInfo *cluster);
 void		parseCommandLine(int argc, char *argv[]);
 void		adjust_data_dir(ClusterInfo *cluster);
 void		get_sock_dir(ClusterInfo *cluster);
+
+/* pg_upgrade.c */
+
+void		cleanup_initdb_cluster(void);
+void		sync_new_cluster(bool sync_data_files);
 
 /* relfilenumber.c */
 
