@@ -1,0 +1,228 @@
+# Copyright (c) 2026, PostgreSQL Global Development Group
+
+# Verify that a wrapper can read source initialization settings, initialize and
+# configure the target separately, and complete an ordinary upgrade.
+# Set oldinstall to exercise a source from an older PostgreSQL installation.
+
+use strict;
+use warnings FATAL => 'all';
+
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+use Text::ParseWords qw(shellwords);
+
+my $oldnode =
+  PostgreSQL::Test::Cluster->new('old_node',
+	install_path => $ENV{oldinstall});
+my @old_initdb_options = ('--wal-segsize=2', '--encoding=UTF8', '--locale=C');
+push @old_initdb_options, '--no-data-checksums' if $oldnode->pg_version >= 18;
+$oldnode->init(extra => \@old_initdb_options);
+$oldnode->start;
+$oldnode->safe_psql('postgres',
+	'CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t VALUES (1), (2), (3)'
+);
+
+my $newnode = PostgreSQL::Test::Cluster->new('new_node');
+my $oldbindir = $oldnode->config_data('--bindir');
+
+sub print_command
+{
+	my ($node, @extra) = @_;
+	return [
+		'pg_upgrade', '--print-initdb-options',
+		'--old-datadir' => $node->data_dir,
+		'--old-bindir' => $oldbindir,
+		'--old-port' => $node->port,
+		'--socketdir' => $node->host,
+		@extra,
+	];
+}
+
+chdir ${PostgreSQL::Test::Utils::tmp_check};
+
+my $start_time =
+  $oldnode->safe_psql('postgres', 'SELECT pg_postmaster_start_time()');
+my ($live_options, $stderr);
+ok( run_log(
+		print_command(
+			$oldnode, '--verbose', '--new-datadir' => $newnode->data_dir),
+		'>' => \$live_options,
+		'2>' => \$stderr),
+	'print initialization options from a running source');
+like(
+	$stderr,
+	qr/Running in verbose mode/,
+	'verbose diagnostics are written to stderr');
+like($live_options, qr/\A[^\r\n]+\r?\n\z/,
+	'stdout contains exactly one line of options');
+ok(!-d $newnode->data_dir, 'printing does not create the target directory');
+is($oldnode->safe_psql('postgres', 'SELECT pg_postmaster_start_time()'),
+	$start_time, 'printing does not restart the running source');
+
+my @options = shellwords($live_options);
+is_deeply(
+	[ sort @options ],
+	[
+		sort qw(--wal-segsize=2 --no-data-checksums --encoding=UTF8
+		  --locale-provider=libc --lc-collate=C --lc-ctype=C)
+	],
+	'output contains source settings without target paths or execution flags'
+);
+
+# Inject template0 metadata to test quoting without requiring such a locale.
+# Other databases keep usable locale settings for the test connections.
+SKIP:
+{
+	skip 'POSIX shell quoting test', 2 if $windows_os;
+	my $locale = q{C's locale $libdir; $(echo ignored)};
+	$oldnode->safe_psql('postgres',
+			q{UPDATE pg_database SET datcollate = $locale$}
+		  . $locale
+		  . q{$locale$ WHERE datname = 'template0'});
+	my ($quoted_options, $quoted_stderr);
+	ok( run_log(
+			print_command($oldnode),
+			'>' => \$quoted_options,
+			'2>' => \$quoted_stderr),
+		'print locale text containing shell metacharacters');
+	is_deeply(
+		[ grep { /^--lc-collate=/ } shellwords($quoted_options) ],
+		["--lc-collate=$locale"],
+		'quoting preserves spaces, quotes, and literal shell metacharacters');
+	$oldnode->safe_psql('postgres',
+		"UPDATE pg_database SET datcollate = 'C' WHERE datname = 'template0'"
+	);
+}
+
+$oldnode->stop;
+my ($stopped_options, $stopped_stderr);
+{
+	local $ENV{PGDATANEW};
+	delete $ENV{PGDATANEW};
+	ok( run_log(
+			print_command($oldnode),
+			'>' => \$stopped_options,
+			'2>' => \$stopped_stderr),
+		'print initialization options without a new data directory');
+}
+is($stopped_options, $live_options,
+	'running and stopped sources produce the same options');
+ok( !-f $oldnode->data_dir . '/postmaster.pid',
+	'printing leaves an initially stopped source stopped');
+ok(!-d 'pg_upgrade_output.d', 'successful printing removes diagnostic logs');
+
+# Discovering source settings does not require the target installation.
+command_checks_all(
+	print_command($oldnode, '--new-bindir' => $newnode->basedir),
+	0, [qr/\A\Q$live_options\E\z/],
+	[], 'printing does not require target binaries');
+
+# A supplied target path must not be examined, even when it is not a directory.
+my $unused_target = $newnode->basedir . '/unused-target';
+append_to_file($unused_target, "unchanged\n");
+my ($ignored_target_options, $ignored_target_stderr);
+ok( run_log(
+		print_command($oldnode, '--new-datadir' => $unused_target),
+		'>' => \$ignored_target_options,
+		'2>' => \$ignored_target_stderr),
+	'printing ignores a supplied target path');
+is($ignored_target_options, $live_options,
+	'target path does not affect source-derived options');
+is(slurp_file($unused_target), "unchanged\n", 'supplied target is unchanged');
+
+# Consume the printed options as a wrapper would, retaining control over
+# authentication, paths, and configuration before the upgrade.
+$newnode->init(extra => \@options);
+$newnode->append_conf('postgresql.conf',
+	'custom.before_upgrade = configured');
+command_ok(
+	[
+		'pg_upgrade', '--no-sync',
+		'--old-datadir' => $oldnode->data_dir,
+		'--new-datadir' => $newnode->data_dir,
+		'--old-bindir' => $oldbindir,
+		'--old-port' => $oldnode->port,
+		'--new-port' => $newnode->port,
+		'--socketdir' => $newnode->host,
+	],
+	'ordinary upgrade accepts a target initialized with the printed options');
+$newnode->start;
+is( $newnode->safe_psql(
+		'postgres', 'SELECT array_agg(id ORDER BY id) FROM t'),
+	'{1,2,3}',
+	'ordinary upgrade preserves the source rows');
+is($newnode->safe_psql('postgres', 'SHOW custom.before_upgrade'),
+	'configured', 'configuration added before upgrade is preserved');
+$newnode->stop;
+
+# Failed source discovery must not produce an argument list or stop a source
+# that was already running.
+$oldnode->start;
+command_checks_all(
+	print_command($oldnode, '--username' => 'missing_print_options_role'),
+	1,
+	[qr/\A\z/],
+	[qr/role .*missing_print_options_role.* does not exist/],
+	'source connection failure leaves stdout empty');
+is($oldnode->safe_psql('postgres', 'SELECT count(*) FROM t'),
+	'3', 'source remains available after failed discovery');
+$oldnode->safe_psql('postgres', 'CREATE ROLE print_options_reader LOGIN');
+$oldnode->safe_psql('template1', 'REVOKE SELECT ON pg_database FROM PUBLIC');
+command_checks_all(
+	print_command($oldnode, '--username' => 'print_options_reader'),
+	1,
+	[qr/\A\z/],
+	[qr/permission denied for table pg_database/],
+	'source query failure leaves stdout empty');
+$oldnode->safe_psql('template1', 'GRANT SELECT ON pg_database TO PUBLIC');
+$oldnode->safe_psql('postgres', 'DROP ROLE print_options_reader');
+$oldnode->stop;
+
+for my $option ('--initdb', '--check', '--initdb-options=')
+{
+	command_checks_all(
+		[ 'pg_upgrade', '--print-initdb-options', $option ],
+		1,
+		[qr/\A\z/],
+		[
+			qr/options --print-initdb-options and .* cannot be used together|--initdb-options requires --initdb/
+		],
+		"printing rejects $option");
+}
+
+# Check that builtin and, when available, ICU options can initialize a separate
+# target with enabled checksums and the source WAL segment size.
+my @providers = ();
+push @providers, [ 'builtin', '--builtin-locale=C.UTF-8' ]
+  if $oldnode->pg_version >= 17;
+push @providers, [ 'icu', '--icu-locale=en-US' ]
+  if $oldnode->pg_version >= 15 && $ENV{with_icu} eq 'yes';
+for my $provider (@providers)
+{
+	my ($name, $locale) = @$provider;
+	my $source =
+	  PostgreSQL::Test::Cluster->new("${name}_source",
+		install_path => $ENV{oldinstall});
+	$source->init(
+		extra => [
+			'--data-checksums', '--wal-segsize=1',
+			'--encoding=UTF8', '--locale=C',
+			"--locale-provider=$name", $locale,
+		]);
+	my ($output, $errors);
+	ok(run_log(print_command($source), '>' => \$output, '2>' => \$errors),
+		"print $name initialization options");
+	my @args = shellwords($output);
+	ok( grep({ $_ eq '--data-checksums' } @args),
+		'output explicitly enables source checksums');
+	ok(grep({ $_ eq $locale } @args), "output preserves the $name locale");
+	my $target = PostgreSQL::Test::Cluster->new("${name}_target");
+	$target->init(extra => \@args);
+	$target->start;
+	is($target->safe_psql('postgres', 'SHOW wal_segment_size'),
+		'1MB', "$name initialization preserves WAL segment size");
+	$target->stop;
+}
+
+done_testing();

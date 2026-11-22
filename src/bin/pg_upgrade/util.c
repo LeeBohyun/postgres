@@ -50,7 +50,7 @@ end_progress_output(void)
 	 */
 	if (log_opts.isatty)
 	{
-		printf("\r");
+		fputc('\r', user_opts.print_initdb_options ? stderr : stdout);
 		pg_log(PG_REPORT_NONL, "%-*s", MESSAGE_WIDTH, "");
 	}
 	else if (log_opts.verbose)
@@ -174,10 +174,15 @@ prep_status_progress(const char *fmt, ...)
 		pg_log(PG_REPORT_NONL, "%-*s", MESSAGE_WIDTH, message);
 }
 
+/*
+ * Reserve stdout for the argument list consumed by wrappers in
+ * --print-initdb-options mode, and send diagnostics to stderr.
+ */
 static void
 pg_log_v(eLogType type, const char *fmt, va_list ap)
 {
 	int			save_errno = errno;
+	FILE	   *output = user_opts.print_initdb_options ? stderr : stdout;
 	StringInfoData buf;
 	char	   *message;
 
@@ -221,7 +226,7 @@ pg_log_v(eLogType type, const char *fmt, va_list ap)
 	{
 		case PG_VERBOSE:
 			if (log_opts.verbose)
-				printf("%s\n", message);
+				fprintf(output, "%s\n", message);
 			break;
 
 		case PG_STATUS:
@@ -241,37 +246,37 @@ pg_log_v(eLogType type, const char *fmt, va_list ap)
 				bool		itfits = (strlen(message) <= MESSAGE_WIDTH - 2);
 
 				/* prefix with "..." if we do leading truncation */
-				printf("  %s%-*.*s\r",
-					   itfits ? "" : "...",
-					   MESSAGE_WIDTH - 2, MESSAGE_WIDTH - 2,
-					   itfits ? message :
-					   message + strlen(message) - MESSAGE_WIDTH + 3 + 2);
+				fprintf(output, "  %s%-*.*s\r",
+						itfits ? "" : "...",
+						MESSAGE_WIDTH - 2, MESSAGE_WIDTH - 2,
+						itfits ? message :
+						message + strlen(message) - MESSAGE_WIDTH + 3 + 2);
 			}
 			else if (log_opts.verbose)
-				printf("  %s\n", message);
+				fprintf(output, "  %s\n", message);
 			break;
 
 		case PG_REPORT_NONL:
 			/* This option is for use by prep_status and friends */
-			printf("%s", message);
+			fprintf(output, "%s", message);
 			break;
 
 		case PG_REPORT:
 		case PG_WARNING:
-			printf("%s\n", message);
+			fprintf(output, "%s\n", message);
 			break;
 
 		case PG_FATAL:
 			/* Extra newline in case we're interrupting status output */
-			printf("\n%s\n", message);
-			printf(_("Failure, exiting\n"));
+			fprintf(output, "\n%s\n", message);
+			fprintf(output, _("Failure, exiting\n"));
 			exit(1);
 			break;
 
 			/* No default:, we want a warning for omitted cases */
 	}
 	pg_free(message);
-	fflush(stdout);
+	fflush(output);
 }
 
 

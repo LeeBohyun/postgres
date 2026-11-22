@@ -51,7 +51,6 @@
 #include "common/restricted_token.h"
 #include "common/string.h"
 #include "fe_utils/string_utils.h"
-#include "fe_utils/version.h"
 #include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
 
@@ -77,7 +76,9 @@ static void create_initdb_parents(char *path);
 static void finalize_initdb(void);
 static void set_initdb_directory_permissions(const char *path);
 static void set_output_permissions(void);
+static void print_initdb_options(void);
 static void get_old_cluster_initdb_info(void);
+static void append_source_initdb_options(PQExpBuffer cmd);
 static void build_new_cluster_initdb_cmd(PQExpBuffer cmd);
 static void create_new_cluster_via_initdb(void);
 static void create_logical_replication_slots(void);
@@ -147,12 +148,18 @@ main(int argc, char **argv)
 	check_pghost_envvar();
 
 	/*
-	 * Resolve old and new binary dirs before adjust_data_dir(), because
-	 * adjust_data_dir() might need to call the binaries.
+	 * Validate binary directories before adjust_data_dir(), which may invoke
+	 * postgres to locate data stored outside the configuration directory.
 	 */
 	check_bin_dirs(argv[0]);
 
 	adjust_data_dir(&old_cluster);
+
+	if (user_opts.print_initdb_options)
+	{
+		print_initdb_options();
+		return 0;
+	}
 
 	if (user_opts.initdb_new_cluster)
 	{
@@ -438,12 +445,16 @@ make_outputdirs(const char *output_root)
 
 
 /*
- * Resolve the new binary directory from pg_upgrade's path when -B or
- * PGBINNEW was not specified, then validate both clusters' binaries.
+ * Validate the old binaries, then resolve and validate the new binary
+ * directory unless we are only printing source initialization options.
  */
 static void
 check_bin_dirs(const char *argv0)
 {
+	check_bin_dir(&old_cluster, false);
+	if (user_opts.print_initdb_options)
+		return;
+
 	if (!new_cluster.bindir)
 	{
 		char		exec_path[MAXPGPATH];
@@ -456,7 +467,6 @@ check_bin_dirs(const char *argv0)
 		new_cluster.bindir = pg_strdup(exec_path);
 	}
 
-	check_bin_dir(&old_cluster, false);
 	check_bin_dir(&new_cluster, true);
 }
 
@@ -702,26 +712,53 @@ fail:
 
 
 /*
- * Read the old cluster's control data and template0 settings for initdb.
+ * Print source-derived initdb arguments without preparing a target cluster.
+ * Put diagnostic logs in the current directory because no target PGDATA is
+ * required. Delay writing stdout until source inspection is complete, so
+ * discovery failures do not leave a partial argument list.
+ */
+static void
+print_initdb_options(void)
+{
+	PQExpBufferData options;
+
+	check_current_dir_write_permissions();
+	make_outputdirs(".");
+	get_old_cluster_initdb_info();
+
+	initPQExpBuffer(&options);
+	append_source_initdb_options(&options);
+
+	cleanup_output_dirs();
+
+	if (printf("%s\n", options.data) < 0 || fflush(stdout) != 0)
+		pg_fatal("could not write initdb options: %m");
+	termPQExpBuffer(&options);
+}
+
+
+/*
+ * Collect the source control data and template0 settings used by initdb.
+ * A running source is allowed only for --check or --print-initdb-options.
+ * Leave that source running. Stop any server started here before returning.
  */
 static void
 get_old_cluster_initdb_info(void)
 {
-	old_cluster.major_version = get_pg_version(old_cluster.pgdata,
-											   &old_cluster.major_version_str);
+	check_data_dir(&old_cluster);
 
 	if (!old_cluster.sockdir)
 		old_cluster.sockdir = user_opts.socketdir ? user_opts.socketdir : ".";
 
 	/*
-	 * Allow a running old server for --check, as check_clusters_stopped()
-	 * does.
+	 * A postmaster.pid may be stale. As in check_clusters_stopped(), try a
+	 * start/stop cycle before treating it as an already running source.
 	 */
 	if (pid_lock_file_exists(old_cluster.pgdata))
 	{
 		if (start_postmaster(&old_cluster, false))
 			stop_postmaster(false);
-		else if (!user_opts.check)
+		else if (!user_opts.check && !user_opts.print_initdb_options)
 			pg_fatal("There seems to be a postmaster servicing the old cluster.\n"
 					 "Please shutdown that postmaster and try again.");
 		else
@@ -742,38 +779,17 @@ get_old_cluster_initdb_info(void)
 
 
 /*
- * Build the initdb command using the old cluster's settings and any
- * arguments supplied with --initdb-options.
+ * Append the source control data and template0 settings as shell-quoted
+ * initdb arguments shared by --initdb and --print-initdb-options.
+ * Exclude executable and target paths, the bootstrap user, and extra options.
  */
 static void
-build_new_cluster_initdb_cmd(PQExpBuffer cmd)
+append_source_initdb_options(PQExpBuffer cmd)
 {
 	DbLocaleInfo *locale = old_cluster.template0;
 	const char *encoding_name = pg_encoding_to_char(locale->db_encoding);
-	char		initdb_path[MAXPGPATH];
 
-	snprintf(initdb_path, sizeof(initdb_path), "%s/initdb", new_cluster.bindir);
-
-	prep_status("Constructing new cluster initdb command");
-
-	initPQExpBuffer(cmd);
-
-	/*
-	 * Build the command with appendShellString() for every value that comes
-	 * from outside our control: the username is from the command line, and
-	 * the encoding and locale strings are read from the old cluster's
-	 * template0. This prevents shell metacharacters in any of them from
-	 * breaking out of their argument when the command is run through the
-	 * shell.
-	 */
-	appendShellString(cmd, initdb_path);
-	appendPQExpBufferStr(cmd, " --for-pg-upgrade=");
-	appendShellString(cmd, initdb_state_file);
-	appendPQExpBufferStr(cmd, " -N -D ");
-	appendShellString(cmd, new_cluster.pgdata);
-	appendPQExpBufferStr(cmd, " -U ");
-	appendShellString(cmd, os_info.user);
-	appendPQExpBuffer(cmd, " --wal-segsize=%u",
+	appendPQExpBuffer(cmd, "--wal-segsize=%u",
 					  old_cluster.controldata.walseg / (1024 * 1024));
 
 	/*
@@ -809,6 +825,32 @@ build_new_cluster_initdb_cmd(PQExpBuffer cmd)
 			appendShellString(cmd, locale->db_locale);
 		}
 	}
+}
+
+
+/*
+ * Build the initdb command using the old cluster's settings and any
+ * arguments supplied with --initdb-options.
+ */
+static void
+build_new_cluster_initdb_cmd(PQExpBuffer cmd)
+{
+	char		initdb_path[MAXPGPATH];
+
+	snprintf(initdb_path, sizeof(initdb_path), "%s/initdb", new_cluster.bindir);
+
+	prep_status("Constructing new cluster initdb command");
+
+	initPQExpBuffer(cmd);
+	appendShellString(cmd, initdb_path);
+	appendPQExpBufferStr(cmd, " --for-pg-upgrade=");
+	appendShellString(cmd, initdb_state_file);
+	appendPQExpBufferStr(cmd, " -N -D ");
+	appendShellString(cmd, new_cluster.pgdata);
+	appendPQExpBufferStr(cmd, " -U ");
+	appendShellString(cmd, os_info.user);
+	appendPQExpBufferChar(cmd, ' ');
+	append_source_initdb_options(cmd);
 
 	for (int i = 0; i < user_opts.num_initdb_options; i++)
 	{

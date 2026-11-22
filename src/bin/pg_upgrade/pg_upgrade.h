@@ -306,7 +306,7 @@ typedef struct
 	char	   *basedir;		/* Base output directory, with timestamp */
 	char	   *dumpdir;		/* Dumps */
 	char	   *logdir;			/* Log files */
-	bool		isatty;			/* is stdout a tty */
+	bool		isatty;			/* is progress output to a tty */
 } LogOpts;
 
 
@@ -317,7 +317,7 @@ typedef struct
 {
 	bool		check;			/* check clusters without performing the
 								 * upgrade */
-	bool		live_check;		/* check clusters only, old server is running */
+	bool		live_check;		/* inspect the already running old server */
 	bool		do_sync;		/* flush changes to disk */
 	transferMode transfer_mode; /* copy files or link them? */
 	int			jobs;			/* number of processes/threads to use */
@@ -328,6 +328,7 @@ typedef struct
 									 * value, 1 for "signed" and 0 for
 									 * "unsigned" */
 	bool		initdb_new_cluster; /* run initdb before compatibility checks */
+	bool		print_initdb_options;	/* print source-derived initdb options */
 	bool		initdb_options_given;	/* --initdb-options given, even if
 										 * empty */
 	char	  **initdb_options; /* additional arguments to initdb */

@@ -264,6 +264,31 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--print-initdb-options</option></term>
+      <listitem>
+       <para>
+        Print the <command>initdb</command> options derived from the old cluster and exit without initializing a new cluster or performing an upgrade.
+        The output contains the old cluster's WAL segment size and data-checksum setting, and the encoding and locale settings used by <option>--initdb</option>.
+        It does not include a data directory, superuser name, authentication settings, or internal execution options.
+        A wrapper can use these options when initializing the new cluster, configure that cluster, and then invoke <application>pg_upgrade</application> normally.
+       </para>
+       <para>
+        Standard output contains one line of arguments quoted for the platform's command shell.
+        Callers constructing an argument list must interpret that quoting rather than split the output on whitespace.
+        Progress messages and diagnostics from inspecting the old cluster are written to standard error.
+        This mode requires the old cluster's binary and data directories, but does not require or use the new cluster's binary or data directories.
+        It cannot be combined with <option>--initdb</option>, <option>--initdb-options</option>, or <option>--check</option>.
+       </para>
+       <para>
+        The old server is started temporarily if it is stopped, and is left running if it is already running.
+        The current directory must be writable for diagnostic logs, which are placed in <filename>pg_upgrade_output.d</filename>.
+        These logs are removed on success unless <option>--retain</option> is specified.
+        Printing initialization options does not perform the upgrade compatibility checks.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--initdb</option></term>
       <listitem>
        <para>
@@ -584,6 +609,9 @@ make prefix=/usr/local/pgsql.new install
      <application>pg_upgrade</application> to have it run
      <command>initdb</command> automatically, deriving the required settings
      from the old cluster.  In that case this manual step can be skipped.
+    </para>
+    <para>
+     To obtain the initialization options while retaining control over cluster creation and configuration, use <option>--print-initdb-options</option> and run <command>initdb</command> separately.
     </para>
    </step>
 

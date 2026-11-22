@@ -68,6 +68,7 @@ parseCommandLine(int argc, char *argv[])
 		{"swap", no_argument, NULL, 7},
 		{"initdb", no_argument, NULL, 8},
 		{"initdb-options", required_argument, NULL, 9},
+		{"print-initdb-options", no_argument, NULL, 10},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -248,6 +249,10 @@ parseCommandLine(int argc, char *argv[])
 				parse_initdb_options(optarg);
 				break;
 
+			case 10:
+				user_opts.print_initdb_options = true;
+				break;
+
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 						os_info.progname);
@@ -258,6 +263,11 @@ parseCommandLine(int argc, char *argv[])
 	if (optind < argc)
 		pg_fatal("too many command-line arguments (first is \"%s\")", argv[optind]);
 
+	if (user_opts.print_initdb_options && user_opts.initdb_new_cluster)
+		pg_fatal("options --print-initdb-options and --initdb cannot be used together");
+	if (user_opts.print_initdb_options && user_opts.check)
+		pg_fatal("options --print-initdb-options and --check cannot be used together");
+
 	if (user_opts.initdb_options_given && !user_opts.initdb_new_cluster)
 		pg_fatal("--initdb-options requires --initdb");
 
@@ -267,7 +277,7 @@ parseCommandLine(int argc, char *argv[])
 	if (log_opts.verbose)
 		pg_log(PG_REPORT, "Running in verbose mode");
 
-	log_opts.isatty = isatty(fileno(stdout));
+	log_opts.isatty = isatty(fileno(user_opts.print_initdb_options ? stderr : stdout));
 
 	/* Turn off read-only mode;  add prefix to PGOPTIONS? */
 	if (getenv("PGOPTIONS"))
@@ -289,7 +299,8 @@ parseCommandLine(int argc, char *argv[])
 	check_required_directory(&old_cluster.pgdata, "PGDATAOLD", false,
 							 "-d", _("old cluster data resides"), false);
 	check_required_directory(&new_cluster.pgdata, "PGDATANEW", false,
-							 "-D", _("new cluster data resides"), false);
+							 "-D", _("new cluster data resides"),
+							 user_opts.print_initdb_options);
 	check_required_directory(&user_opts.socketdir, "PGSOCKETDIR", true,
 							 "-s", _("sockets will be created"), false);
 
@@ -300,6 +311,7 @@ parseCommandLine(int argc, char *argv[])
 	 * error on file pg_upgrade_utility.log if pg_upgrade is run inside the
 	 * new cluster directory, so we do a check here.
 	 */
+	if (!user_opts.print_initdb_options)
 	{
 		char		cwd[MAXPGPATH],
 					new_cluster_pgdata[MAXPGPATH];
@@ -416,20 +428,21 @@ usage(void)
 			 "                                checking or upgrading, using old cluster settings\n"));
 	printf(_("  --initdb-options=OPTIONS      options to pass to initdb (requires --initdb)\n"));
 	printf(_("  --no-statistics               do not import statistics from old cluster\n"));
+	printf(_("  --print-initdb-options        print initdb options for the old cluster, then exit\n"));
 	printf(_("  --set-char-signedness=OPTION  set new cluster char signedness to \"signed\" or\n"
 			 "                                \"unsigned\"\n"));
 	printf(_("  --swap                        move data directories to new cluster\n"));
 	printf(_("  --sync-method=METHOD          set method for syncing files to disk\n"));
 	printf(_("  -?, --help                    show this help, then exit\n"));
 	printf(_("\n"
-			 "Before running pg_upgrade you must:\n"
+			 "Before performing an upgrade you must:\n"
 			 "  create a new database cluster (using the new version of initdb),\n"
 			 "    unless the --initdb option is given, in which case pg_upgrade\n"
 			 "    creates the new cluster for you\n"
 			 "  shutdown the postmaster servicing the old cluster\n"
 			 "  shutdown the postmaster servicing the new cluster\n"));
 	printf(_("\n"
-			 "When you run pg_upgrade, you must provide the following information:\n"
+			 "To perform an upgrade, provide the following information:\n"
 			 "  the data directory for the old cluster  (-d DATADIR)\n"
 			 "  the data directory for the new cluster  (-D DATADIR)\n"
 			 "  the \"bin\" directory for the old version (-b BINDIR)\n"
@@ -580,10 +593,9 @@ adjust_data_dir(ClusterInfo *cluster)
 /*
  * get_sock_dir
  *
- * Identify the socket directory to use for this cluster.  If we're doing
- * a live check (old cluster only), we need to find out where the postmaster
- * is listening.  Otherwise, we're going to put the socket into the current
- * directory.
+ * On Unix, reuse the socket directory and port in postmaster.pid for an
+ * already running source. Otherwise, use user_opts.socketdir, which defaults
+ * to the current directory. On Windows, leave sockdir unset to use TCP.
  */
 void
 get_sock_dir(ClusterInfo *cluster)
@@ -593,10 +605,6 @@ get_sock_dir(ClusterInfo *cluster)
 		cluster->sockdir = user_opts.socketdir;
 	else
 	{
-		/*
-		 * If we are doing a live check, we will use the old cluster's Unix
-		 * domain socket directory so we can connect to the live server.
-		 */
 		unsigned short orig_port = cluster->port;
 		char		filename[MAXPGPATH],
 					line[MAXPGPATH];
