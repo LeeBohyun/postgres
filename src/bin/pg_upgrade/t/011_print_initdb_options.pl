@@ -86,7 +86,7 @@ is_deeply(
 # Other databases keep usable locale settings for the test connections.
 SKIP:
 {
-	skip 'POSIX shell quoting test', 2 if $windows_os;
+	skip 'POSIX shell quoting test', 4 if $windows_os;
 	my $locale = q{C's locale $libdir; $(echo ignored)};
 	$oldnode->safe_psql('postgres',
 			q{UPDATE pg_database SET datcollate = $locale$}
@@ -102,6 +102,19 @@ SKIP:
 		[ grep { /^--lc-collate=/ } shellwords($quoted_options) ],
 		["--lc-collate=$locale"],
 		'quoting preserves spaces, quotes, and literal shell metacharacters');
+	my $shell_arguments;
+	ok( run_log(
+			[
+				'sh', '-c',
+				q{eval "set -- $1" || exit; printf '%s\0' "$@"},
+				'sh', $quoted_options,
+			],
+			'>' => \$shell_arguments),
+		'shell evaluates the printed initialization options');
+	is_deeply(
+		[ split /\0/, $shell_arguments ],
+		[ map { /^--lc-collate=/ ? "--lc-collate=$locale" : $_ } @options ],
+		'shell reuse preserves argument boundaries and literal metacharacters');
 	$oldnode->safe_psql('postgres',
 		"UPDATE pg_database SET datcollate = 'C' WHERE datname = 'template0'"
 	);

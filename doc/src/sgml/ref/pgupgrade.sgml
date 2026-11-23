@@ -274,7 +274,19 @@ PostgreSQL documentation
        </para>
        <para>
         Standard output contains one line of arguments quoted for the platform's command shell.
-        Callers constructing an argument list must interpret that quoting rather than split the output on whitespace.
+        As with <xref linkend="app-pgconfig"/>'s <option>--configure</option>
+        output, shell quotation marks preserve arguments containing spaces.
+        For example, in a POSIX shell script:
+<programlisting>
+initdb_options=$(/new/bin/pg_upgrade --print-initdb-options \
+    --old-bindir=/old/bin --old-datadir=/old/data) || exit
+eval /new/bin/initdb --pgdata=/new/data "$initdb_options"
+</programlisting>
+        The <command>eval</command> interprets the quotation marks in the
+        output.  Callers constructing an argument list directly must parse
+        that quoting instead of splitting the output on whitespace.
+       </para>
+       <para>
         Progress messages and diagnostics from inspecting the old cluster are written to standard error.
         This mode requires the old cluster's binary and data directories, but does not require or use the new cluster's binary or data directories.
         It cannot be combined with <option>--initdb</option>, <option>--initdb-options</option>, or <option>--check</option>.
