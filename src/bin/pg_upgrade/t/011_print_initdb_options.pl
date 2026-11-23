@@ -19,6 +19,18 @@ my @old_initdb_options = ('--wal-segsize=2', '--encoding=UTF8', '--locale=C');
 push @old_initdb_options, '--no-data-checksums' if $oldnode->pg_version >= 18;
 $oldnode->init(extra => \@old_initdb_options);
 $oldnode->start;
+
+# oldinstall can have different ICU support from the target build. Ignore the
+# bootstrap unicode entry when checking the fresh source's ICU collations.
+my $test_icu =
+	 $oldnode->pg_version >= 15
+  && $ENV{with_icu} eq 'yes'
+  && $oldnode->safe_psql(
+	'postgres',
+	"SELECT EXISTS (SELECT 1 FROM pg_collation
+                    WHERE collprovider = 'i' AND collname <> 'unicode')"
+  ) eq 't';
+
 $oldnode->safe_psql('postgres',
 	'CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t VALUES (1), (2), (3)'
 );
@@ -197,7 +209,7 @@ my @providers = ();
 push @providers, [ 'builtin', '--builtin-locale=C.UTF-8' ]
   if $oldnode->pg_version >= 17;
 push @providers, [ 'icu', '--icu-locale=en-US' ]
-  if $oldnode->pg_version >= 15 && $ENV{with_icu} eq 'yes';
+  if $test_icu;
 for my $provider (@providers)
 {
 	my ($name, $locale) = @$provider;
