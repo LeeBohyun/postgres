@@ -15,6 +15,10 @@ use Text::ParseWords qw(shellwords);
 my $oldnode =
   PostgreSQL::Test::Cluster->new('old_node',
 	install_path => $ENV{oldinstall});
+# Use 2 MB WAL segments to verify discovery of a source value that differs
+# from initdb's 16 MB default. Keep checksums disabled so the printer must emit
+# --no-data-checksums for a target initdb that enables them by default.
+# Sources before PG18 already default to disabled checksums.
 my @old_initdb_options = ('--wal-segsize=2', '--encoding=UTF8', '--locale=C');
 push @old_initdb_options, '--no-data-checksums' if $oldnode->pg_version >= 18;
 $oldnode->init(extra => \@old_initdb_options);
@@ -53,6 +57,8 @@ sub print_command
 
 chdir ${PostgreSQL::Test::Utils::tmp_check};
 
+# Inspect a live source without restarting it or creating a target. Verbose
+# diagnostics must go to stderr so stdout contains only one line of options.
 my $start_time =
   $oldnode->safe_psql('postgres', 'SELECT pg_postmaster_start_time()');
 my ($live_options, $stderr);
@@ -120,6 +126,9 @@ SKIP:
 	);
 }
 
+# Inspect an initially stopped source without specifying a target. Printing must
+# return the same options as for a live source and stop the server it starts
+# temporarily. Successful inspection must remove its diagnostic logs.
 $oldnode->stop;
 my ($stopped_options, $stopped_stderr);
 {
