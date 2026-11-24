@@ -68,7 +68,8 @@ parseCommandLine(int argc, char *argv[])
 		{"swap", no_argument, NULL, 7},
 		{"initdb", no_argument, NULL, 8},
 		{"initdb-options", required_argument, NULL, 9},
-		{"print-initdb-options", no_argument, NULL, 10},
+		{"print-initdb-options", optional_argument, NULL, 10},
+		{"initdb-database", required_argument, NULL, 11},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -251,6 +252,17 @@ parseCommandLine(int argc, char *argv[])
 
 			case 10:
 				user_opts.print_initdb_options = true;
+				if (optarg && strcmp(optarg, "shell") != 0 &&
+					strcmp(optarg, "json") != 0)
+					pg_fatal("invalid argument for option %s: \"%s\"",
+							 "--print-initdb-options", optarg);
+				user_opts.initdb_options_json = optarg && strcmp(optarg, "json") == 0;
+				break;
+
+			case 11:
+				if (optarg[0] == '\0')
+					pg_fatal("empty database name for option %s", "--initdb-database");
+				user_opts.initdb_database = pg_strdup(optarg);
 				break;
 
 			default:
@@ -267,6 +279,8 @@ parseCommandLine(int argc, char *argv[])
 		pg_fatal("options --print-initdb-options and --initdb cannot be used together");
 	if (user_opts.print_initdb_options && user_opts.check)
 		pg_fatal("options --print-initdb-options and --check cannot be used together");
+	if (user_opts.initdb_database && !user_opts.print_initdb_options)
+		pg_fatal("--initdb-database requires --print-initdb-options");
 
 	if (user_opts.initdb_options_given && !user_opts.initdb_new_cluster)
 		pg_fatal("--initdb-options requires --initdb");
@@ -301,8 +315,10 @@ parseCommandLine(int argc, char *argv[])
 	check_required_directory(&new_cluster.pgdata, "PGDATANEW", false,
 							 "-D", _("new cluster data resides"),
 							 user_opts.print_initdb_options);
-	check_required_directory(&user_opts.socketdir, "PGSOCKETDIR", true,
-							 "-s", _("sockets will be created"), false);
+	check_required_directory(&user_opts.socketdir, "PGSOCKETDIR",
+							 !user_opts.print_initdb_options,
+							 "-s", _("sockets will be created"),
+							 user_opts.print_initdb_options);
 
 #ifdef WIN32
 
@@ -417,7 +433,8 @@ usage(void)
 	printf(_("  -p, --old-port=PORT           old cluster port number (default %d)\n"), old_cluster.port);
 	printf(_("  -P, --new-port=PORT           new cluster port number (default %d)\n"), new_cluster.port);
 	printf(_("  -r, --retain                  retain SQL and log files after success\n"));
-	printf(_("  -s, --socketdir=DIR           socket directory to use (default current dir.)\n"));
+	printf(_("  -s, --socketdir=DIR           socket directory (default current dir., or a\n"
+			 "                                temporary dir. with --print-initdb-options)\n"));
 	printf(_("  -U, --username=NAME           cluster superuser (default \"%s\")\n"), os_info.user);
 	printf(_("  -v, --verbose                 enable verbose internal logging\n"));
 	printf(_("  -V, --version                 display version information, then exit\n"));
@@ -426,9 +443,12 @@ usage(void)
 	printf(_("  --copy-file-range             copy files to new cluster with copy_file_range\n"));
 	printf(_("  --initdb                      create the new cluster with initdb before\n"
 			 "                                checking or upgrading, using old cluster settings\n"));
+	printf(_("  --initdb-database=DBNAME       database supplying printed encoding and locale\n"
+			 "                                settings (default template0)\n"));
 	printf(_("  --initdb-options=OPTIONS      options to pass to initdb (requires --initdb)\n"));
 	printf(_("  --no-statistics               do not import statistics from old cluster\n"));
-	printf(_("  --print-initdb-options        print initdb options for the old cluster, then exit\n"));
+	printf(_("  --print-initdb-options[=FMT]   print old cluster initdb options, then exit\n"
+			 "                                FMT is shell (default) or json\n"));
 	printf(_("  --set-char-signedness=OPTION  set new cluster char signedness to \"signed\" or\n"
 			 "                                \"unsigned\"\n"));
 	printf(_("  --swap                        move data directories to new cluster\n"));
@@ -595,7 +615,8 @@ adjust_data_dir(ClusterInfo *cluster)
  *
  * On Unix, reuse the socket directory and port in postmaster.pid for an
  * already running source. Otherwise, use user_opts.socketdir, which defaults
- * to the current directory. On Windows, leave sockdir unset to use TCP.
+ * to the printer's temporary directory or, otherwise, the current directory.
+ * On Windows, leave sockdir unset to use TCP.
  */
 void
 get_sock_dir(ClusterInfo *cluster)

@@ -76,9 +76,15 @@ static void create_initdb_parents(char *path);
 static void finalize_initdb(void);
 static void set_initdb_directory_permissions(const char *path);
 static void set_output_permissions(void);
+static void make_print_options_workspace(void);
+static void report_print_options_workspace(void);
 static void print_initdb_options(void);
-static void get_old_cluster_initdb_info(void);
-static void append_source_initdb_options(PQExpBuffer cmd);
+static DbLocaleInfo *get_old_cluster_initdb_info(void);
+static void append_initdb_option(PQExpBuffer options, const char *name,
+								 const char *value, bool json);
+static void append_source_initdb_options(PQExpBuffer options,
+										 const DbLocaleInfo *locale, bool json,
+										 bool include_icu_rules);
 static void build_new_cluster_initdb_cmd(PQExpBuffer cmd);
 static void create_new_cluster_via_initdb(void);
 static void create_logical_replication_slots(void);
@@ -108,6 +114,9 @@ static mode_t initdb_target_mode;
 static bool initdb_restore_mode;
 static char **initdb_created_parents;
 static int	initdb_num_created_parents;
+
+/* Non-NULL until successful cleanup, so failures can report retained files. */
+static char *print_options_workspace;
 
 char	   *output_files[] = {
 	SERVER_LOG_FILE,
@@ -371,7 +380,7 @@ make_outputdirs(const char *output_root)
 	log_opts.rootdir = (char *) pg_malloc0(MAXPGPATH);
 	len = snprintf(log_opts.rootdir, MAXPGPATH, "%s/%s", output_root, BASE_OUTPUTDIR);
 	if (len >= MAXPGPATH)
-		pg_fatal("directory path for new cluster is too long");
+		pg_fatal("directory path for output files is too long");
 
 	/* BASE_OUTPUTDIR/$timestamp/ */
 	gettimeofday(&time, NULL);
@@ -385,7 +394,7 @@ make_outputdirs(const char *output_root)
 	len = snprintf(log_opts.basedir, MAXPGPATH, "%s/%s", log_opts.rootdir,
 				   timebuf);
 	if (len >= MAXPGPATH)
-		pg_fatal("directory path for new cluster is too long");
+		pg_fatal("directory path for output files is too long");
 
 	/* BASE_OUTPUTDIR/$timestamp/dump/ */
 	pg_free(log_opts.dumpdir);
@@ -393,7 +402,7 @@ make_outputdirs(const char *output_root)
 	len = snprintf(log_opts.dumpdir, MAXPGPATH, "%s/%s/%s", log_opts.rootdir,
 				   timebuf, DUMP_OUTPUTDIR);
 	if (len >= MAXPGPATH)
-		pg_fatal("directory path for new cluster is too long");
+		pg_fatal("directory path for output files is too long");
 
 	/* BASE_OUTPUTDIR/$timestamp/log/ */
 	pg_free(log_opts.logdir);
@@ -401,7 +410,7 @@ make_outputdirs(const char *output_root)
 	len = snprintf(log_opts.logdir, MAXPGPATH, "%s/%s/%s", log_opts.rootdir,
 				   timebuf, LOG_OUTPUTDIR);
 	if (len >= MAXPGPATH)
-		pg_fatal("directory path for new cluster is too long");
+		pg_fatal("directory path for output files is too long");
 
 	/*
 	 * Ignore the error case where the root path exists, as it is kept the
@@ -419,7 +428,7 @@ make_outputdirs(const char *output_root)
 	len = snprintf(filename_path, sizeof(filename_path), "%s/%s",
 				   log_opts.logdir, INTERNAL_LOG_FILE);
 	if (len >= sizeof(filename_path))
-		pg_fatal("directory path for new cluster is too long");
+		pg_fatal("directory path for output files is too long");
 
 	if ((log_opts.internal = fopen_priv(filename_path, "a")) == NULL)
 		pg_fatal("could not open log file \"%s\": %m", filename_path);
@@ -430,7 +439,7 @@ make_outputdirs(const char *output_root)
 		len = snprintf(filename_path, sizeof(filename_path), "%s/%s",
 					   log_opts.logdir, *filename);
 		if (len >= sizeof(filename_path))
-			pg_fatal("directory path for new cluster is too long");
+			pg_fatal("directory path for output files is too long");
 		if ((fp = fopen_priv(filename_path, "a")) == NULL)
 			pg_fatal("could not write to log file \"%s\": %m", filename_path);
 
@@ -712,43 +721,105 @@ fail:
 
 
 /*
- * Print source-derived initdb arguments without preparing a target cluster.
- * Put diagnostic logs in the current directory because no target PGDATA is
- * required. Delay writing stdout until source inspection is complete, so
- * discovery failures do not leave a partial argument list.
+ * Give the printer private logs and a default socket without requiring a
+ * writable current directory or changing the meaning of relative paths.
+ */
+static void
+make_print_options_workspace(void)
+{
+	const char *tmpdir = getenv("TMPDIR");
+	char	   *template;
+#ifdef WIN32
+	char		temp_path[MAXPGPATH];
+
+	if (!tmpdir || !*tmpdir)
+	{
+		DWORD		len = GetTempPath(sizeof(temp_path), temp_path);
+
+		if (len == 0 || len >= sizeof(temp_path))
+			pg_fatal("could not locate temporary directory");
+		tmpdir = temp_path;
+	}
+#else
+	if (!tmpdir || !*tmpdir)
+		tmpdir = "/tmp";
+#endif
+
+	template = psprintf("%s/pg_upgrade-XXXXXX", tmpdir);
+	print_options_workspace = make_absolute_path(template);
+	pg_free(template);
+	if (!print_options_workspace)
+		pg_fatal("could not make temporary directory path absolute");
+	if (!mkdtemp(print_options_workspace))
+		pg_fatal("could not create directory \"%s\": %m", print_options_workspace);
+
+	/* Register before start_postmaster(), so its exit handler runs first. */
+	atexit(report_print_options_workspace);
+	make_outputdirs(print_options_workspace);
+	if (!user_opts.socketdir)
+		user_opts.socketdir = pg_strdup(print_options_workspace);
+}
+
+
+static void
+report_print_options_workspace(void)
+{
+	if (print_options_workspace)
+		pg_log(PG_REPORT, "Temporary files are retained in \"%s\".",
+			   print_options_workspace);
+}
+
+
+/*
+ * Delay stdout until inspection and formatting succeed, so discovery failures
+ * do not leave a partial argument list. Retain logs if writing stdout fails.
  */
 static void
 print_initdb_options(void)
 {
 	PQExpBufferData options;
+	DbLocaleInfo *locale;
 
-	check_current_dir_write_permissions();
-	make_outputdirs(".");
-	get_old_cluster_initdb_info();
+	make_print_options_workspace();
+	locale = get_old_cluster_initdb_info();
 
 	initPQExpBuffer(&options);
-	append_source_initdb_options(&options);
-
-	cleanup_output_dirs();
+	append_source_initdb_options(&options, locale,
+								 user_opts.initdb_options_json, true);
+	if (PQExpBufferBroken(&options))
+		pg_fatal("out of memory");
 
 	if (printf("%s\n", options.data) < 0 || fflush(stdout) != 0)
 		pg_fatal("could not write initdb options: %m");
 	termPQExpBuffer(&options);
+
+	cleanup_output_dirs();
+	if (!log_opts.retain)
+	{
+		if (rmdir(print_options_workspace) == 0)
+		{
+			pg_free(print_options_workspace);
+			print_options_workspace = NULL;
+		}
+		else
+			pg_log(PG_WARNING, "could not remove directory \"%s\": %m",
+				   print_options_workspace);
+	}
 }
 
 
 /*
- * Collect the source control data and template0 settings used by initdb.
+ * Collect the source control data and selected database settings for initdb.
  * A running source is allowed only for --check or --print-initdb-options.
  * Leave that source running. Stop any server started here before returning.
  */
-static void
+static DbLocaleInfo *
 get_old_cluster_initdb_info(void)
 {
-	check_data_dir(&old_cluster);
+	DbLocaleInfo *locale;
 
-	if (!old_cluster.sockdir)
-		old_cluster.sockdir = user_opts.socketdir ? user_opts.socketdir : ".";
+	check_data_dir(&old_cluster);
+	get_sock_dir(&old_cluster);
 
 	/*
 	 * A postmaster.pid may be stale. As in check_clusters_stopped(), try a
@@ -771,26 +842,83 @@ get_old_cluster_initdb_info(void)
 	prep_status("Examining old cluster settings");
 	if (!user_opts.live_check)
 		start_postmaster(&old_cluster, true);
-	get_template0_info(&old_cluster);
+	locale = get_db_locale_info(&old_cluster,
+								user_opts.initdb_database ?
+								user_opts.initdb_database : "template0");
 	if (!user_opts.live_check)
 		stop_postmaster(false);
 	check_ok();
+	return locale;
 }
 
 
 /*
- * Append source-derived, shell-quoted initdb arguments shared by --initdb
- * and --print-initdb-options. Callers supply the executable, target paths,
- * bootstrap user, and additional options.
+ * Append a complete argument to either shell output or a JSON argument array.
+ * Follow the frontend backup-manifest writer's JSON escaping convention.
  */
 static void
-append_source_initdb_options(PQExpBuffer cmd)
+append_initdb_option(PQExpBuffer options, const char *name,
+					 const char *value, bool json)
 {
-	DbLocaleInfo *locale = old_cluster.template0;
-	const char *encoding_name = pg_encoding_to_char(locale->db_encoding);
+	if (!json)
+	{
+		if (options->len > 0)
+			appendPQExpBufferChar(options, ' ');
+		appendPQExpBufferStr(options, name);
+		if (value)
+		{
+			if (user_opts.print_initdb_options && strpbrk(value, "\r\n"))
+				pg_fatal("initdb option \"%s\" contains a newline or carriage return\n"
+						 "Use --print-initdb-options=json to preserve this value.", name);
+			appendPQExpBufferChar(options, '=');
+			appendShellString(options, value);
+		}
+		return;
+	}
 
-	appendPQExpBuffer(cmd, "--wal-segsize=%u",
-					  old_cluster.controldata.walseg / (1024 * 1024));
+	if (options->len > 1)
+		appendPQExpBufferStr(options, ", ");
+	appendPQExpBufferChar(options, '"');
+	appendPQExpBufferStr(options, name);
+	if (value)
+	{
+		size_t		len = strlen(value);
+
+		if (pg_encoding_verifymbstr(PG_UTF8, value, len) != len)
+			pg_fatal("initdb option \"%s\" is not valid UTF-8", name);
+		appendPQExpBufferChar(options, '=');
+		for (const unsigned char *p = (const unsigned char *) value; *p; p++)
+		{
+			if (*p == '"' || *p == '\\')
+				appendPQExpBufferChar(options, '\\');
+			if (*p < ' ')
+				appendPQExpBuffer(options, "\\u%04x", (unsigned int) *p);
+			else
+				appendPQExpBufferChar(options, *p);
+		}
+	}
+	appendPQExpBufferChar(options, '"');
+}
+
+
+/*
+ * Append source-derived initdb arguments shared by --initdb and the printer.
+ * Callers supply executable/target paths, bootstrap user and extra options.
+ * Automatic initdb copies ICU rules later through SQL, so it need not send
+ * multiline rules through a shell. The printer must include the rules.
+ */
+static void
+append_source_initdb_options(PQExpBuffer options, const DbLocaleInfo *locale,
+							 bool json, bool include_icu_rules)
+{
+	char		walsegsize[32];
+
+	if (json)
+		appendPQExpBufferChar(options, '[');
+
+	snprintf(walsegsize, sizeof(walsegsize), "%u",
+			 old_cluster.controldata.walseg / (1024 * 1024));
+	append_initdb_option(options, "--wal-segsize", walsegsize, json);
 
 	/*
 	 * Pass --data-checksums or --no-data-checksums explicitly.  Starting from
@@ -798,33 +926,29 @@ append_source_initdb_options(PQExpBuffer cmd)
 	 * cluster's setting to avoid a mismatch that check_control_data() would
 	 * reject.
 	 */
-	if (old_cluster.controldata.data_checksum_version != 0)
-		appendPQExpBufferStr(cmd, " --data-checksums");
-	else
-		appendPQExpBufferStr(cmd, " --no-data-checksums");
-
-	appendPQExpBufferStr(cmd, " --encoding=");
-	appendShellString(cmd, encoding_name);
-	appendPQExpBufferStr(cmd, " --locale-provider=");
-	appendShellString(cmd, collprovider_name(locale->db_collprovider));
-	appendPQExpBufferStr(cmd, " --lc-collate=");
-	appendShellString(cmd, locale->db_collate);
-	appendPQExpBufferStr(cmd, " --lc-ctype=");
-	appendShellString(cmd, locale->db_ctype);
+	append_initdb_option(options,
+						 old_cluster.controldata.data_checksum_version != 0 ?
+						 "--data-checksums" : "--no-data-checksums", NULL, json);
+	append_initdb_option(options, "--encoding",
+						 pg_encoding_to_char(locale->db_encoding), json);
+	append_initdb_option(options, "--locale-provider",
+						 collprovider_name(locale->db_collprovider), json);
+	append_initdb_option(options, "--lc-collate", locale->db_collate, json);
+	append_initdb_option(options, "--lc-ctype", locale->db_ctype, json);
 
 	if (locale->db_locale)
 	{
 		if (locale->db_collprovider == COLLPROVIDER_ICU)
-		{
-			appendPQExpBufferStr(cmd, " --icu-locale=");
-			appendShellString(cmd, locale->db_locale);
-		}
+			append_initdb_option(options, "--icu-locale", locale->db_locale, json);
 		else if (locale->db_collprovider == COLLPROVIDER_BUILTIN)
-		{
-			appendPQExpBufferStr(cmd, " --builtin-locale=");
-			appendShellString(cmd, locale->db_locale);
-		}
+			append_initdb_option(options, "--builtin-locale", locale->db_locale, json);
 	}
+	if (include_icu_rules && locale->db_collprovider == COLLPROVIDER_ICU &&
+		locale->db_icu_rules)
+		append_initdb_option(options, "--icu-rules", locale->db_icu_rules, json);
+
+	if (json)
+		appendPQExpBufferChar(options, ']');
 }
 
 
@@ -849,8 +973,7 @@ build_new_cluster_initdb_cmd(PQExpBuffer cmd)
 	appendShellString(cmd, new_cluster.pgdata);
 	appendPQExpBufferStr(cmd, " -U ");
 	appendShellString(cmd, os_info.user);
-	appendPQExpBufferChar(cmd, ' ');
-	append_source_initdb_options(cmd);
+	append_source_initdb_options(cmd, old_cluster.template0, false, false);
 
 	for (int i = 0; i < user_opts.num_initdb_options; i++)
 	{
@@ -868,7 +991,7 @@ create_new_cluster_via_initdb(void)
 {
 	PQExpBufferData cmd;
 
-	get_old_cluster_initdb_info();
+	old_cluster.template0 = get_old_cluster_initdb_info();
 	build_new_cluster_initdb_cmd(&cmd);
 
 	prep_status("Creating new cluster with initdb");

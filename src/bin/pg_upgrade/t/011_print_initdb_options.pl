@@ -7,10 +7,21 @@
 use strict;
 use warnings FATAL => 'all';
 
+use Cwd    qw(getcwd);
+use Encode qw(encode);
+use File::Spec;
+use JSON::PP qw(decode_json);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Text::ParseWords qw(shellwords);
+
+# Keep temporary sockets short, and make cleanup observable independently of
+# the working directory and any socket-directory settings in the environment.
+my $print_tmpdir = PostgreSQL::Test::Utils::tempdir_short();
+local $ENV{TMPDIR} = $print_tmpdir;
+local $ENV{PGSOCKETDIR};
+delete $ENV{PGSOCKETDIR};
 
 my $oldnode =
   PostgreSQL::Test::Cluster->new('old_node',
@@ -50,7 +61,6 @@ sub print_command
 		'--old-datadir' => $node->data_dir,
 		'--old-bindir' => $oldbindir,
 		'--old-port' => $node->port,
-		'--socketdir' => $node->host,
 		@extra,
 	];
 }
@@ -87,6 +97,22 @@ is_deeply(
 	],
 	'output contains source settings without target paths or execution flags'
 );
+
+# JSON supplies complete arguments for wrappers that invoke initdb directly.
+# Choosing the shell format explicitly must preserve the default output.
+my ($json_options, $json_stderr);
+ok( run_log(
+		print_command($oldnode, '--print-initdb-options=json'),
+		'>' => \$json_options,
+		'2>' => \$json_stderr),
+	'print initialization options as JSON');
+is_deeply(decode_json($json_options),
+	\@options, 'JSON and shell formats describe the same complete arguments');
+like($json_options, qr/\A[^\r\n]+\r?\n\z/, 'JSON output occupies one line');
+command_checks_all(
+	print_command($oldnode, '--print-initdb-options=shell'),
+	0, [qr/\A\Q$live_options\E\z/],
+	[], 'explicit shell format matches default');
 
 # Inject template0 metadata to test quoting without requiring such a locale.
 # Other databases keep usable locale settings for the test connections.
@@ -126,6 +152,96 @@ SKIP:
 	);
 }
 
+# JSON must preserve control characters, quotes, backslashes and UTF-8 even
+# when PGCLIENTENCODING requests another encoding. Only template0 is changed,
+# so the source remains connectable without requiring this invented locale.
+my $json_locale = "C's \\\" locale\b\f\n\r\t\x01 \xc3\xa9";
+$oldnode->safe_psql('postgres',
+		q{UPDATE pg_database SET datcollate = $locale$}
+	  . $json_locale
+	  . q{$locale$ WHERE datname = 'template0'});
+{
+	local $ENV{PGCLIENTENCODING} = 'LATIN1';
+	my ($output, $errors);
+	ok( run_log(
+			print_command($oldnode, '--print-initdb-options=json'),
+			'>' => \$output,
+			'2>' => \$errors),
+		'print JSON independently of the requested client encoding');
+	is_deeply(
+		[
+			map  { encode('UTF-8', $_) }
+			grep { /^--lc-collate=/ } @{ decode_json($output) }
+		],
+		["--lc-collate=$json_locale"],
+		'JSON preserves exact UTF-8 locale text and every control character');
+}
+$oldnode->safe_psql('postgres',
+	"UPDATE pg_database SET datcollate = 'C' WHERE datname = 'template0'");
+
+# A wrapper's maintenance database may differ from template0. A quoted name
+# exercises libpq connection-string escaping. Disable
+# template1 connections to ensure even the temporary-server probe uses it.
+my $database = q{print 'source"\name; --};
+my $sql_database = $database;
+$sql_database =~ s/"/""/g;
+$oldnode->safe_psql('postgres',
+	qq{CREATE DATABASE "$sql_database" TEMPLATE template0 ENCODING 'LATIN1'});
+my ($database_options, $database_stderr);
+ok( run_log(
+		print_command(
+			$oldnode, '--print-initdb-options=json',
+			'--initdb-database' => $database),
+		'>' => \$database_options,
+		'2>' => \$database_stderr),
+	'print settings from a selected database with a quoted name');
+is_deeply(
+	decode_json($database_options),
+	[ map { $_ eq '--encoding=UTF8' ? '--encoding=LATIN1' : $_ } @options ],
+	'only the selected database supplies the printed encoding and locale');
+
+# A database name supplied as source-encoded bytes must still identify that
+# database after the printer changes its client encoding to UTF-8 for JSON.
+SKIP:
+{
+	skip 'Unix byte arguments required', 2 if $windows_os;
+	my $nonascii_database = "caf\xe9";
+	$oldnode->safe_psql($database,
+		q{CREATE DATABASE U&"caf\00E9" TEMPLATE template0 ENCODING 'LATIN1'});
+	my ($output, $errors);
+	ok( run_log(
+			print_command(
+				$oldnode,
+				'--print-initdb-options=json',
+				'--initdb-database' => $nonascii_database),
+			'>' => \$output,
+			'2>' => \$errors),
+		'print JSON from a database with a non-ASCII source-encoded name');
+	is_deeply(
+		decode_json($output),
+		decode_json($database_options),
+		'JSON encoding conversion preserves selected database identity');
+	$oldnode->safe_psql($database, q{DROP DATABASE U&"caf\00E9"});
+}
+
+$oldnode->safe_psql('postgres',
+	'ALTER DATABASE template1 ALLOW_CONNECTIONS false');
+$oldnode->stop;
+command_checks_all(
+	print_command(
+		$oldnode, '--print-initdb-options=json',
+		'--initdb-database' => $database),
+	0,
+	[qr/\A\Q$database_options\E\z/],
+	[],
+	'selected database also permits inspection with template1 disabled');
+ok(!-f $oldnode->data_dir . '/postmaster.pid',
+	'selected-database inspection stops its temporary server');
+$oldnode->start;
+$oldnode->safe_psql('postgres',
+	'ALTER DATABASE template1 ALLOW_CONNECTIONS true');
+$oldnode->safe_psql('postgres', qq{DROP DATABASE "$sql_database"});
+
 # Inspect an initially stopped source without specifying a target. Printing must
 # return the same options as for a live source and stop the server it starts
 # temporarily. Successful inspection must remove its diagnostic logs.
@@ -145,6 +261,82 @@ is($stopped_options, $live_options,
 ok( !-f $oldnode->data_dir . '/postmaster.pid',
 	'printing leaves an initially stopped source stopped');
 ok(!-d 'pg_upgrade_output.d', 'successful printing removes diagnostic logs');
+is_deeply([ grep { $_ ne '.' && $_ ne '..' } slurp_dir($print_tmpdir) ],
+	[], 'successful printing removes its private workspace');
+
+# Neither logs nor the default socket may require a writable CWD. Keep source
+# paths absolute here; the following case checks relative path resolution.
+SKIP:
+{
+	skip 'Unix directory permissions required', 2 if $windows_os;
+	my $cwd = getcwd();
+	my $readonly = $oldnode->basedir . '/readonly';
+	mkdir($readonly, 0500) or die "mkdir $readonly: $!";
+	chdir $readonly or die "chdir $readonly: $!";
+	command_checks_all(print_command($oldnode), 0,
+		[qr/\A\Q$live_options\E\z/],
+		[],
+		'print from a read-only working directory with the default socket');
+	chdir $cwd or die "chdir $cwd: $!";
+	chmod(0700, $readonly) or die "chmod $readonly: $!";
+}
+{
+	local $ENV{TMPDIR} = File::Spec->abs2rel($print_tmpdir, getcwd());
+	command_checks_all(
+		print_command(
+			$oldnode,
+			'--old-bindir' => File::Spec->abs2rel($oldbindir, getcwd()),
+			'--old-datadir' =>
+			  File::Spec->abs2rel($oldnode->data_dir, getcwd())),
+		0,
+		[qr/\A\Q$live_options\E\z/],
+		[],
+		'relative source paths and TMPDIR retain their original meaning');
+}
+
+# The default socket path must preserve spaces and apostrophes in TMPDIR.
+# libpq treats commas in a host as separators, so such a TMPDIR requires an
+# explicit socket directory; both supported ways to select one must work.
+SKIP:
+{
+	skip 'Unix sockets required', 6 if $windows_os;
+	my $tmpdir = $print_tmpdir . q{/space 'dir};
+	mkdir($tmpdir) or die "mkdir $tmpdir: $!";
+	local $ENV{TMPDIR} = $tmpdir;
+	command_checks_all(print_command($oldnode), 0,
+		[qr/\A\Q$live_options\E\z/],
+		[], 'TMPDIR metacharacters preserve the default socket directory');
+	rmdir($tmpdir) or die "rmdir $tmpdir: $!";
+	$tmpdir .= ',sub';
+	mkdir($tmpdir) or die "mkdir $tmpdir: $!";
+	$ENV{TMPDIR} = $tmpdir;
+	command_checks_all(
+		print_command($oldnode, '--socketdir' => $oldnode->host), 0,
+		[qr/\A\Q$live_options\E\z/], [],
+		'explicit socket directory overrides the temporary directory');
+	{
+		local $ENV{PGSOCKETDIR} = $oldnode->host;
+		command_checks_all(print_command($oldnode), 0,
+			[qr/\A\Q$live_options\E\z/],
+			[],
+			'PGSOCKETDIR overrides the default temporary socket directory');
+	}
+	rmdir($tmpdir) or die "rmdir $tmpdir: $!";
+}
+
+# --retain reports an existing private directory; successful printing without
+# it above must not leave one. Errors later in this test retain their logs too.
+my ($retained_options, $retained_stderr);
+ok( run_log(
+		print_command($oldnode, '--retain'),
+		'>' => \$retained_options,
+		'2>' => \$retained_stderr),
+	'print options while retaining diagnostic logs');
+is($retained_options, $live_options, '--retain leaves stdout unchanged');
+my ($workspace) =
+  $retained_stderr =~ /Temporary files are retained in "([^"]+)"/;
+ok( defined($workspace) && -d "$workspace/pg_upgrade_output.d",
+	'--retain reports the retained diagnostic directory');
 
 # Discovering source settings does not require the target installation.
 command_checks_all(
@@ -213,6 +405,25 @@ $oldnode->safe_psql('template1', 'GRANT SELECT ON pg_database TO PUBLIC');
 $oldnode->safe_psql('postgres', 'DROP ROLE print_options_reader');
 $oldnode->stop;
 
+# A failed connection after starting the source must stop that server before
+# reporting the retained workspace, while keeping stdout empty for wrappers.
+my ($failed_options, $failed_stderr);
+ok( !run_log(
+		print_command($oldnode, '--initdb-database=missing_print_options_db'),
+		'>' => \$failed_options,
+		'2>' => \$failed_stderr),
+	'fail inspection of a missing selected database');
+is($failed_options, '', 'failed database inspection leaves stdout empty');
+like(
+	$failed_stderr,
+	qr/database .*missing_print_options_db.* does not exist/,
+	'failure identifies the missing database');
+($workspace) = $failed_stderr =~ /Temporary files are retained in "([^"]+)"/;
+ok(defined($workspace) && -d "$workspace/pg_upgrade_output.d",
+	'failure reports retained diagnostics');
+ok( !-f $oldnode->data_dir . '/postmaster.pid',
+	'failed inspection stops the server it started');
+
 for my $option ('--initdb', '--check', '--initdb-options=')
 {
 	command_checks_all(
@@ -224,6 +435,26 @@ for my $option ('--initdb', '--check', '--initdb-options=')
 		],
 		"printing rejects $option");
 }
+
+for my $format ('', 'invalid')
+{
+	command_checks_all(
+		[ 'pg_upgrade', "--print-initdb-options=$format" ],
+		1,
+		[qr/\A\z/],
+		[qr/invalid argument for option --print-initdb-options/],
+		"reject invalid output format '$format'");
+}
+command_checks_all(
+	[ 'pg_upgrade', '--initdb-database=postgres' ], 1,
+	[qr/--initdb-database requires --print-initdb-options/], [qr/\A\z/],
+	'database selection requires printing');
+command_checks_all(
+	[ 'pg_upgrade', '--print-initdb-options', '--initdb-database=' ],
+	1,
+	[qr/\A\z/],
+	[qr/empty database name/],
+	'reject an empty database selection');
 
 # Check that builtin and, when available, ICU options can initialize a separate
 # target with enabled checksums and the source WAL segment size.
@@ -238,16 +469,42 @@ for my $provider (@providers)
 	my $source =
 	  PostgreSQL::Test::Cluster->new("${name}_source",
 		install_path => $ENV{oldinstall});
+	my $rules = q{&a < '$' < c < b} . " &c < \xc3\xa9";
+	my $test_rules = $name eq 'icu' && $source->pg_version >= 16;
 	$source->init(
 		extra => [
 			'--data-checksums', '--wal-segsize=1',
 			'--encoding=UTF8', '--locale=C',
 			"--locale-provider=$name", $locale,
+			($test_rules ? "--icu-rules=$rules" : ()),
 		]);
 	my ($output, $errors);
-	ok(run_log(print_command($source), '>' => \$output, '2>' => \$errors),
-		"print $name initialization options");
-	my @args = shellwords($output);
+	{
+		# Non-ASCII rules must retain their database encoding even if the
+		# caller's libpq environment requests a different client encoding.
+		local $ENV{PGCLIENTENCODING} = 'LATIN1';
+		ok( run_log(
+				print_command($source),
+				'>' => \$output,
+				'2>' => \$errors),
+			"print $name initialization options independently of PGCLIENTENCODING"
+		);
+	}
+	my @args;
+	if ($windows_os)
+	{
+		# shellwords parses POSIX quoting, not cmd.exe's. Use JSON for argv.
+		ok( run_log(
+				print_command($source, '--print-initdb-options=json'),
+				'>' => \$output,
+				'2>' => \$errors),
+			"print $name arguments for direct initialization on Windows");
+		@args = map { encode('UTF-8', $_) } @{ decode_json($output) };
+	}
+	else
+	{
+		@args = shellwords($output);
+	}
 	ok( grep({ $_ eq '--data-checksums' } @args),
 		'output explicitly enables source checksums');
 	ok(grep({ $_ eq $locale } @args), "output preserves the $name locale");
@@ -257,6 +514,85 @@ for my $provider (@providers)
 	is($target->safe_psql('postgres', 'SHOW wal_segment_size'),
 		'1MB', "$name initialization preserves WAL segment size");
 	$target->stop;
+
+	next unless $test_rules;
+	is_deeply(
+		[ grep { /^--icu-rules=/ } @args ],
+		["--icu-rules=$rules"],
+		'printed arguments preserve single-line ICU rules and literal metacharacters'
+	);
+
+	# The shell output format rejects multiline rules. JSON must preserve long
+	# multiline rules exactly, and the resulting arguments must initialize a
+	# real cluster. Automatic --initdb must keep its existing SQL copy path.
+	$rules .= "\r\n\t&d < f" . (' ' x 9000);
+	$source->start;
+	$source->safe_psql('postgres',
+			q{UPDATE pg_database SET daticurules = $rules$}
+		  . $rules
+		  . q{$rules$ WHERE datname = 'template0'});
+	$source->stop;
+	command_checks_all(
+		print_command($source),
+		1,
+		[qr/\A\z/],
+		[qr/Use --print-initdb-options=json to preserve this value/],
+		'shell output rejects multiline rules with a JSON hint');
+	my ($rules_output, $rules_stderr);
+	ok( run_log(
+			print_command($source, '--print-initdb-options=json'),
+			'>' => \$rules_output,
+			'2>' => \$rules_stderr),
+		'print long multiline ICU rules as JSON');
+	my @rules_args =
+	  map { encode('UTF-8', $_) } @{ decode_json($rules_output) };
+	is_deeply(
+		[ grep { /^--icu-rules=/ } @rules_args ],
+		["--icu-rules=$rules"],
+		'JSON preserves newlines, Unicode, metacharacters and long ICU rules'
+	);
+	my $rules_target = PostgreSQL::Test::Cluster->new('icu_rules_target');
+	$rules_target->init(extra => \@rules_args);
+	$rules_target->start;
+	is( $rules_target->safe_psql(
+			'postgres',
+			"SELECT daticurules FROM pg_database WHERE datname = 'template0'"
+		),
+		$rules,
+		'initdb accepts the JSON arguments and preserves the exact rules');
+	$rules_target->stop;
+
+	my $automatic = PostgreSQL::Test::Cluster->new('icu_rules_automatic');
+	command_ok(
+		[
+			'pg_upgrade', '--no-sync', '--initdb',
+			'--old-datadir' => $source->data_dir,
+			'--new-datadir' => $automatic->data_dir,
+			'--old-bindir' => $oldbindir,
+			'--old-port' => $source->port,
+			'--new-port' => $automatic->port,
+			'--socketdir' => $automatic->host,
+		],
+		'automatic initdb still upgrades a source with long multiline ICU rules'
+	);
+	# pg_upgrade invoked initdb directly, so add the test harness's connection
+	# settings that Cluster::init() normally writes before starting the node.
+	my $listen = $PostgreSQL::Test::Cluster::use_tcp ? $automatic->host : '';
+	my $socketdir =
+	  $PostgreSQL::Test::Cluster::use_tcp ? '' : $automatic->host;
+	$automatic->append_conf('postgresql.conf',
+			'port = '
+		  . $automatic->port
+		  . "\nlisten_addresses = '$listen'\nunix_socket_directories = '$socketdir'"
+	);
+	$automatic->start;
+	is( $automatic->safe_psql(
+			'postgres',
+			"SELECT daticurules FROM pg_database WHERE datname = 'template0'"
+		),
+		$rules,
+		'automatic initdb preserves canonical template0 rules through SQL');
+	$automatic->stop;
 }
 
 done_testing();

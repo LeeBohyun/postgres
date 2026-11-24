@@ -329,6 +329,9 @@ typedef struct
 									 * "unsigned" */
 	bool		initdb_new_cluster; /* run initdb before compatibility checks */
 	bool		print_initdb_options;	/* print source-derived initdb options */
+	bool		initdb_options_json;	/* print a JSON argument array */
+	char	   *initdb_database;	/* database supplying printed locale
+									 * settings */
 	bool		initdb_options_given;	/* --initdb-options given, even if
 										 * empty */
 	char	  **initdb_options; /* additional arguments to initdb */
@@ -434,6 +437,7 @@ FileNameMap *gen_db_file_maps(DbInfo *old_db,
 							  const char *new_pgdata);
 void		get_db_rel_and_slot_infos(ClusterInfo *cluster);
 void		get_template0_info(ClusterInfo *cluster);
+DbLocaleInfo *get_db_locale_info(ClusterInfo *cluster, const char *db_name);
 int			count_old_cluster_logical_slots(void);
 void		get_subscription_info(ClusterInfo *cluster);
 

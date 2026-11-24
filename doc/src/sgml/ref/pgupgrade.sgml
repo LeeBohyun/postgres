@@ -31,6 +31,13 @@ PostgreSQL documentation
    <arg choice="plain"><replaceable>newconfigdir</replaceable></arg>
    <arg rep="repeat"><replaceable>option</replaceable></arg>
   </cmdsynopsis>
+  <cmdsynopsis>
+   <command>pg_upgrade</command>
+   <arg choice="plain"><option>--print-initdb-options</option><arg choice="opt">=<replaceable>format</replaceable></arg></arg>
+   <arg choice="plain"><option>-b</option> <replaceable>oldbindir</replaceable></arg>
+   <arg choice="plain"><option>-d</option> <replaceable>oldconfigdir</replaceable></arg>
+   <arg rep="repeat"><replaceable>option</replaceable></arg>
+  </cmdsynopsis>
  </refsynopsisdiv>
 
  <refsect1>
@@ -201,7 +208,9 @@ PostgreSQL documentation
       <term><option>--socketdir=</option><replaceable>dir</replaceable></term>
       <listitem><para>directory to use for postmaster sockets during upgrade;
       default is current working directory; environment
-      variable <envar>PGSOCKETDIR</envar></para></listitem>
+      variable <envar>PGSOCKETDIR</envar>.  With
+      <option>--print-initdb-options</option>, the default is the printer's
+      private temporary directory.</para></listitem>
      </varlistentry>
 
      <varlistentry>
@@ -269,15 +278,17 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
-      <term><option>--print-initdb-options</option></term>
+      <term><option>--print-initdb-options</option><optional>=<replaceable>format</replaceable></optional></term>
       <listitem>
        <para>
         Print the <command>initdb</command> options derived from the old
         cluster and exit without initializing a new cluster or performing an
         upgrade.
         The output contains the old cluster's WAL segment size and
-        data-checksum setting, and the encoding and locale settings used by
-        <option>--initdb</option>.
+        data-checksum setting, and the encoding and locale settings of
+        <literal>template0</literal>, including custom ICU rules.
+        Use <option>--initdb-database</option> to select another database's
+        encoding and locale settings.
         It does not include a data directory, superuser name, authentication
         settings, or internal execution options.
         A wrapper can use these options when initializing the new cluster,
@@ -285,8 +296,10 @@ PostgreSQL documentation
         <application>pg_upgrade</application> normally.
        </para>
        <para>
-        Standard output contains one line of arguments quoted for the
-        platform's command shell.
+        The default format, <literal>shell</literal>, writes one line of
+        arguments quoted for the platform's command shell to standard output.
+        Values use the source database's encoding, independently of
+        <envar>PGCLIENTENCODING</envar>.
         As with <xref linkend="app-pgconfig"/>'s <option>--configure</option>
         output, shell quotation marks preserve arguments containing spaces.
         For example, in a POSIX shell script:
@@ -300,6 +313,18 @@ eval /new/bin/initdb --pgdata=/new/data "$initdb_options"
         that quoting instead of splitting the output on whitespace.
        </para>
        <para>
+        The <literal>json</literal> format writes a UTF-8 JSON array of
+        argument strings.  Each element is one complete argument, such as
+        <literal>--encoding=UTF8</literal>, without shell quotation marks.
+        When constructing a byte argument list, callers must encode decoded
+        ICU rules in the printed database encoding expected by
+        <command>initdb</command>.
+        JSON preserves embedded newlines and carriage returns, which are
+        rejected in <literal>shell</literal> format.
+        For example, use <option>--print-initdb-options=json</option> to
+        preserve multiline ICU rules.
+       </para>
+       <para>
         Progress messages and diagnostics from inspecting the old cluster
         are written to standard error.
         This mode requires the old cluster's binary and data directories,
@@ -311,12 +336,36 @@ eval /new/bin/initdb --pgdata=/new/data "$initdb_options"
        <para>
         The old server is started temporarily if it is stopped, and is left
         running if it is already running.
-        The current directory must be writable for diagnostic logs, which
-        are placed in <filename>pg_upgrade_output.d</filename>.
-        These logs are removed on success unless <option>--retain</option>
-        is specified.
+        Diagnostic logs and the default Unix-domain socket are placed in a
+        private temporary directory under <envar>TMPDIR</envar>, or the
+        platform's default temporary directory if it is unset.
+        Use <option>--socketdir</option> if that path is too long for a
+        Unix-domain socket or contains a comma, which
+        <application>libpq</application> treats as a host separator.
+        The current directory need not be writable.
+        Temporary files are removed on success unless
+        <option>--retain</option> is specified.
+        If temporary files are retained after failure or with
+        <option>--retain</option>, their location is reported on standard error.
         Printing initialization options does not perform the upgrade
         compatibility checks.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--initdb-database=</option><replaceable>dbname</replaceable></term>
+      <listitem>
+       <para>
+        Select the database supplying encoding and locale settings for
+        <option>--print-initdb-options</option>.  The default is
+        <literal>template0</literal>.
+        The printer connects to the selected database, except that it uses
+        <literal>template1</literal> to read <literal>template0</literal>,
+        which does not normally allow connections.
+        This option requires <option>--print-initdb-options</option> and does
+        not change the settings used by an ordinary upgrade or by
+        <option>--initdb</option>.
        </para>
       </listitem>
      </varlistentry>
@@ -1257,6 +1306,17 @@ psql --username=postgres --file=script.sql postgres
       <para>
        Cluster's install user name; option
        <option>-U</option>/<option>--username</option>.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><envar>TMPDIR</envar></term>
+     <listitem>
+      <para>
+       Parent directory for temporary files created by
+       <option>--print-initdb-options</option>.  If unset or empty, the
+       platform's default temporary directory is used.
       </para>
      </listitem>
     </varlistentry>
