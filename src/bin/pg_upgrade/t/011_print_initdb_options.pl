@@ -111,8 +111,7 @@ SKIP:
 	my $shell_arguments;
 	ok( run_log(
 			[
-				'sh', '-c',
-				q{eval "set -- $1" || exit; printf '%s\0' "$@"},
+				'sh', '-c', q{eval "set -- $1" || exit; printf '%s\0' "$@"},
 				'sh', $quoted_options,
 			],
 			'>' => \$shell_arguments),
@@ -120,7 +119,8 @@ SKIP:
 	is_deeply(
 		[ split /\0/, $shell_arguments ],
 		[ map { /^--lc-collate=/ ? "--lc-collate=$locale" : $_ } @options ],
-		'shell reuse preserves argument boundaries and literal metacharacters');
+		'shell reuse preserves argument boundaries and literal metacharacters'
+	);
 	$oldnode->safe_psql('postgres',
 		"UPDATE pg_database SET datcollate = 'C' WHERE datname = 'template0'"
 	);

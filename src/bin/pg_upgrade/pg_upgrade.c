@@ -779,9 +779,9 @@ get_old_cluster_initdb_info(void)
 
 
 /*
- * Append the source control data and template0 settings as shell-quoted
- * initdb arguments shared by --initdb and --print-initdb-options.
- * Exclude executable and target paths, the bootstrap user, and extra options.
+ * Append source-derived, shell-quoted initdb arguments shared by --initdb
+ * and --print-initdb-options. Callers supply the executable, target paths,
+ * bootstrap user, and additional options.
  */
 static void
 append_source_initdb_options(PQExpBuffer cmd)
