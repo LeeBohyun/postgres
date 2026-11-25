@@ -1550,10 +1550,10 @@ setup_config(void)
 
 
 /*
- * Save the external WAL directory's original state for
- * pg_upgrade --check --initdb. After checking, pg_upgrade removes generated
- * WAL files and newly created directories, preserves any pre-existing WAL
- * directory, and restores its original permissions.
+ * Save the external WAL directory's original state for pg_upgrade --initdb.
+ * After a successful --check or a failed compatibility check, pg_upgrade
+ * removes generated WAL files and newly created directories, preserves any
+ * pre-existing WAL directory, and restores its original permissions.
  */
 static void
 write_pg_upgrade_state(void)

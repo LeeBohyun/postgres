@@ -904,8 +904,8 @@ append_initdb_option(PQExpBuffer options, const char *name,
 /*
  * Append source-derived initdb arguments shared by --initdb and the printer.
  * Callers supply executable/target paths, bootstrap user and extra options.
- * Automatic initdb copies ICU rules later through SQL, so it need not send
- * multiline rules through a shell. The printer must include the rules.
+ * With --initdb, pg_upgrade copies ICU rules later through SQL, so it need
+ * not send multiline rules through a shell.  The printer must include them.
  */
 static void
 append_source_initdb_options(PQExpBuffer options, const DbLocaleInfo *locale,
