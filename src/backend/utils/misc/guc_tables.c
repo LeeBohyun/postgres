@@ -32,6 +32,7 @@
 #include "access/commit_ts.h"
 #include "access/gin.h"
 #include "access/htup_details.h"
+#include "access/pgupgrade_config.h"
 #include "access/slru.h"
 #include "access/toast_compression.h"
 #include "access/twophase.h"

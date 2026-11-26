@@ -10,11 +10,14 @@
 #include "postgres_fe.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "common/controldata_utils.h"
+#include "common/file_perm.h"
+#include "common/file_utils.h"
 #include "fe_utils/simple_list.h"
 #include "pg_upgrade.h"
 #include "pqexpbuffer.h"
@@ -398,4 +401,134 @@ finish_upgrade_preparation(void)
 	file->stream = NULL;
 	publish_upgrade_relink_file(relink_file);
 	pg_free(relink_file);
+}
+
+/* Copy history files for recovery on the retained old-cluster timeline. */
+static void
+copy_wal_timeline_history(void)
+{
+	char		waldir[MAXPGPATH];
+	DIR		   *dir;
+	struct dirent *de;
+
+	snprintf(waldir, sizeof(waldir), "%s/pg_wal", old_cluster.pgdata);
+	dir = opendir(waldir);
+	if (dir == NULL)
+		pg_fatal("could not open directory \"%s\": %m", waldir);
+	while ((de = readdir(dir)) != NULL)
+	{
+		char		source[MAXPGPATH];
+		char		dst[MAXPGPATH];
+
+		if (!IsTLHistoryFileName(de->d_name))
+			continue;
+		snprintf(source, sizeof(source), "%s/%s", waldir, de->d_name);
+		snprintf(dst, sizeof(dst), "%s/pg_wal/%s", new_cluster.pgdata,
+				 de->d_name);
+		copyFile(source, dst, "pg_wal", de->d_name);
+	}
+	closedir(dir);
+}
+
+/* Stage the segment containing the final old checkpoint for archiving. */
+static void
+stage_old_checkpoint_wal(void)
+{
+	ControlData *control = &old_cluster.controldata;
+	const char *name = control->chkpnt_redo_wal_file;
+	char		source[MAXPGPATH];
+	char		dst[MAXPGPATH];
+	char		status[MAXPGPATH];
+	struct stat st;
+	int			fd;
+
+	snprintf(status, sizeof(status), "%s/pg_wal/archive_status/%s.done",
+			 old_cluster.pgdata, name);
+	if (stat(status, &st) == 0)
+	{
+		if (!S_ISREG(st.st_mode))
+			pg_fatal("invalid old archive status file \"%s\"", status);
+		return;
+	}
+	if (errno != ENOENT)
+		pg_fatal("could not inspect old archive status \"%s\": %m", status);
+
+	snprintf(source, sizeof(source), "%s/pg_wal/%s", old_cluster.pgdata, name);
+	snprintf(dst, sizeof(dst), "%s/pg_wal/%s", new_cluster.pgdata, name);
+	if (stat(source, &st) != 0 || !S_ISREG(st.st_mode) ||
+		st.st_size != control->walseg)
+		pg_fatal("old checkpoint WAL file \"%s\" is missing or has an invalid size",
+				 source);
+	snprintf(status, sizeof(status), "%s/pg_wal/archive_status/%s.done",
+			 new_cluster.pgdata, name);
+	if (stat(status, &st) == 0)
+		pg_fatal("old checkpoint archive status already exists: \"%s\"", status);
+	if (errno != ENOENT)
+		pg_fatal("could not inspect archive status \"%s\": %m", status);
+	/* Reject an existing destination instead of replacing archived WAL. */
+	copyFile(source, dst, "pg_wal", name);
+	if (fsync_fname(dst, false) != 0 || fsync_parent_path(dst) != 0)
+		pg_fatal("could not synchronize staged old checkpoint WAL file \"%s\"",
+				 dst);
+
+	snprintf(status, sizeof(status), "%s/pg_wal/archive_status/%s.ready",
+			 new_cluster.pgdata, name);
+	fd = open(status, O_WRONLY | O_CREAT | O_EXCL | PG_BINARY,
+			  pg_file_create_mode);
+	if (fd < 0)
+		pg_fatal("could not create old checkpoint archive status \"%s\": %m",
+				 status);
+	if (close(fd) != 0 || fsync_fname(status, false) != 0 ||
+		fsync_parent_path(status) != 0)
+		pg_fatal("could not synchronize old checkpoint archive status \"%s\": %m",
+				 status);
+}
+
+void
+prepare_upgrade_archive(bool stage_checkpoint)
+{
+	copy_wal_timeline_history();
+	if (stage_checkpoint)
+		stage_old_checkpoint_wal();
+}
+
+char *
+get_old_cluster_archive_command(void)
+{
+	PGconn	   *conn = connectToServer(&old_cluster, "template1");
+	PGresult   *res;
+	char	   *mode;
+	char	   *cmd;
+	char	   *result = NULL;
+
+	res = executeQueryOrDie(conn,
+							"SELECT current_setting('archive_mode'), "
+							"current_setting('archive_command')");
+	mode = PQgetvalue(res, 0, 0);
+	cmd = PQgetvalue(res, 0, 1);
+
+	if (strcmp(mode, "off") != 0 &&
+		cmd[0] != '\0' &&
+		strcmp(cmd, "(disabled)") != 0)
+		result = pg_strdup(cmd);
+
+	PQclear(res);
+	PQfinish(conn);
+	return result;
+}
+
+void
+configure_upgrade_archive(const char *archive_command)
+{
+	PGconn	   *conn = connectToServer(&new_cluster, "template1");
+	char	   *literal = PQescapeLiteral(conn, archive_command,
+										  strlen(archive_command));
+
+	if (literal == NULL)
+		pg_fatal("could not quote archive_command: %s", PQerrorMessage(conn));
+	PQclear(executeQueryOrDie(conn, "ALTER SYSTEM SET archive_mode = 'on'"));
+	PQclear(executeQueryOrDie(conn, "ALTER SYSTEM SET archive_command = %s",
+							  literal));
+	PQfreemem(literal);
+	PQfinish(conn);
 }

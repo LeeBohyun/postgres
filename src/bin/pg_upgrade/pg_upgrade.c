@@ -94,6 +94,8 @@ ClusterInfo old_cluster,
 			new_cluster;
 OSInfo		os_info;
 
+static char *old_cluster_archive_command;
+
 /*
  * Track directories created by --initdb and the original permissions of
  * existing target and external WAL directories. Automatic cleanup uses
@@ -216,7 +218,8 @@ main(int argc, char **argv)
 
 	if (user_opts.wal_upgrade && !user_opts.check)
 		create_upgrade_preparation();
-	check_and_dump_old_cluster();
+	check_and_dump_old_cluster(user_opts.wal_upgrade && !user_opts.check ?
+							   &old_cluster_archive_command : NULL);
 
 
 	/* -- NEW -- */
@@ -255,6 +258,9 @@ main(int argc, char **argv)
 	prepare_new_globals();
 
 	create_new_objects();
+
+	if (old_cluster_archive_command != NULL)
+		configure_upgrade_archive(old_cluster_archive_command);
 
 	stop_postmaster(false);
 
@@ -345,6 +351,7 @@ main(int argc, char **argv)
 		snprintf(snapshots, sizeof(snapshots), "%s/pg_logical/snapshots", new_cluster.pgdata);
 		if (!rmtree(snapshots, false))
 			pg_fatal("could not remove pre-reset logical snapshots");
+		prepare_upgrade_archive(old_cluster_archive_command != NULL);
 	}
 
 	sync_new_cluster(user_opts.transfer_mode != TRANSFER_MODE_SWAP);

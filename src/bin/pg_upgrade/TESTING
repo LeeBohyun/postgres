@@ -77,3 +77,11 @@ emission. Run it from a configured build tree with:
 
 The tests use PostgreSQL::Test::Cluster and fresh temporary data directories.
 Crash checks require an assertion-enabled build.
+
+
+013_wal_upgrade_standby.pl checks XID-zero upgrade replay, a durable completion
+restartpoint, streaming and archive recovery, checksum-state adoption, inherited
+storage, restart, promotion, ordinary heap WAL, later sequence WAL, and rejection
+of a COMPLETE record without its completion checkpoint. Run it together with
+012_wal_upgrade.pl. Set oldinstall to a compatible installed source version for
+cross-major tests; without it, the fixtures use the current version as source.

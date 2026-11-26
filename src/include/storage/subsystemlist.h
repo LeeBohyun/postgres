@@ -33,6 +33,7 @@ PG_SHMEM_SUBSYSTEM(DSMRegistryShmemCallbacks)
 /* xlog, clog, and buffers */
 PG_SHMEM_SUBSYSTEM(VarsupShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(XLOGShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(PgUpgradeShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(XLogPrefetchShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(XLogRecoveryShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(CLOGShmemCallbacks)

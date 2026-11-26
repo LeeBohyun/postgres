@@ -306,6 +306,16 @@ SetDatabasePath(const char *path)
 void
 checkDataDir(void)
 {
+	checkDataDirPermissions();
+
+	/* Check for PG_VERSION */
+	ValidatePgVersion(DataDir);
+}
+
+/* Validate DataDir ownership and permissions and set file-creation modes. */
+void
+checkDataDirPermissions(void)
+{
 	struct stat stat_buf;
 
 	Assert(DataDir);
@@ -388,8 +398,6 @@ checkDataDir(void)
 	data_directory_mode = pg_dir_create_mode;
 #endif
 
-	/* Check for PG_VERSION */
-	ValidatePgVersion(DataDir);
 }
 
 /*

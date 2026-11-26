@@ -384,7 +384,7 @@ extern OSInfo os_info;
 /* check.c */
 
 void		output_check_banner(void);
-void		check_and_dump_old_cluster(void);
+void		check_and_dump_old_cluster(char **archive_command);
 void		check_new_cluster(void);
 void		report_clusters_compatible(void);
 void		issue_warnings_and_set_wal_level(void);
@@ -468,6 +468,9 @@ void		sync_new_cluster(bool sync_data_files);
 void		create_upgrade_preparation(void);
 void		prepare_upgrade_old_cluster(void);
 void		finish_upgrade_preparation(void);
+void		prepare_upgrade_archive(bool stage_checkpoint);
+char	   *get_old_cluster_archive_command(void);
+void		configure_upgrade_archive(const char *archive_command);
 
 /* relfilenumber.c */
 

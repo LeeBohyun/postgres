@@ -59,6 +59,18 @@ extern ssize_t pg_pwritev_with_retry(int fd,
 
 extern ssize_t pg_pwrite_zeros(int fd, size_t size, pgoff_t offset);
 
+typedef enum PGReflinkResult
+{
+	PG_REFLINK_OK,
+	PG_REFLINK_UNSUPPORTED,
+	PG_REFLINK_ERROR,
+} PGReflinkResult;
+
+extern PGReflinkResult pg_clone_file(const char *source, const char *dst,
+									 int *save_errno);
+extern PGReflinkResult pg_copy_file_range_all(const char *source, const char *dst,
+											  int *save_errno);
+
 /* Filename components */
 #define PG_TEMP_FILES_DIR "pgsql_tmp"
 #define PG_TEMP_FILE_PREFIX "pgsql_tmp"

@@ -1878,9 +1878,12 @@ Oid
 Oid8
 OidOptions
 OkeysState
+OldControlField
+OldControlFieldType
 OldMultiXactReader
 OldToNewMapping
 OldToNewMappingData
+OldUpgradeControlData
 OnCommitAction
 OnCommitItem
 OnConflictAction
@@ -1951,6 +1954,7 @@ PGP_S2K
 PGPing
 PGQueryClass
 PGRUsage
+PGReflinkResult
 PGSemaphore
 PGSemaphoreData
 PGShmemHeader
@@ -2356,6 +2360,8 @@ PgStat_TableCountsXact
 PgStat_TableXactStatus
 PgStat_WalCounters
 PgStat_WalStats
+PgUpgradeCheckpointState
+PgUpgradeControlData
 PgUpgradeRelinkOperation
 PgXmlErrorContext
 PgXmlStrictness
@@ -2654,6 +2660,9 @@ ReplOriginXactState
 ReplaceVarsFromTargetList_context
 ReplaceVarsNoMatchOption
 ReplaceWrapOption
+ReplayFileIdentity
+ReplayRelinkState
+ReplayStorageRoot
 ReplicaIdentityStmt
 ReplicationKind
 ReplicationSlot
@@ -3327,6 +3336,8 @@ UnresolvedTupData
 UpdateContext
 UpdateStmt
 UpgradeCommandReader
+UpgradeRecordState
+UpgradeRecoveryMode
 UpgradeRelinkFile
 UpgradeTask
 UpgradeTaskProcessCB
@@ -3334,6 +3345,9 @@ UpgradeTaskReport
 UpgradeTaskSlot
 UpgradeTaskSlotState
 UpgradeTaskStep
+UpgradeWalReadPrivate
+UpgradeWalSegment
+UpgradeWalWindow
 UploadManifestCmd
 UpperRelationKind
 UserAuth

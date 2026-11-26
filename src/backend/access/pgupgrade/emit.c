@@ -261,8 +261,7 @@ write_control_file_image(void)
 	(void) PgUpgradeInsertRawFileRecord(path, buffer, PG_CONTROL_FILE_SIZE, 0);
 
 	/*
-	 * Record the current parameter and checksum state after the pg_control
-	 * image.
+	 * Record the current parameter settings after the pg_control image.
 	 */
 	XLogReportCurrentControlState();
 

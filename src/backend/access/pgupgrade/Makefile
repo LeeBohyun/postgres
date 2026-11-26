@@ -13,9 +13,12 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	config.o \
+	control.o \
 	emit.o \
 	first_start.o \
 	records.o \
-	redo.o
+	replay.o \
+	startup.o
 
 include $(top_srcdir)/src/backend/common.mk

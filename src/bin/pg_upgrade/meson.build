@@ -75,6 +75,7 @@ tests += {
       't/010_initdb_option.pl',
       't/011_print_initdb_options.pl',
       't/012_wal_upgrade.pl',
+      't/013_wal_upgrade_standby.pl',
     ],
     'deps': [test_ext],
     'test_kwargs': {'priority': 40}, # pg_upgrade tests are slow

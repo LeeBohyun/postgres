@@ -638,6 +638,27 @@ pg_upgrade --initdb --initdb-options='-c huge_pages=off --waldir=/wal/new' ...
         storage; the source-reuse restrictions of the chosen transfer mode
         still apply.
        </para>
+       <para>
+        To upgrade a physical standby, retain its old-version data directory
+        at the old primary's final shutdown checkpoint. Start a new-version
+        skeleton with <filename>standby.signal</filename> and
+        <filename>pg_upgrade.signal</filename>, and set
+        <xref linkend="guc-pg-upgrade-standby-old-datadir"/> to that retained
+        directory. Begin streaming without <varname>primary_slot_name</varname>
+        and with <varname>wal_receiver_create_temp_slot</varname> disabled.
+        Keep the upgrade WAL available until the standby finishes replay.
+        Recovery remains blocked from serving queries, promotion, and normal
+        completion until the completion restartpoint is durable.
+       </para>
+       <para>
+        For archive recovery, restore a pre-upgrade backup and recover it with
+        the old binaries through the final old-version checkpoint. Then switch
+        to the new binaries with <filename>recovery.signal</filename> and
+        <filename>pg_upgrade.signal</filename>. The upgrade preserves active
+        archiving settings and stages the boundary WAL for the new archiver;
+        archiving is asynchronous, so verify that the required WAL has reached
+        the archive before relying on it for recovery.
+       </para>
       </listitem>
      </varlistentry>
     </variablelist>

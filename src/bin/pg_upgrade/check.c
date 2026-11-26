@@ -565,12 +565,15 @@ output_check_banner(void)
 
 
 void
-check_and_dump_old_cluster(void)
+check_and_dump_old_cluster(char **archive_command)
 {
 	/* -- OLD -- */
 
 	if (!user_opts.live_check)
 		start_postmaster(&old_cluster, true);
+
+	if (archive_command != NULL)
+		*archive_command = get_old_cluster_archive_command();
 
 	/*
 	 * First check that all databases allow connections since we'll otherwise
