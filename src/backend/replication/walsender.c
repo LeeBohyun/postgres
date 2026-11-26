@@ -861,7 +861,9 @@ HandleUploadManifestPacket(StringInfo buf, off_t *offset,
 static bool
 WalSndInPgUpgradeHandoff(void)
 {
-	return pg_upgrade_handoff_pending;
+	return pg_upgrade_handoff_pending ||
+		(RecoveryInProgress() &&
+		 XLogRecPtrIsValid(GetPgUpgradeHandoffRetention()));
 }
 
 /*

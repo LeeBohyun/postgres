@@ -85,3 +85,27 @@ Failed frontend shutdown leaves a fallback stop available. A target that still
 runs after both stop attempts keeps its data directory. An interrupted HANDOFF
 must be resolved against the old primary and standby state before retrying;
 do not remove a request file while a postmaster could still consume it.
+
+
+Cascaded standbys and WAL retention
+----------------------------------
+
+Primary completion confirms receipt by its direct standbys. Each relay also
+waits for its own persistent physical slots before declaring its HANDOFF pause
+complete. An offline leaf therefore keeps the relay waiting, including across
+relay restart, while the primary can finish after receiving the relay's receipt.
+
+pg_upgrade recreates the primary's physical slots. First startup reserves their
+WAL at the bootstrap redo position before emitting upgrade records. A new relay
+validates its retained old slot files and reserves slots for its children before
+replay can checkpoint or recycle WAL. Slot names and reservations are local to
+each parent; they are not transmitted in upgrade WAL.
+
+Keep fsync enabled, max_slot_wal_keep_size = -1, and
+idle_replication_slot_timeout = 0 while these reservations are inactive. Each
+parent needs enough max_replication_slots and wal_level = replica or higher.
+These settings are checked before primary HANDOFF and again during migration.
+Bootstrap every new standby without consuming the migrated upstream slot and
+keep wal_receiver_create_temp_slot disabled. Once all nodes have replayed the
+upgrade, activate primary_slot_name from the leaves upward. This order preserves
+the replay-start WAL for descendants that have not yet finished.

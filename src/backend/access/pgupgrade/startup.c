@@ -18,6 +18,7 @@
 
 #include "access/pgupgrade_config.h"
 #include "access/pgupgrade_control.h"
+#include "access/pgupgrade_retention_slots.h"
 #include "access/pgupgrade_wal.h"
 #include "access/timeline.h"
 #include "access/xlog.h"
@@ -943,6 +944,9 @@ ArmFromLocalStandby(void)
 						"recovery")));
 
 	ReadOldUpgradeControlData(old_datadir, &old_control);
+	PgUpgradePreparePhysicalSlotMigration(old_datadir,
+										  old_control.major_version,
+										  old_control.checkpoint_end_lsn);
 	if (old_control.wal_segment_size != wal_segment_size)
 		ereport(FATAL,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

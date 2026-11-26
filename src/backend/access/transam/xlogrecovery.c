@@ -1840,6 +1840,14 @@ PerformWalRecovery(void)
 				break;
 			}
 
+			/*
+			 * Honor a pause requested while applying this record before
+			 * reading another.
+			 */
+			if (((volatile XLogRecoveryCtlData *) XLogRecoveryCtl)->recoveryPauseState !=
+				RECOVERY_NOT_PAUSED)
+				recoveryPausesHere(false);
+
 			/* Else, try to fetch the next WAL record */
 			record = ReadRecord(xlogprefetcher, LOG, false, replayTLI);
 		} while (record != NULL);

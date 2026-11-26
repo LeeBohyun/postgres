@@ -21,6 +21,7 @@ OBJS = \
 	handoff_receipt.o \
 	records.o \
 	replay.o \
+	retention_slots.o \
 	startup.o
 
 include $(top_srcdir)/src/backend/common.mk

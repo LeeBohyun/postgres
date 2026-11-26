@@ -18,12 +18,14 @@
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_class_d.h"
 #include "common/file_utils.h"
+#include "common/string.h"
 #include "fe_utils/string_utils.h"
 #include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
 #include "common/unicode_version.h"
 
 static void check_new_cluster_is_empty(void);
+static void check_new_cluster_physical_replication_slots(void);
 static void arm_pg_upgrade_handoff(void);
 static void finish_pg_upgrade_handoff(void);
 static void set_pg_upgrade_handoff_signal_handlers(pqsigfunc handler);
@@ -1077,6 +1079,102 @@ wait_for_wal_upgrade_standbys(PGconn *conn)
 }
 
 
+/* Read persistent settings without pg_upgrade's temporary startup overrides. */
+static char *
+new_cluster_startup_setting(const char *name)
+{
+	PQExpBufferData command;
+	char	   *program = psprintf("%s/postgres", new_cluster.bindir);
+	char	   *value;
+
+	initPQExpBuffer(&command);
+	appendShellString(&command, program);
+	pg_free(program);
+	appendPQExpBufferStr(&command, " -D ");
+	appendShellString(&command, new_cluster.pgconfig);
+	appendPQExpBuffer(&command, " -C %s", name);
+	value = pipe_read_line(command.data);
+	termPQExpBuffer(&command);
+	if (value == NULL)
+		pg_fatal("could not read new-cluster setting \"%s\"", name);
+	pg_strip_crlf(value);
+	return value;
+}
+
+static void
+check_new_cluster_physical_replication_slots(void)
+{
+	int			required;
+	int			existing_slots;
+	PGconn	   *conn;
+	PGresult   *res;
+	char	   *value;
+
+	if (!user_opts.wal_upgrade || old_cluster.phys_slot_arr.nslots == 0)
+		return;
+	prep_status("Checking physical replication slot retention settings");
+	/* Binary-upgrade slot creation would otherwise accept this reserved name. */
+	for (int i = 0; i < old_cluster.phys_slot_arr.nslots; i++)
+	{
+		const char *name = old_cluster.phys_slot_arr.slotnames[i];
+
+		if (strcmp(name, "pg_conflict_detection") == 0)
+			pg_fatal("physical replication slot \"%s\" uses a name reserved in the new cluster; drop and recreate it under another name before upgrading",
+					 name);
+	}
+	required = old_cluster.phys_slot_arr.nslots +
+		count_old_cluster_logical_slots() +
+		(old_cluster.sub_retain_dead_tuples ? 1 : 0);
+	conn = connectToServer(&new_cluster, "template1");
+	res = executeQueryOrDie(conn,
+							"SELECT slot_name FROM pg_catalog.pg_replication_slots "
+							"WHERE temporary IS FALSE");
+	existing_slots = PQntuples(res);
+	if (existing_slots > 0)
+	{
+		char	  **names = pg_malloc_array(char *, existing_slots);
+
+		for (int i = 0; i < existing_slots; i++)
+			names[i] = PQgetvalue(res, i, 0);
+		qsort(names, existing_slots, sizeof(char *), pg_qsort_strcmp);
+		for (int i = 0; i < old_cluster.phys_slot_arr.nslots; i++)
+		{
+			const char *name = old_cluster.phys_slot_arr.slotnames[i];
+
+			if (bsearch(&name, names, existing_slots, sizeof(char *),
+						pg_qsort_strcmp) != NULL)
+				pg_fatal("physical replication slot \"%s\" already exists in the new cluster",
+						 name);
+		}
+		pg_free(names);
+	}
+	PQclear(res);
+	PQfinish(conn);
+	required += existing_slots;
+	value = new_cluster_startup_setting("max_replication_slots");
+	if (atoi(value) < required)
+		pg_fatal("\"max_replication_slots\" must be at least %d to preserve the old cluster's replication slots",
+				 required);
+	pg_free(value);
+	value = new_cluster_startup_setting("max_slot_wal_keep_size");
+	if (strcmp(value, "-1") != 0)
+		pg_fatal("\"max_slot_wal_keep_size\" must be -1 while migrated physical slots are inactive");
+	pg_free(value);
+	value = new_cluster_startup_setting("idle_replication_slot_timeout");
+	if (strcmp(value, "0") != 0)
+		pg_fatal("\"idle_replication_slot_timeout\" must be 0 while migrated physical slots are inactive");
+	pg_free(value);
+	value = new_cluster_startup_setting("wal_level");
+	if (strcmp(value, "minimal") == 0)
+		pg_fatal("\"wal_level\" must be replica or logical to preserve physical replication slots");
+	pg_free(value);
+	value = new_cluster_startup_setting("fsync");
+	if (strcmp(value, "on") != 0)
+		pg_fatal("\"fsync\" must be on to preserve physical replication slots");
+	pg_free(value);
+	check_ok();
+}
+
 void
 check_new_cluster(void)
 {
@@ -1121,6 +1219,7 @@ check_new_cluster(void)
 	check_for_new_tablespace_dir();
 
 	check_new_cluster_replication_slots();
+	check_new_cluster_physical_replication_slots();
 
 	check_new_cluster_subscription_configuration();
 }

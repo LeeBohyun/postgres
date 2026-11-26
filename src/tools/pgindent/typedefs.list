@@ -1881,6 +1881,7 @@ OkeysState
 OldControlField
 OldControlFieldType
 OldMultiXactReader
+OldReplicationSlotPrefix
 OldToNewMapping
 OldToNewMappingData
 OldUpgradeControlData
@@ -2367,6 +2368,7 @@ PgUpgradeHandoffPhase
 PgUpgradeHandoffProbe
 PgUpgradeHandoffSlot
 PgUpgradeRelinkOperation
+PgUpgradeSlotMigration
 PgXmlErrorContext
 PgXmlStrictness
 Pg_abi_values

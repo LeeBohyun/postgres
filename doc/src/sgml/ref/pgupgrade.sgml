@@ -662,6 +662,21 @@ pg_upgrade --initdb --initdb-options='-c huge_pages=off --waldir=/wal/new' ...
         completion until the completion restartpoint is durable.
        </para>
        <para>
+        Physical slots are recreated on the upgraded primary and on relays,
+        with WAL reserved before emission or replay. A relay independently
+        waits for its children to receive the final old-version checkpoint;
+        primary completion confirms only direct standby receipt. Keep
+        <varname>fsync</varname> enabled,
+        <varname>max_slot_wal_keep_size</varname> set to <literal>-1</literal>,
+        and <varname>idle_replication_slot_timeout</varname> set to
+        <literal>0</literal> while migrated slots are inactive. Each parent
+        needs enough <varname>max_replication_slots</varname> and
+        <varname>wal_level</varname> of <literal>replica</literal> or higher.
+        Bootstrap new standbys without using these slots. After every node
+        has replayed the upgrade, activate <varname>primary_slot_name</varname>
+        from the leaves upward to preserve WAL needed by descendants.
+       </para>
+       <para>
         For archive recovery, restore a pre-upgrade backup and recover it with
         the old binaries through the final old-version checkpoint. Then switch
         to the new binaries with <filename>recovery.signal</filename> and

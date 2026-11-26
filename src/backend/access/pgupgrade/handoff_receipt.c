@@ -47,9 +47,6 @@ snapshot_handoff_slots(int *nslots)
 	int			max_slots = max_replication_slots + max_repack_replication_slots;
 
 	*nslots = 0;
-	/* Cascaded standby acknowledgement is added by the next stack layer. */
-	if (RecoveryInProgress())
-		return NULL;
 	if (max_slots == 0)
 		return NULL;
 

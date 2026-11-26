@@ -54,6 +54,7 @@
 #include "access/pgupgrade_first_start.h"
 #include "access/pgupgrade_handoff.h"
 #include "access/pgupgrade_handoff_receipt.h"
+#include "access/pgupgrade_retention_slots.h"
 #include "access/pgupgrade_wal.h"
 #include "access/rewriteheap.h"
 #include "access/subtrans.h"
@@ -6515,6 +6516,8 @@ StartupXLOG(void)
 	lastFullPageWrites = checkPoint.fullPageWrites;
 
 	RedoRecPtr = XLogCtl->RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
+	/* Reserve each relay's upgrade WAL before replay can checkpoint. */
+	PgUpgradeCreateMigratedPhysicalSlots(checkPoint.redo);
 	doPageWrites = lastFullPageWrites;
 
 	/* REDO */

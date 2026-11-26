@@ -9,5 +9,6 @@ backend_sources += files(
   'handoff_receipt.c',
   'records.c',
   'replay.c',
+  'retention_slots.c',
   'startup.c',
 )

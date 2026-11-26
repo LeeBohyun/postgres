@@ -16,6 +16,7 @@
 
 #include "access/pgupgrade_emit.h"
 #include "access/pgupgrade_first_start.h"
+#include "access/pgupgrade_retention_slots.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
@@ -115,6 +116,8 @@ PgUpgradeRunFirstStart(void)
 
 	ereport(LOG,
 			(errmsg("emitting upgrade WAL during exclusive startup")));
+
+	PgUpgradeResetPhysicalSlotsForEmission(PgUpgradeFirstStartRedo());
 
 	complete_lsn = PgUpgradeEmitWalFile();
 	checkpoint_end = PgUpgradeCompletionCheckPoint(complete_lsn);

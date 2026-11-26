@@ -93,3 +93,9 @@ target after failed cleanup. 019_handoff_cancellation.pl covers durable
 cancellation, independent manual pauses, promotion checks, request consumption,
 and failure cleanup. These tests require HANDOFF support in the source binaries;
 the cancellation fixture always uses the current installation.
+
+016_wal_upgrade_cascade.pl and 017_cascade_handoff.pl check cascaded HANDOFF,
+offline-leaf receipt, and relay restart. 018_physical_slot_retention.pl checks
+preflight slot conflicts and retention settings, retained-slot corruption,
+upgrade-WAL reservation across checkpoints and restarts without wal_keep_size,
+leaf-first slot activation, and later sequence, heap, and index WAL.

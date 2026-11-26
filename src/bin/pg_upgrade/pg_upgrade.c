@@ -88,6 +88,7 @@ static void append_source_initdb_options(PQExpBuffer options,
 static void build_new_cluster_initdb_cmd(PQExpBuffer cmd);
 static void create_new_cluster_via_initdb(void);
 static void create_logical_replication_slots(void);
+static void create_physical_replication_slots(void);
 static void create_conflict_detection_slot(void);
 
 ClusterInfo old_cluster,
@@ -337,7 +338,8 @@ main(int argc, char **argv)
 	 * replicated. It can only protect tuples that might be deleted after the
 	 * new cluster starts.
 	 */
-	if (migrate_logical_slots || old_cluster.sub_retain_dead_tuples)
+	if (migrate_logical_slots || old_cluster.sub_retain_dead_tuples ||
+		(user_opts.wal_upgrade && old_cluster.phys_slot_arr.nslots > 0))
 	{
 		start_postmaster(&new_cluster, true);
 
@@ -346,6 +348,9 @@ main(int argc, char **argv)
 
 		if (old_cluster.sub_retain_dead_tuples)
 			create_conflict_detection_slot();
+
+		if (user_opts.wal_upgrade && old_cluster.phys_slot_arr.nslots > 0)
+			create_physical_replication_slots();
 
 		stop_postmaster(false);
 	}
@@ -1753,6 +1758,30 @@ create_logical_replication_slots(void)
 	check_ok();
 
 	return;
+}
+
+/* First startup reserves these slots after the final preparation WAL reset. */
+static void
+create_physical_replication_slots(void)
+{
+	PGconn	   *conn = connectToServer(&new_cluster, "template1");
+
+	prep_status("Restoring physical replication slots in the new cluster");
+	for (int i = 0; i < old_cluster.phys_slot_arr.nslots; i++)
+	{
+		const char *name = old_cluster.phys_slot_arr.slotnames[i];
+		char	   *literal = PQescapeLiteral(conn, name, strlen(name));
+
+		if (literal == NULL)
+			pg_fatal("could not quote physical replication slot name: %s",
+					 PQerrorMessage(conn));
+		PQclear(executeQueryOrDie(conn,
+								  "SELECT pg_catalog.pg_create_physical_replication_slot(%s, false)",
+								  literal));
+		PQfreemem(literal);
+	}
+	PQfinish(conn);
+	check_ok();
 }
 
 /*
