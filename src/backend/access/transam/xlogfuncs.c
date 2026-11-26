@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "access/htup_details.h"
+#include "access/pgupgrade_handoff.h"
 #include "access/xlog_internal.h"
 #include "access/xlogbackup.h"
 #include "access/xlogrecovery.h"
@@ -592,6 +593,7 @@ pg_wal_replay_resume(PG_FUNCTION_ARGS)
 						 "pg_wal_replay_resume()")));
 
 	SetRecoveryPause(false);
+	PgUpgradeWaitForHandoffCancellation();
 
 	PG_RETURN_VOID();
 }

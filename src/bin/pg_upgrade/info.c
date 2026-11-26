@@ -869,6 +869,83 @@ count_old_cluster_logical_slots(void)
 	return slot_count;
 }
 
+/* Collect the persistent physical slots that must acknowledge HANDOFF. */
+void
+get_old_cluster_physical_slot_infos(void)
+{
+	PGconn	   *conn;
+	PGresult   *res;
+	char	  **slotnames = NULL;
+	int			num_slots;
+	int			i_invalidation_reason;
+	int			i_restart_lsn;
+	int			i_slotname;
+	int			i_wal_status;
+	uint32		old_major_version =
+		GET_MAJOR_VERSION(old_cluster.major_version);
+
+	old_cluster.phys_slot_arr.slotnames = NULL;
+	old_cluster.phys_slot_arr.nslots = 0;
+
+	if (!user_opts.wal_upgrade ||
+		old_major_version < 904)
+		return;
+
+	conn = connectToServer(&old_cluster, "template1");
+	res = executeQueryOrDie(conn,
+							"SELECT slot_name, restart_lsn::text AS restart_lsn, "
+							"       %s AS wal_status, %s AS invalidation_reason "
+							"FROM pg_catalog.pg_replication_slots "
+							"WHERE slot_type = 'physical' AND "
+							"      %s AND "
+							"      %s "
+							"ORDER BY slot_name",
+							old_major_version >= 1300 ?
+							"wal_status" : "NULL::text",
+							old_major_version >= 1700 ?
+							"invalidation_reason" : "NULL::text",
+							old_major_version >= 1000 ?
+							"temporary IS FALSE" : "true",
+							old_major_version >= 1900 ?
+							"slot_name <> 'pg_conflict_detection'" : "true");
+
+	num_slots = PQntuples(res);
+	i_slotname = PQfnumber(res, "slot_name");
+	i_restart_lsn = PQfnumber(res, "restart_lsn");
+	i_wal_status = PQfnumber(res, "wal_status");
+	i_invalidation_reason = PQfnumber(res, "invalidation_reason");
+
+	if (num_slots > 0)
+	{
+		slotnames = pg_malloc_array(char *, num_slots);
+		for (int slotnum = 0; slotnum < num_slots; slotnum++)
+			slotnames[slotnum] =
+				pg_strdup(PQgetvalue(res, slotnum, i_slotname));
+	}
+
+	old_cluster.phys_slot_arr.slotnames = slotnames;
+	old_cluster.phys_slot_arr.nslots = num_slots;
+	for (int slotnum = 0; slotnum < num_slots; slotnum++)
+	{
+		const char *slotname = slotnames[slotnum];
+
+		if (PQgetisnull(res, slotnum, i_restart_lsn))
+			pg_fatal("physical replication slot \"%s\" has no restart LSN; initialize its standby or drop the stale slot before upgrading",
+					 slotname);
+		if (!PQgetisnull(res, slotnum, i_invalidation_reason))
+			pg_fatal("physical replication slot \"%s\" is invalidated (%s); recreate its standby and slot or drop the stale slot before upgrading",
+					 slotname,
+					 PQgetvalue(res, slotnum, i_invalidation_reason));
+		if (!PQgetisnull(res, slotnum, i_wal_status) &&
+			strcmp(PQgetvalue(res, slotnum, i_wal_status), "lost") == 0)
+			pg_fatal("physical replication slot \"%s\" has lost required WAL; recreate its standby and slot or drop the stale slot before upgrading",
+					 slotname);
+	}
+
+	PQclear(res);
+	PQfinish(conn);
+}
+
 /*
  * get_subscription_info()
  *

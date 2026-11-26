@@ -91,6 +91,7 @@
 
 #include "access/pgupgrade_control.h"
 #include "access/pgupgrade_first_start.h"
+#include "access/pgupgrade_handoff.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
@@ -369,6 +370,9 @@ static PMState pmState = PM_INIT;
  * It is of no interest unless pmState is PM_RUN or PM_HOT_STANDBY.
  */
 static bool connsAllowed = true;
+
+/* Allow physical standbys to reconnect during HANDOFF shutdown. */
+static bool PgUpgradeHandoffShutdown = false;
 
 /* Start time of SIGKILL timeout during immediate shutdown or child crash */
 /* Zero means timeout is not running */
@@ -1862,6 +1866,9 @@ canAcceptConnections(BackendType backend_type)
 	 */
 	if (pmState != PM_RUN && pmState != PM_HOT_STANDBY)
 	{
+		if (PgUpgradeHandoffShutdown && backend_type == B_BACKEND &&
+			pmState == PM_WAIT_XLOG_SHUTDOWN)
+			return CAC_UPGRADE_HANDOFF;
 		if (Shutdown > NoShutdown)
 			return CAC_SHUTDOWN;	/* shutdown is pending */
 		else if (!FatalError && pmState == PM_STARTUP)
@@ -2139,6 +2146,9 @@ process_pm_shutdown_request(void)
 	}
 	else
 		mode = SmartShutdown;
+
+	if (mode != ImmediateShutdown && PgUpgradeHandoffIsArmed())
+		PgUpgradeHandoffShutdown = true;
 
 	switch (mode)
 	{
@@ -3646,7 +3656,7 @@ BackendStartup(ClientSocket *client_sock)
 	 * slots) cleanly.
 	 */
 	cac = canAcceptConnections(B_BACKEND);
-	if (cac == CAC_OK)
+	if (cac == CAC_OK || cac == CAC_UPGRADE_HANDOFF)
 	{
 		/* Can change later to B_WAL_SENDER */
 		bn = AssignPostmasterChildSlot(B_BACKEND);
@@ -3926,6 +3936,12 @@ process_pm_pmsignal(void)
 			/* Waken archiver for the last time */
 			if (PgArchPMChild != NULL)
 				signal_child(PgArchPMChild, SIGUSR2);
+
+			if (PgUpgradeHandoffShutdown)
+			{
+				SignalChildren(SIGTERM, btmask(B_BACKEND));
+				WalSndInitStopping();
+			}
 
 			/*
 			 * Waken walsenders for the last time. No regular backends should

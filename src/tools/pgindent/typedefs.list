@@ -2362,12 +2362,17 @@ PgStat_WalCounters
 PgStat_WalStats
 PgUpgradeCheckpointState
 PgUpgradeControlData
+PgUpgradeHandoffCancellation
+PgUpgradeHandoffPhase
+PgUpgradeHandoffProbe
+PgUpgradeHandoffSlot
 PgUpgradeRelinkOperation
 PgXmlErrorContext
 PgXmlStrictness
 Pg_abi_values
 Pg_finfo_record
 Pg_magic_struct
+PhysicalSlotNameArr
 PipeProtoChunk
 PipeProtoHeader
 PlaceHolderInfo
@@ -4529,6 +4534,7 @@ xl_multixact_truncate
 xl_overwrite_contrecord
 xl_parameter_change
 xl_pg_upgrade_complete
+xl_pg_upgrade_handoff
 xl_pg_upgrade_key
 xl_pg_upgrade_marker
 xl_pg_upgrade_rawfile

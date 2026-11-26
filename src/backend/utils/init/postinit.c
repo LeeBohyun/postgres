@@ -964,9 +964,11 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	}
 
 	/*
-	 * Binary upgrades only allowed super-user connections
+	 * Binary upgrade mode allows physical replication connections for
+	 * HANDOFF. Other connections are restricted to superusers.
 	 */
-	if (IsBinaryUpgrade && !am_superuser)
+	if (IsBinaryUpgrade && !am_superuser &&
+		(!am_walsender || am_db_walsender))
 	{
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),

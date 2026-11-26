@@ -60,3 +60,28 @@ Bootstrap streaming does not consume a replication slot. Operators must keep
 upgrade WAL and the retained old data available for the whole replay. Transfer
 mode requirements apply to inherited files; copy keeps its source, while link
 and swap have their usual source-reuse restrictions.
+
+
+Automatic standby handoff
+-------------------------
+
+Before the final old-primary shutdown, pg_upgrade checks that every required
+persistent physical slot has a valid restart position and a connected streaming
+standby. It starts a guarded smart shutdown, durably arms the request, rechecks
+the slot set, and then releases the guard. HANDOFF needs matching support in the
+old primary and its standbys. Their configured replication listeners remain
+available during this phase; ordinary binary-upgrade starts keep TCP disabled.
+
+The old primary durably removes pg_upgrade_handoff.pending before emitting
+HANDOFF immediately before its shutdown checkpoint. It waits for each required
+slot to confirm durable receipt of the checkpoint and saves those positions.
+A standby persists the checkpoint as a restartpoint, then pauses. Restarting the
+old-version standby restores the pause. pg_wal_replay_resume() durably cancels
+that HANDOFF before acknowledging the request; cancellation preserves a later
+manual pause and does not suppress a future HANDOFF. Promotion is blocked while
+HANDOFF is active.
+
+Failed frontend shutdown leaves a fallback stop available. A target that still
+runs after both stop attempts keeps its data directory. An interrupted HANDOFF
+must be resolved against the old primary and standby state before retrying;
+do not remove a request file while a postmaster could still consume it.

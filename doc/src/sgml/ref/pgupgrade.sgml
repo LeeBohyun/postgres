@@ -639,6 +639,17 @@ pg_upgrade --initdb --initdb-options='-c huge_pages=off --waldir=/wal/new' ...
         still apply.
        </para>
        <para>
+        The old primary and its standbys must support the upgrade HANDOFF
+        record. Before the final shutdown, every required persistent physical
+        slot must have a valid restart position and a connected streaming
+        standby. The old primary waits for durable receipt of its final
+        checkpoint. Each standby persists that checkpoint and pauses; the
+        pause survives restart. Use <function>pg_wal_replay_resume()</function>
+        to durably cancel HANDOFF when abandoning the upgrade. Promotion is
+        blocked until HANDOFF is cancelled. Do not remove a pending HANDOFF
+        request while an old-primary postmaster could consume it.
+       </para>
+       <para>
         To upgrade a physical standby, retain its old-version data directory
         at the old primary's final shutdown checkpoint. Start a new-version
         skeleton with <filename>standby.signal</filename> and

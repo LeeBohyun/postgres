@@ -5,6 +5,8 @@ backend_sources += files(
   'control.c',
   'emit.c',
   'first_start.c',
+  'handoff.c',
+  'handoff_receipt.c',
   'records.c',
   'replay.c',
   'startup.c',

@@ -368,4 +368,37 @@ unlike(
 	qr/PG_UPGRADE_(?:START|COMPLETE)/,
 	'validation failure emits neither START nor COMPLETE');
 
+my $archive_old = PostgreSQL::Test::Cluster->new('archive_old');
+my $archive_new = PostgreSQL::Test::Cluster->new('archive_new');
+$archive_old->init(allows_streaming => 1);
+$archive_old->append_conf('postgresql.conf',
+	"archive_mode = on\narchive_command = 'false'\n");
+$archive_old->start;
+$archive_old->safe_psql('postgres',
+	'CREATE TABLE archived_data (id int); INSERT INTO archived_data VALUES (1)'
+);
+$archive_old->stop;
+
+command_ok(
+	upgrade_command($archive_old, $archive_new),
+	'upgrade preserves an active archive command');
+
+my $archive_control = read_control($archive_old);
+my ($old_checkpoint_segment) =
+  $archive_control =~ /Latest checkpoint's REDO WAL file:\s+([0-9A-F]{24})/;
+die 'old cluster has no checkpoint WAL file'
+  unless defined $old_checkpoint_segment;
+
+my $auto_conf = slurp_file($archive_new->data_dir . '/postgresql.auto.conf');
+like($auto_conf, qr/^archive_mode = 'on'$/m, 'new cluster enables archiving');
+like(
+	$auto_conf,
+	qr/^archive_command = 'false'$/m,
+	'new cluster uses the old archive command');
+my $staged_wal = $archive_new->data_dir . "/pg_wal/$old_checkpoint_segment";
+my $staged_status = $archive_new->data_dir
+  . "/pg_wal/archive_status/$old_checkpoint_segment.ready";
+ok(-f $staged_wal && -f $staged_status,
+	'old checkpoint WAL is staged for the new-cluster archiver');
+
 done_testing();

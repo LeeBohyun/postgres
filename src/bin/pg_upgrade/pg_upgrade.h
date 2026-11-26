@@ -158,6 +158,12 @@ typedef struct
 	LogicalSlotInfo *slots;		/* array of logical slot infos */
 } LogicalSlotInfoArr;
 
+typedef struct
+{
+	int			nslots;
+	char	  **slotnames;
+} PhysicalSlotNameArr;
+
 /*
  * The following structure represents a relation mapping.
  */
@@ -298,6 +304,8 @@ typedef struct
 	int			nsubs;			/* number of subscriptions */
 	bool		sub_retain_dead_tuples; /* whether a subscription enables
 										 * retain_dead_tuples. */
+	/* Old-cluster physical slots participating in HANDOFF. */
+	PhysicalSlotNameArr phys_slot_arr;
 } ClusterInfo;
 
 
@@ -384,7 +392,13 @@ extern OSInfo os_info;
 /* check.c */
 
 void		output_check_banner(void);
+void		prepare_pg_upgrade_handoff(void);
+void		perform_pg_upgrade_handoff(void);
 void		check_and_dump_old_cluster(char **archive_command);
+bool		pg_upgrade_handoff_requires_immediate_stop(void);
+int			pg_upgrade_handoff_signal_status(void);
+void		cleanup_pg_upgrade_handoff_after_stop(void);
+PGconn	   *begin_postmaster_stop_for_handoff(ClusterInfo *cluster);
 void		check_new_cluster(void);
 void		report_clusters_compatible(void);
 void		issue_warnings_and_set_wal_level(void);
@@ -450,6 +464,7 @@ void		get_db_rel_and_slot_infos(ClusterInfo *cluster);
 void		get_template0_info(ClusterInfo *cluster);
 DbLocaleInfo *get_db_locale_info(ClusterInfo *cluster, const char *db_name);
 int			count_old_cluster_logical_slots(void);
+void		get_old_cluster_physical_slot_infos(void);
 void		get_subscription_info(ClusterInfo *cluster);
 
 /* option.c */
@@ -495,6 +510,7 @@ PGresult   *executeQueryOrDie(PGconn *conn, const char *fmt, ...) pg_attribute_p
 char	   *cluster_conn_opts(ClusterInfo *cluster);
 
 bool		start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error);
+void		start_postmaster_for_handoff(void);
 void		stop_postmaster(bool in_atexit);
 void		check_pghost_envvar(void);
 

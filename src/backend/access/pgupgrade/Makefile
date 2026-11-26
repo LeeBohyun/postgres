@@ -17,6 +17,8 @@ OBJS = \
 	control.o \
 	emit.o \
 	first_start.o \
+	handoff.o \
+	handoff_receipt.o \
 	records.o \
 	replay.o \
 	startup.o

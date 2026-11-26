@@ -10,7 +10,8 @@
  * finalization requires the following durable shutdown checkpoint.
  *
  * RELINK batches for one database or shared relations must end before an
- * upgrade record of another type.
+ * upgrade record of another type. HANDOFF belongs to the old primary's final
+ * shutdown sequence, before the new cluster emits its upgrade WAL.
  *
  * Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -19,7 +20,10 @@
 #ifndef PG_UPGRADE_RECORDS_H
 #define PG_UPGRADE_RECORDS_H
 
+#include "pgtime.h"
+
 #define PG_UPGRADE_RELINK_FILE "pg_upgrade_relink"
+#define PG_UPGRADE_HANDOFF_SIGNAL_FILE "pg_upgrade_handoff.pending"
 
 /* XLogRecord xl_info values for RM_PG_UPGRADE_ID. */
 /* First upgrade record. */
@@ -28,6 +32,8 @@
 #define XLOG_UPGRADE_COMPLETE		0x10
 /* A chunk of a non-relation file's after-image. */
 #define XLOG_UPGRADE_RAWFILE			0x50
+/* Pause old-cluster standby replay after the next shutdown checkpoint. */
+#define XLOG_UPGRADE_HANDOFF			0x60
 /* Directory and relation operations to apply during upgrade replay. */
 #define XLOG_UPGRADE_RELINK				0x70
 
@@ -55,6 +61,7 @@ typedef struct xl_pg_upgrade_marker
  * START identifies the old cluster and the physical layout required for
  * replay. boundary_lsn is the end of the old primary's final shutdown
  * checkpoint on old_tli. transfer_mode records the primary's transfer mode.
+ * Standby replay uses it when pg_upgrade_standby_transfer_mode is mirror.
  */
 typedef struct xl_pg_upgrade_start
 {
@@ -98,6 +105,19 @@ typedef struct xl_pg_upgrade_rawfile
 
 #define SizeOfPgUpgradeRawFile \
 	(offsetof(xl_pg_upgrade_rawfile, offset) + sizeof(uint64))
+
+/*
+ * Announce the old and new major versions to standbys before the old
+ * primary's final shutdown checkpoint.
+ */
+typedef struct xl_pg_upgrade_handoff
+{
+	uint32		old_major_version;
+	uint32		new_major_version;
+	pg_time_t	handoff_time;
+} xl_pg_upgrade_handoff;
+
+#define SizeOfPgUpgradeHandoff sizeof(xl_pg_upgrade_handoff)
 
 typedef struct xl_pg_upgrade_key
 {

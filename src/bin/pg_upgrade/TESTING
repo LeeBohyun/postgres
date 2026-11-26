@@ -85,3 +85,11 @@ storage, restart, promotion, ordinary heap WAL, later sequence WAL, and rejectio
 of a COMPLETE record without its completion checkpoint. Run it together with
 012_wal_upgrade.pl. Set oldinstall to a compatible installed source version for
 cross-major tests; without it, the fixtures use the current version as source.
+
+014_wal_upgrade_handoff.pl exercises HANDOFF over TCP with a replication role,
+durable pause and cancellation, and first-start standby replay.
+015_stop_failure.pl verifies fallback shutdown and preservation of a running
+target after failed cleanup. 019_handoff_cancellation.pl covers durable
+cancellation, independent manual pauses, promotion checks, request consumption,
+and failure cleanup. These tests require HANDOFF support in the source binaries;
+the cancellation fixture always uses the current installation.

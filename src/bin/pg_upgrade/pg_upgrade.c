@@ -136,6 +136,7 @@ int
 main(int argc, char **argv)
 {
 	char	   *deletion_script_file_name = NULL;
+	bool		perform_handoff;
 	bool		migrate_logical_slots;
 
 	/*
@@ -165,6 +166,10 @@ main(int argc, char **argv)
 	check_bin_dirs(argv[0]);
 
 	adjust_data_dir(&old_cluster);
+	perform_handoff = user_opts.wal_upgrade && !user_opts.check &&
+		!user_opts.live_check;
+	if (perform_handoff)
+		prepare_pg_upgrade_handoff();
 
 	if (user_opts.print_initdb_options)
 	{
@@ -229,8 +234,22 @@ main(int argc, char **argv)
 	report_clusters_compatible();
 	/* --check exits above. Retain the new cluster once the upgrade begins. */
 	initdb_keep_cluster = true;
+
+	/*
+	 * Perform HANDOFF after the new-cluster checks pass, then record the old
+	 * cluster's final shutdown checkpoint end LSN in START.
+	 */
+	if (perform_handoff)
+	{
+		stop_postmaster(false);
+		perform_pg_upgrade_handoff();
+	}
+
 	if (user_opts.wal_upgrade && !user_opts.check)
 		prepare_upgrade_old_cluster();
+
+	if (perform_handoff)
+		start_postmaster(&new_cluster, true);
 
 	pg_log(PG_REPORT,
 		   "\n"

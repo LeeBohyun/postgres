@@ -76,6 +76,9 @@ tests += {
       't/011_print_initdb_options.pl',
       't/012_wal_upgrade.pl',
       't/013_wal_upgrade_standby.pl',
+      't/014_wal_upgrade_handoff.pl',
+      't/015_stop_failure.pl',
+      't/019_handoff_cancellation.pl',
     ],
     'deps': [test_ext],
     'test_kwargs': {'priority': 40}, # pg_upgrade tests are slow

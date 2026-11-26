@@ -5,7 +5,7 @@
 use strict;
 use warnings FATAL => 'all';
 
-use File::Copy qw(copy move);
+use File::Copy qw(copy);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -94,21 +94,41 @@ sub read_wal
 	return $out;
 }
 
-sub retain_old_boundary
+sub prepare_upgrade_with_standby
 {
-	my ($old, $name) = @_;
-	$old->backup_fs_cold($name);
+	my ($old, $new, $name, $mode) = @_;
+	$mode //= 'copy';
+	my $slot = "${name}_slot";
+	$old->start;
+	$old->safe_psql('postgres',
+		"SELECT pg_create_physical_replication_slot('$slot', true)");
+	$old->backup($name);
 	my $retained = PostgreSQL::Test::Cluster->new($name,
 		defined($ENV{oldinstall}) ? (install_path => $ENV{oldinstall}) : ());
 	$retained->init_from_backup($old, $name, has_streaming => 1);
-	my $control = $retained->data_dir . '/global/pg_control';
-	move("$control.old", $control)
-	  or die "restore old control file: $!"
-	  if !-f $control && -f "$control.old";
-	$retained->append_conf('postgresql.auto.conf', "primary_conninfo = ''");
+	$retained->append_conf('postgresql.auto.conf',
+		"primary_slot_name = '$slot'");
 	$retained->start;
-	$retained->safe_psql('postgres', 'CHECKPOINT');
+	$old->wait_for_catchup($retained->name);
+	$old->stop;
+	command_ok(upgrade_command($old, $new, $mode),
+		"prepare $name upgrade with a retained old standby");
+	$retained->poll_query_until('postgres',
+		q{SELECT pg_get_wal_replay_pause_state() = 'paused'})
+	  or die 'retained standby did not reach HANDOFF';
+	$retained->safe_psql('postgres', 'SELECT pg_wal_replay_resume()');
+	$retained->poll_query_until('postgres',
+		q{SELECT pg_get_wal_replay_pause_state() = 'not paused'})
+	  or die 'retained standby did not cancel HANDOFF';
 	$retained->stop;
+	# The last link-mode fixture disables the source. Other fixtures reuse it.
+	if ($mode ne 'link')
+	{
+		$old->start;
+		$old->safe_psql('postgres',
+			"SELECT pg_drop_replication_slot('$slot')");
+		$old->stop;
+	}
 	return $retained;
 }
 
@@ -162,12 +182,7 @@ my $fingerprint =
 my $expected = $old->safe_psql('postgres', $fingerprint);
 $old->stop;
 
-command_ok(upgrade_command($old, $new),
-	'primary prepares first-start upgrade WAL emission');
-
-# Without automatic HANDOFF, model a stopped old standby at the source's final
-# checkpoint after pg_upgrade has finished starting and stopping the source.
-my $retained = retain_old_boundary($old, 'retained');
+my $retained = prepare_upgrade_with_standby($old, $new, 'retained');
 
 configure_primary($new);
 $new->start;
@@ -250,10 +265,8 @@ subtest 'native COMPLETE without its checkpoint' => sub {
 	plan skip_all => 'requires an assertion-enabled build'
 	  unless $new->config_data('--configure') =~ /--enable-cassert/;
 	my $partial = PostgreSQL::Test::Cluster->new('partial');
-	command_ok(
-		upgrade_command($old, $partial),
-		'prepare interrupted-emission fixture');
-	my $partial_retained = retain_old_boundary($old, 'partial_retained');
+	my $partial_retained =
+	  prepare_upgrade_with_standby($old, $partial, 'partial_retained');
 	configure_primary($partial);
 	{
 		local $ENV{PG_UPGRADE_TEST_CRASH_AFTER_COMPLETE} = 1;
@@ -283,10 +296,8 @@ subtest 'native COMPLETE without its checkpoint' => sub {
 
 subtest 'native INHERIT with a local copy override' => sub {
 	my $linked = PostgreSQL::Test::Cluster->new('linked');
-	command_ok(
-		upgrade_command($old, $linked, 'link'),
-		'prepare reference-mode upgrade');
-	my $link_retained = retain_old_boundary($old, 'link_retained');
+	my $link_retained =
+	  prepare_upgrade_with_standby($old, $linked, 'link_retained', 'link');
 	configure_primary($linked);
 	$linked->start;
 	my $replica =
