@@ -37,7 +37,7 @@ connectToServer(ClusterInfo *cluster, const char *db_name)
 		if (conn)
 			PQfinish(conn);
 
-		printf(_("Failure, exiting\n"));
+		pg_log(PG_REPORT, "Failure, exiting");
 		exit(1);
 	}
 
@@ -154,7 +154,7 @@ executeQueryOrDie(PGconn *conn, const char *fmt, ...)
 			   PQerrorMessage(conn));
 		PQclear(result);
 		PQfinish(conn);
-		printf(_("Failure, exiting\n"));
+		pg_log(PG_REPORT, "Failure, exiting");
 		exit(1);
 	}
 	pg_free(query.data);
@@ -175,8 +175,8 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	char		cmd[MAXPGPATH * 4 + 1000];
 	PGconn	   *conn;
 	bool		pg_ctl_return = false;
-	char		socket_string[MAXPGPATH + 200];
 	PQExpBufferData pgoptions;
+	PQExpBufferData quoted_options;
 
 	static bool exit_hook_registered = false;
 
@@ -186,23 +186,9 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 		exit_hook_registered = true;
 	}
 
-	socket_string[0] = '\0';
-
-#if !defined(WIN32)
-	/* prevent TCP/IP connections, restrict socket access */
-	strcat(socket_string,
-		   " -c listen_addresses='' -c unix_socket_permissions=0700");
-
-	/* Have a sockdir?	Tell the postmaster. */
-	if (cluster->sockdir)
-		snprintf(socket_string + strlen(socket_string),
-				 sizeof(socket_string) - strlen(socket_string),
-				 " -c %s='%s'",
-				 "unix_socket_directories",
-				 cluster->sockdir);
-#endif
-
 	initPQExpBuffer(&pgoptions);
+	initPQExpBuffer(&quoted_options);
+	appendPQExpBuffer(&pgoptions, "-p %d -b", cluster->port);
 
 	/*
 	 * Construct a parameter string which is passed to the server process.
@@ -219,15 +205,41 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	 * Use -b to disable autovacuum and logical replication launcher
 	 * (effective in PG17 or later for the latter).
 	 */
+	if (cluster->pgopts)
+		appendPQExpBuffer(&pgoptions, " %s", cluster->pgopts);
+
+#ifndef WIN32
+	/* Prevent TCP/IP connections and restrict socket access. */
+	appendPQExpBufferStr(&pgoptions,
+						 " -c listen_addresses='' -c unix_socket_permissions=0700");
+	if (cluster->sockdir)
+	{
+		PQExpBufferData socket_option;
+
+		/* Quote the directory as one GUC-list item, then as a shell argument. */
+		initPQExpBuffer(&socket_option);
+		appendPQExpBufferStr(&socket_option, "unix_socket_directories=\"");
+		for (const char *p = cluster->sockdir; *p; p++)
+		{
+			if (*p == '"')
+				appendPQExpBufferChar(&socket_option, '"');
+			appendPQExpBufferChar(&socket_option, *p);
+		}
+		appendPQExpBufferChar(&socket_option, '"');
+		appendPQExpBufferStr(&pgoptions, " -c ");
+		appendShellString(&pgoptions, socket_option.data);
+		termPQExpBuffer(&socket_option);
+	}
+#endif
+	appendShellString(&quoted_options, pgoptions.data);
 	snprintf(cmd, sizeof(cmd),
-			 "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o \"-p %d -b%s %s%s\" start",
+			 "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o %s start",
 			 cluster->bindir,
 			 log_opts.logdir,
-			 SERVER_LOG_FILE, cluster->pgconfig, cluster->port,
-			 pgoptions.data,
-			 cluster->pgopts ? cluster->pgopts : "", socket_string);
+			 SERVER_LOG_FILE, cluster->pgconfig, quoted_options.data);
 
 	termPQExpBuffer(&pgoptions);
+	termPQExpBuffer(&quoted_options);
 
 	/*
 	 * Don't throw an error right away, let connecting throw the error because
@@ -266,8 +278,13 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	 * there might have been a connection problem in _checking_ if the server
 	 * has started.  Therefore, even if pg_ctl failed, we continue and test
 	 * for connectivity in case we get a connection reason for the failure.
+	 * The printer uses the selected database rather than template1 when
+	 * possible.
 	 */
-	if ((conn = get_db_conn(cluster, "template1")) == NULL ||
+	if ((conn = get_db_conn(cluster,
+							cluster == &old_cluster && user_opts.initdb_database &&
+							strcmp(user_opts.initdb_database, "template0") != 0 ?
+							user_opts.initdb_database : "template1")) == NULL ||
 		PQstatus(conn) != CONNECTION_OK)
 	{
 		pg_log(PG_REPORT, "\n%s", PQerrorMessage(conn));
@@ -305,6 +322,8 @@ void
 stop_postmaster(bool in_atexit)
 {
 	ClusterInfo *cluster;
+	PQExpBufferData options;
+	bool		stopped;
 
 	if (os_info.running_cluster == &old_cluster)
 		cluster = &old_cluster;
@@ -313,11 +332,20 @@ stop_postmaster(bool in_atexit)
 	else
 		return;					/* no cluster running */
 
-	exec_prog(SERVER_STOP_LOG_FILE, NULL, !in_atexit, !in_atexit,
-			  "\"%s/pg_ctl\" -w -D \"%s\" -o \"%s\" %s stop",
-			  cluster->bindir, cluster->pgconfig,
-			  cluster->pgopts ? cluster->pgopts : "",
-			  in_atexit ? "-m fast" : "-m smart");
+	initPQExpBuffer(&options);
+	appendShellString(&options, cluster->pgopts ? cluster->pgopts : "");
+	stopped = exec_prog(SERVER_STOP_LOG_FILE, NULL, !in_atexit, !in_atexit,
+						"\"%s/pg_ctl\" -w -D \"%s\" -o %s %s stop",
+						cluster->bindir, cluster->pgconfig,
+						options.data, in_atexit ? "-m fast" : "-m smart");
+	termPQExpBuffer(&options);
+
+	/*
+	 * Clear the running-cluster marker only after confirmed shutdown.
+	 * Otherwise, --initdb cleanup could delete data still in use.
+	 */
+	if (!stopped)
+		return;
 
 	os_info.running_cluster = NULL;
 }

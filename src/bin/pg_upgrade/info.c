@@ -21,7 +21,6 @@ static void create_rel_filename_map(const char *old_data, const char *new_data,
 static void report_unmatched_relation(const RelInfo *rel, const DbInfo *db,
 									  bool is_new_db);
 static void free_db_and_rel_infos(DbInfoArr *db_arr);
-static void get_template0_info(ClusterInfo *cluster);
 static void get_db_infos(ClusterInfo *cluster);
 static char *get_rel_infos_query(void);
 static void process_rel_infos(DbInfo *dbinfo, PGresult *res, void *arg);
@@ -328,12 +327,26 @@ get_db_rel_and_slot_infos(ClusterInfo *cluster)
  * Get information about template0, which will be copied from the old cluster
  * to the new cluster.
  */
-static void
+void
 get_template0_info(ClusterInfo *cluster)
 {
-	PGconn	   *conn = connectToServer(cluster, "template1");
+	cluster->template0 = get_db_locale_info(cluster, "template0");
+}
+
+
+/*
+ * Read a database's locale settings without replacing the template0 metadata
+ * used by the upgrade.  template0 itself does not allow connections.
+ */
+DbLocaleInfo *
+get_db_locale_info(ClusterInfo *cluster, const char *db_name)
+{
+	PGconn	   *conn = connectToServer(cluster,
+									   strcmp(db_name, "template0") == 0 ?
+									   "template1" : db_name);
 	DbLocaleInfo *locale;
 	PGresult   *dbres;
+	PQExpBufferData query;
 	int			i_datencoding;
 	int			i_datlocprovider;
 	int			i_datcollate;
@@ -341,38 +354,56 @@ get_template0_info(ClusterInfo *cluster)
 	int			i_datlocale;
 	int			i_daticurules;
 
-	if (GET_MAJOR_VERSION(cluster->major_version) >= 1700)
-		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, datlocprovider, "
-								  "       datcollate, datctype, datlocale, "
-								  "       daticurules "
-								  "FROM	pg_catalog.pg_database "
-								  "WHERE datname='template0'");
-	else if (GET_MAJOR_VERSION(cluster->major_version) >= 1600)
-		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, datlocprovider, "
-								  "       datcollate, datctype, daticulocale AS datlocale, "
-								  "       daticurules "
-								  "FROM	pg_catalog.pg_database "
-								  "WHERE datname='template0'");
-	else if (GET_MAJOR_VERSION(cluster->major_version) >= 1500)
-		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, datlocprovider, "
-								  "       datcollate, datctype, daticulocale AS datlocale, "
-								  "       NULL AS daticurules "
-								  "FROM	pg_catalog.pg_database "
-								  "WHERE datname='template0'");
-	else
-		dbres = executeQueryOrDie(conn,
-								  "SELECT encoding, 'c' AS datlocprovider, "
-								  "       datcollate, datctype, NULL AS datlocale, "
-								  "       NULL AS daticurules "
-								  "FROM	pg_catalog.pg_database "
-								  "WHERE datname='template0'");
+	/*
+	 * JSON strings must be UTF-8. Shell arguments, including ICU rules, need
+	 * the database encoding expected by initdb, regardless of
+	 * PGCLIENTENCODING. Ordinary upgrade callers retain their existing
+	 * connection encoding.
+	 */
+	if (user_opts.print_initdb_options)
+	{
+		const char *encoding = user_opts.initdb_options_json ? "UTF8" :
+			PQparameterStatus(conn, "server_encoding");
 
+		if (PQsetClientEncoding(conn, encoding) != 0)
+			pg_fatal("could not set client encoding: %s", PQerrorMessage(conn));
+	}
+
+	initPQExpBuffer(&query);
+	if (GET_MAJOR_VERSION(cluster->major_version) >= 1700)
+		appendPQExpBufferStr(&query,
+							 "SELECT encoding, datlocprovider, "
+							 "       datcollate, datctype, datlocale, daticurules ");
+	else if (GET_MAJOR_VERSION(cluster->major_version) >= 1600)
+		appendPQExpBufferStr(&query,
+							 "SELECT encoding, datlocprovider, "
+							 "       datcollate, datctype, daticulocale AS datlocale, "
+							 "       daticurules ");
+	else if (GET_MAJOR_VERSION(cluster->major_version) >= 1500)
+		appendPQExpBufferStr(&query,
+							 "SELECT encoding, datlocprovider, "
+							 "       datcollate, datctype, daticulocale AS datlocale, "
+							 "       NULL AS daticurules ");
+	else
+		appendPQExpBufferStr(&query,
+							 "SELECT encoding, 'c' AS datlocprovider, "
+							 "       datcollate, datctype, NULL AS datlocale, "
+							 "       NULL AS daticurules ");
+
+	/*
+	 * Except for template0, we connected to the requested database. Use its
+	 * server-side name so a client encoding change does not reinterpret a
+	 * non-ASCII db_name.
+	 */
+	appendPQExpBuffer(&query,
+					  "FROM pg_catalog.pg_database WHERE datname = %s",
+					  strcmp(db_name, "template0") == 0 ?
+					  "'template0'" : "pg_catalog.current_database()");
+	dbres = executeQueryOrDie(conn, "%s", query.data);
+	termPQExpBuffer(&query);
 
 	if (PQntuples(dbres) != 1)
-		pg_fatal("template0 not found");
+		pg_fatal("database \"%s\" not found", db_name);
 
 	locale = pg_malloc_object(DbLocaleInfo);
 
@@ -396,10 +427,9 @@ get_template0_info(ClusterInfo *cluster)
 	else
 		locale->db_icu_rules = pg_strdup(PQgetvalue(dbres, 0, i_daticurules));
 
-	cluster->template0 = locale;
-
 	PQclear(dbres);
 	PQfinish(conn);
+	return locale;
 }
 
 

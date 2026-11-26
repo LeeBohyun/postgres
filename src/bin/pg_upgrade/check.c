@@ -758,6 +758,8 @@ report_clusters_compatible(void)
 		/* stops new cluster */
 		stop_postmaster(false);
 
+		cleanup_initdb_cluster();
+
 		cleanup_output_dirs();
 		exit(0);
 	}
