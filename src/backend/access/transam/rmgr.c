@@ -39,6 +39,7 @@
 #include "replication/message.h"
 #include "replication/origin.h"
 #include "storage/standby.h"
+#include "access/pgupgrade_wal.h"
 #include "utils/relmapper.h"
 /* IWYU pragma: end_keep */
 

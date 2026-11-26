@@ -1,0 +1,36 @@
+WAL-logged major-version upgrades
+================================
+
+pg_upgrade prepares the new cluster while both versions are available. It
+records storage operations and file captures as text commands in
+pg_upgrade_relink.tmp. After the prepared data is synced, the frontend
+publishes that file as pg_upgrade_relink and leaves the new cluster stopped.
+Initialization and catalog-restore WAL are discarded before this publication.
+
+The startup process consumes the commands on the first normal primary start,
+before accepting connections or launching background database writers. It
+emits START, RELINK and RAWFILE records together with ordinary relation WAL,
+then emits COMPLETE and takes the completion shutdown checkpoint. Upgrade
+records have transaction ID zero; there is no upgrade transaction or COMMIT.
+
+RELINK describes explicit INHERIT and RECREATE operations. Logged relations
+can inherit their old files with link, clone or swap transfer. Copy and
+copy-file-range transfers rebuild them with ordinary SMGR create records and
+full-page images. New, rebuilt and unlogged relations are recreated in every
+mode. Logged relations also capture their free-space and visibility-map forks,
+including when their main forks are inherited, so later WAL can reference those
+pages. Per-database batches end before another record type is emitted. File
+existence, command input, and physical-layout checks remain necessary.
+
+Before startup can emit WAL or change migrated slots, it durably sets the
+reserved backupEndPoint value PG_INT64_MAX. The existing control-file layout
+is unchanged. This marker rejects an interrupted emission even if the input
+file is subsequently lost. Startup clears it only after the completion
+checkpoint and durable removal of pg_upgrade_relink. A partially emitted
+target cannot be resumed; a retry needs a fresh target and intact old storage.
+The usual source-reuse restrictions for link and swap transfers still apply.
+
+The initial redo position retains all startup and upgrade WAL until completion.
+Migrated logical slots receive a new decoding snapshot and positions within
+that WAL before their state is saved. Emission rejects unexpected files or
+input commands rather than treating an incomplete target as a normal cluster.

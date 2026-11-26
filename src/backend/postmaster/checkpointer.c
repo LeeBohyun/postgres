@@ -39,6 +39,7 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "access/pgupgrade_first_start.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
@@ -51,6 +52,7 @@
 #include "postmaster/auxprocess.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
 #include "replication/syncrep.h"
 #include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
@@ -791,6 +793,13 @@ CheckpointWriteDelay(int flags, double progress)
 {
 	static int	absorb_counter = WRITES_PER_ABSORB;
 
+	/* Handle shutdown requests during the upgrade completion checkpoint. */
+	if (PgUpgradeFirstStartInProgress())
+	{
+		ProcessStartupProcInterrupts();
+		return;
+	}
+
 	/* Do nothing if checkpoint is being executed by non-checkpointer process */
 	if (!AmCheckpointerProcess())
 		return;
@@ -1063,8 +1072,16 @@ RequestCheckpoint(int flags)
 				old_started;
 
 	/*
-	 * If in a standalone backend, just do it ourselves.
+	 * Ignore automatic requests while the checkpointer is held back. Startup
+	 * takes its completion checkpoint directly after emission finishes.
 	 */
+	if (PgUpgradeFirstStartInProgress())
+	{
+		Assert((flags & CHECKPOINT_WAIT) == 0);
+		return;
+	}
+
+	/* If in a standalone backend, just do it ourselves. */
 	if (!IsPostmasterEnvironment)
 	{
 		/*

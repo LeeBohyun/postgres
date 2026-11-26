@@ -89,6 +89,7 @@
 #include <pthread.h>
 #endif
 
+#include "access/pgupgrade_first_start.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
@@ -256,6 +257,12 @@ bool		remove_temp_files_after_crash = true;
  */
 bool		send_abort_for_crash = false;
 bool		send_abort_for_kill = false;
+
+/*
+ * Keep PM_STARTUP and delay checkpointer, bgwriter, and extension workers
+ * until the startup child exits. This also keeps all connections rejected.
+ */
+static bool upgrade_pending;
 
 /* special child processes; NULL when not running */
 static PMChild *StartupPMChild = NULL,
@@ -837,6 +844,7 @@ PostmasterMain(int argc, char *argv[])
 
 	/* And switch working directory into it */
 	ChangeToDataDir();
+	upgrade_pending = PgUpgradeFirstStartPending();
 
 	/*
 	 * Check for invalid combinations of GUC settings.
@@ -1395,11 +1403,17 @@ PostmasterMain(int argc, char *argv[])
 	/* Make sure we can perform I/O while starting up. */
 	maybe_start_io_workers();
 
-	/* Start bgwriter and checkpointer so they can help with recovery */
-	if (CheckpointerPMChild == NULL)
-		CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
-	if (BgWriterPMChild == NULL)
-		BgWriterPMChild = StartChildProcess(B_BG_WRITER);
+	/*
+	 * Delay checkpointer and bgwriter when restarting for upgrade emission to
+	 * give startup exclusive write access to the database.
+	 */
+	if (!upgrade_pending)
+	{
+		if (CheckpointerPMChild == NULL)
+			CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
+		if (BgWriterPMChild == NULL)
+			BgWriterPMChild = StartChildProcess(B_BG_WRITER);
+	}
 
 	/*
 	 * We're ready to rock and roll...
@@ -2279,6 +2293,8 @@ process_pm_child_exit(void)
 			ReleasePostmasterChildSlot(StartupPMChild);
 			StartupPMChild = NULL;
 
+			upgrade_pending = false;
+
 			/*
 			 * Startup process exited in response to a shutdown request (or it
 			 * completed normally regardless of the shutdown request).
@@ -3150,7 +3166,15 @@ PostmasterStateMachine(void)
 		 */
 		if (io_worker_count == 0)
 		{
-			UpdatePMState(PM_WAIT_CHECKPOINTER);
+			/* Upgrade startup may shut down before a checkpointer is started. */
+			if (CheckpointerPMChild == NULL)
+			{
+				UpdatePMState(PM_WAIT_DEAD_END);
+				ConfigurePostmasterWaitSet(false);
+				SignalChildren(SIGQUIT, btmask(B_DEAD_END_BACKEND));
+			}
+			else
+				UpdatePMState(PM_WAIT_CHECKPOINTER);
 
 			/*
 			 * Now that the processes mentioned above are gone, tell
@@ -3272,6 +3296,7 @@ PostmasterStateMachine(void)
 
 		/* re-read control file into local memory */
 		LocalProcessControlFile(true);
+		upgrade_pending = PgUpgradeFirstStartPending();
 
 		/*
 		 * Re-initialize shared memory and semaphores.  Note: We don't call
@@ -3361,6 +3386,9 @@ LaunchMissingBackgroundProcesses(void)
 	 * we always will process the config change in a timely manner.
 	 */
 	maybe_start_io_workers();
+
+	if (upgrade_pending)
+		return;
 
 	/*
 	 * The checkpointer and the background writer are active from the start,
@@ -3765,7 +3793,7 @@ process_pm_pmsignal(void)
 	 * first. We don't want to go back to recovery in that case.
 	 */
 	if (CheckPostmasterSignal(PMSIGNAL_RECOVERY_STARTED) &&
-		pmState == PM_STARTUP && Shutdown == NoShutdown)
+		pmState == PM_STARTUP && Shutdown == NoShutdown && !upgrade_pending)
 	{
 		/* WAL redo has started. We're out of reinitialization. */
 		FatalError = false;
@@ -3803,7 +3831,7 @@ process_pm_pmsignal(void)
 	}
 
 	if (CheckPostmasterSignal(PMSIGNAL_BEGIN_HOT_STANDBY) &&
-		(pmState == PM_RECOVERY && Shutdown == NoShutdown))
+		(pmState == PM_RECOVERY && Shutdown == NoShutdown) && !upgrade_pending)
 	{
 		ereport(LOG,
 				(errmsg("database system is ready to accept read-only connections")));
@@ -4309,10 +4337,10 @@ maybe_start_bgworkers(void)
 	dlist_mutable_iter iter;
 
 	/*
-	 * During crash recovery, we have no need to be called until the state
-	 * transition out of recovery.
+	 * During crash recovery, wait for the transition out of recovery. During
+	 * upgrade emission, delay workers until startup finishes writing WAL.
 	 */
-	if (FatalError)
+	if (FatalError || upgrade_pending)
 	{
 		StartWorkerNeeded = false;
 		HaveCrashedWorker = false;

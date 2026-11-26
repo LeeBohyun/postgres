@@ -800,6 +800,16 @@ output_completion_banner(char *deletion_script_file_name)
 		appendPQExpBufferChar(&user_specification, ' ');
 	}
 
+	if (user_opts.wal_upgrade)
+		pg_log(PG_REPORT,
+			   "WAL generated during schema restore: " UINT64_FORMAT " bytes",
+			   log_opts.pg_upgrade_wal_bytes);
+
+	if (user_opts.wal_upgrade)
+		pg_log(PG_REPORT,
+			   "Upgrade WAL emission is pending. Start the new server to complete it.\n"
+			   "Retain the old cluster until first-start emission succeeds.");
+
 	pg_log(PG_REPORT,
 		   "Some statistics are not transferred by pg_upgrade.\n"
 		   "Once you start the new server, consider running these two commands:\n"
@@ -1020,6 +1030,25 @@ create_script_for_old_cluster_deletion(char **deletion_script_file_name)
 	/* add shebang header */
 	fprintf(script, "#!/bin/sh\n\n");
 #endif
+
+	if (user_opts.wal_upgrade)
+	{
+#ifdef WIN32
+		fprintf(script, "IF EXIST \"%s/%s\" (ECHO Upgrade WAL emission is still pending. & EXIT /B 1)\n",
+				new_cluster_pgdata, PG_UPGRADE_RELINK_FILE);
+#else
+		PQExpBufferData pending;
+		PQExpBufferData quoted;
+
+		initPQExpBuffer(&pending);
+		appendPQExpBuffer(&pending, "%s/%s", new_cluster_pgdata, PG_UPGRADE_RELINK_FILE);
+		initPQExpBuffer(&quoted);
+		appendShellString(&quoted, pending.data);
+		fprintf(script, "if test -e %s; then\n  echo 'Upgrade WAL emission is still pending.' >&2\n  exit 1\nfi\n\n", quoted.data);
+		termPQExpBuffer(&quoted);
+		termPQExpBuffer(&pending);
+#endif
+	}
 
 	/* delete old cluster's default tablespace */
 	fprintf(script, RMDIR_CMD " %c%s%c\n", PATH_QUOTE,

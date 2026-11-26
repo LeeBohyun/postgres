@@ -12,6 +12,8 @@ GETTEXT_FILES    = check.c \
                    option.c \
                    parallel.c \
                    pg_upgrade.c \
+                   prepare_upgrade.c \
+                   relink_file.c \
                    relfilenumber.c \
                    server.c \
                    slru_io.c \

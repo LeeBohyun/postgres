@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "access/pgupgrade_first_start.h"
 #include "access/transam.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
@@ -55,6 +56,7 @@
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/standby.h"
 #include "storage/subsystems.h"
 #include "utils/builtins.h"
 #include "utils/guc_hooks.h"
@@ -2236,7 +2238,12 @@ InvalidateObsoleteReplicationSlots(uint32 possible_causes,
 	Assert(!(possible_causes & RS_INVAL_WAL_REMOVED) || oldestSegno > 0);
 	Assert(possible_causes != RS_INVAL_NONE);
 
-	if (max_replication_slots == 0 && max_repack_replication_slots == 0)
+	/*
+	 * Keep migrated slots valid while startup replaces their pre-reset
+	 * positions.
+	 */
+	if (PgUpgradeFirstStartInProgress() ||
+		(max_replication_slots == 0 && max_repack_replication_slots == 0))
 		return invalidated;
 
 	XLogSegNoOffsetToRecPtr(oldestSegno, 0, wal_segment_size, oldestLSN);
@@ -2521,6 +2528,80 @@ CreateSlotOnDisk(ReplicationSlot *slot)
 	fsync_fname(PG_REPLSLOT_DIR, true);
 
 	END_CRIT_SECTION();
+}
+
+/*
+ * pg_upgrade's final WAL reset leaves migrated slots pointing at discarded
+ * WAL. StartupReplicationSlots() has cleared their pending decoding updates.
+ * Emit an empty snapshot inside the upgrade WAL, move each slot's restart and
+ * confirmed-flush LSNs to its start and end. Preserve xmin and catalog_xmin
+ * because resetting WAL does not change transaction IDs or catalog contents.
+ */
+void
+ReplicationSlotsPrepareUpgrade(void)
+{
+	XLogRecPtr	start;
+	XLogRecPtr	end;
+	bool		have_logical = false;
+
+	Assert(AmStartupProcess() && PgUpgradeFirstStartInProgress());
+
+	for (int i = 0; i < max_replication_slots; i++)
+		have_logical |= ReplicationSlotCtl->replication_slots[i].in_use &&
+			SlotIsLogical(&ReplicationSlotCtl->replication_slots[i]);
+	if (!have_logical)
+		return;
+
+	start = GetXLogInsertRecPtr();
+
+	/*
+	 * Emit an empty RUNNING_XACTS record so migrated logical slots can build
+	 * a decoding snapshot inside the upgrade WAL. The snapshot is empty
+	 * because connections and background database workers are blocked.
+	 */
+
+	end = LogStandbySnapshot();
+	XLogFlush(end);
+	for (int i = 0; i < max_replication_slots; i++)
+	{
+		ReplicationSlot *slot = &ReplicationSlotCtl->replication_slots[i];
+
+		if (!slot->in_use || !SlotIsLogical(slot))
+			continue;
+		if (slot->data.invalidated != RS_INVAL_NONE || slot->data.persistency != RS_PERSISTENT)
+			ereport(ERROR, (errmsg("cannot migrate invalid or temporary replication slot \"%s\"",
+								   NameStr(slot->data.name))));
+		SpinLockAcquire(&slot->mutex);
+		slot->data.restart_lsn = start;
+		slot->data.confirmed_flush = end;
+		if (slot->data.two_phase)
+			slot->data.two_phase_at = end;
+		SpinLockRelease(&slot->mutex);
+	}
+	ReplicationSlotsComputeRequiredLSN();
+}
+
+/*
+ * Mark migrated logical slots dirty and save their state files
+ * before COMPLETE.
+ */
+void
+ReplicationSlotsSaveUpgrade(void)
+{
+	Assert(AmStartupProcess() && PgUpgradeFirstStartInProgress());
+	for (int i = 0; i < max_replication_slots; i++)
+	{
+		ReplicationSlot *slot = &ReplicationSlotCtl->replication_slots[i];
+		char		path[MAXPGPATH];
+
+		if (!slot->in_use || !SlotIsLogical(slot))
+			continue;
+		SpinLockAcquire(&slot->mutex);
+		slot->dirty = slot->just_dirtied = true;
+		SpinLockRelease(&slot->mutex);
+		snprintf(path, sizeof(path), "%s/%s", PG_REPLSLOT_DIR, NameStr(slot->data.name));
+		SaveSlotToPath(slot, path, ERROR);
+	}
 }
 
 /*

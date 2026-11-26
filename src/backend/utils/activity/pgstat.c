@@ -103,6 +103,7 @@
 
 #include <unistd.h>
 
+#include "access/pgupgrade_first_start.h"
 #include "access/xact.h"
 #include "lib/dshash.h"
 #include "pgstat.h"
@@ -1694,8 +1695,12 @@ pgstat_write_statsfile(void)
 
 	pgstat_assert_is_up();
 
-	/* should be called only by the checkpointer or single user mode */
-	Assert(!IsUnderPostmaster || MyBackendType == B_CHECKPOINTER);
+	/*
+	 * Only checkpointer, single-user mode, or startup performing the upgrade
+	 * completion checkpoint may write the final statistics file.
+	 */
+	Assert(!IsUnderPostmaster || MyBackendType == B_CHECKPOINTER ||
+		   (AmStartupProcess() && PgUpgradeFirstStartInProgress()));
 
 	/* we're shutting down, so it's ok to just override this */
 	pgstat_fetch_consistency = PGSTAT_FETCH_CONSISTENCY_NONE;

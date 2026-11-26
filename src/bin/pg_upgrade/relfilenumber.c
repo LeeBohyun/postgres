@@ -320,7 +320,7 @@ FileNameMapCmp(const void *a, const void *b)
  * return InvalidRelFileNumber.  Note that this code snippet is lifted from
  * parse_filename_for_nontemp_relation().
  */
-static RelFileNumber
+RelFileNumber
 parse_relfilenumber(const char *filename)
 {
 	char	   *endp;

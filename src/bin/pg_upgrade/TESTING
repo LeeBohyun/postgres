@@ -64,3 +64,16 @@ and then try to pg_upgrade it to the new version.  Success is reported
 if pg_dumpall output matches between the pre-upgrade and post-upgrade
 databases.  In case of trouble, manually comparing those dump files may
 help to isolate the problem.
+
+
+WAL-UPGRADE TESTS
+-----------------
+
+012_wal_upgrade.pl checks native first-start emission, explicit storage
+commands, source-file validation, transfer modes and rejection of interrupted
+emission. Run it from a configured build tree with:
+
+  make -C src/bin/pg_upgrade check PROVE_TESTS=t/012_wal_upgrade.pl
+
+The tests use PostgreSQL::Test::Cluster and fresh temporary data directories.
+Crash checks require an assertion-enabled build.

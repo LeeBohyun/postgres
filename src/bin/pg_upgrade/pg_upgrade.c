@@ -214,6 +214,8 @@ main(int argc, char **argv)
 
 	check_cluster_compatibility();
 
+	if (user_opts.wal_upgrade && !user_opts.check)
+		create_upgrade_preparation();
 	check_and_dump_old_cluster();
 
 
@@ -224,6 +226,8 @@ main(int argc, char **argv)
 	report_clusters_compatible();
 	/* --check exits above. Retain the new cluster once the upgrade begins. */
 	initdb_keep_cluster = true;
+	if (user_opts.wal_upgrade && !user_opts.check)
+		prepare_upgrade_old_cluster();
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -274,12 +278,16 @@ main(int argc, char **argv)
 	 * the old system, but we do it anyway just in case.  We do it late here
 	 * because there is no need to have the schema load use new oids.
 	 */
-	prep_status("Setting next OID for new cluster");
-	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -o %" PRIu64 " \"%s\"",
-			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
-			  new_cluster.pgdata);
-	check_ok();
+	/* WAL upgrades set next OID in the final reset after slot migration. */
+	if (!user_opts.wal_upgrade)
+	{
+		prep_status("Setting next OID for new cluster");
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" -o %" PRIu64 " \"%s\"",
+				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+				  new_cluster.pgdata);
+		check_ok();
+	}
 
 	migrate_logical_slots = count_old_cluster_logical_slots();
 
@@ -317,11 +325,37 @@ main(int argc, char **argv)
 		stop_postmaster(false);
 	}
 
+	if (user_opts.wal_upgrade)
+	{
+		char		start_wal_file[25];
+		char		snapshots[MAXPGPATH];
+
+		/*
+		 * Reset WAL after slot migration to discard its preparation WAL too.
+		 * First startup later moves the slots' decoding positions into the
+		 * upgrade WAL.
+		 */
+		strlcpy(start_wal_file, old_cluster.controldata.upgrade_start_wal_file,
+				sizeof(start_wal_file));
+
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" --wal-upgrade-exact -o %" PRIu64 " -l %s \"%s\"",
+				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+				  start_wal_file, new_cluster.pgdata);
+		snprintf(snapshots, sizeof(snapshots), "%s/pg_logical/snapshots", new_cluster.pgdata);
+		if (!rmtree(snapshots, false))
+			pg_fatal("could not remove pre-reset logical snapshots");
+	}
+
 	sync_new_cluster(user_opts.transfer_mode != TRANSFER_MODE_SWAP);
+
+	if (user_opts.wal_upgrade)
+		finish_upgrade_preparation();
 
 	create_script_for_old_cluster_deletion(&deletion_script_file_name);
 
-	issue_warnings_and_set_wal_level();
+	if (!user_opts.wal_upgrade)
+		issue_warnings_and_set_wal_level();
 
 	pg_log(PG_REPORT,
 		   "\n"
@@ -1234,6 +1268,9 @@ create_new_objects(void)
 {
 	int			dbnum;
 	PGconn	   *conn_new_template1;
+	PGresult   *lsn_res;
+	uint64		lsn_before = 0,
+				lsn_after = 0;
 
 	prep_status_progress("Restoring database schemas in the new cluster");
 
@@ -1246,6 +1283,13 @@ create_new_objects(void)
 	 */
 	conn_new_template1 = connectToServer(&new_cluster, "template1");
 	PQclear(executeQueryOrDie(conn_new_template1, "CHECKPOINT"));
+	if (user_opts.wal_upgrade)
+	{
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_before = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+	}
 	PQfinish(conn_new_template1);
 
 	/*
@@ -1350,6 +1394,17 @@ create_new_objects(void)
 
 	end_progress_output();
 	check_ok();
+
+	if (user_opts.wal_upgrade)
+	{
+		conn_new_template1 = connectToServer(&new_cluster, "template1");
+		lsn_res = executeQueryOrDie(conn_new_template1,
+									"SELECT pg_current_wal_lsn() - '0/0'");
+		lsn_after = strtoull(PQgetvalue(lsn_res, 0, 0), NULL, 10);
+		PQclear(lsn_res);
+		PQfinish(conn_new_template1);
+		log_opts.pg_upgrade_wal_bytes = lsn_after - lsn_before;
+	}
 
 	/* update new_cluster info now that we have objects in the databases */
 	get_db_rel_and_slot_infos(&new_cluster);

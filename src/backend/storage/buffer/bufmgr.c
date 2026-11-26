@@ -5877,6 +5877,17 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 	if (!BufferIsValid(buffer))
 		elog(ERROR, "bad buffer ID: %d", buffer);
 
+	/*
+	 * pg_upgrade resets WAL after restoring catalogs so that upgrade WAL
+	 * follows the old cluster's shutdown WAL.  For example, a catalog page
+	 * may still have LSN 0/3000100 when WAL insertion restarts at 0/2000100.
+	 * If a hint update marks that page dirty, writing it to disk would first
+	 * try to flush WAL through 0/3000100 and fail.  Upgrade WAL emission must
+	 * first log the page image and replace the page's LSN.
+	 */
+	if (IsBinaryUpgrade)
+		return;
+
 	if (BufferIsLocal(buffer))
 	{
 		MarkLocalBufferDirty(buffer);

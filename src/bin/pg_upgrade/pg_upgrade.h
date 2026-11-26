@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include "common/pg_upgrade_records.h"
 #include "common/relpath.h"
 #include "libpq-fe.h"
 
@@ -214,7 +215,13 @@ typedef struct
 {
 	uint32		ctrl_ver;
 	uint32		cat_ver;
+	uint64		system_identifier;
 	char		nextxlogfile[25];
+	char		chkpnt_redo_wal_file[25];
+	char		upgrade_start_wal_file[25];
+	uint64		chkpnt_redo_lsn;
+	uint32		chkpnt_tli;
+	uint64		shutdown_checkpoint_end_lsn;
 	uint32		chkpnt_nxtxid;
 	uint32		chkpnt_nxtepoch;
 	Oid8		chkpnt_nxtoid;
@@ -285,6 +292,7 @@ typedef struct
 	char	   *major_version_str;	/* string PG_VERSION of cluster */
 	uint32		bin_version;	/* version returned from pg_ctl */
 	char	  **tablespaces;	/* tablespace directories */
+	Oid		   *tablespace_oids;	/* matches tablespaces[] order */
 	int			num_tablespaces;
 	const char *tablespace_suffix;	/* directory specification */
 	int			nsubs;			/* number of subscriptions */
@@ -307,6 +315,7 @@ typedef struct
 	char	   *dumpdir;		/* Dumps */
 	char	   *logdir;			/* Log files */
 	bool		isatty;			/* is progress output to a tty */
+	uint64		pg_upgrade_wal_bytes;
 } LogOpts;
 
 
@@ -336,6 +345,7 @@ typedef struct
 										 * empty */
 	char	  **initdb_options; /* additional arguments to initdb */
 	int			num_initdb_options;
+	bool		wal_upgrade;
 } UserOpts;
 
 typedef struct
@@ -389,6 +399,7 @@ void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
 void		get_control_data(ClusterInfo *cluster);
 void		check_control_data(ControlData *oldctrl, ControlData *newctrl);
 void		disable_old_cluster(transferMode transfer_mode);
+uint64		get_shutdown_checkpoint_end_lsn(ClusterInfo *cluster);
 
 
 /* dump.c */
@@ -452,7 +463,15 @@ void		get_sock_dir(ClusterInfo *cluster);
 void		cleanup_initdb_cluster(void);
 void		sync_new_cluster(bool sync_data_files);
 
+/* prepare_upgrade.c */
+
+void		create_upgrade_preparation(void);
+void		prepare_upgrade_old_cluster(void);
+void		finish_upgrade_preparation(void);
+
 /* relfilenumber.c */
+
+RelFileNumber parse_relfilenumber(const char *filename);
 
 void		transfer_all_new_tablespaces(DbInfoArr *old_db_arr,
 										 DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata);

@@ -21,6 +21,7 @@
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
+#include "access/pgupgrade_first_start.h"
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -127,9 +128,12 @@ InitSync(void)
 	/*
 	 * Create pending-operations hashtable if we need it.  Currently, we need
 	 * it if we are standalone (not under a postmaster) or if we are a
-	 * checkpointer auxiliary process.
+	 * checkpointer auxiliary process. The startup upgrade WAL emitter also
+	 * queues fsyncs here because its checkpoint runs before a checkpointer
+	 * can start.
 	 */
-	if (!IsUnderPostmaster || AmCheckpointerProcess())
+	if (!IsUnderPostmaster || AmCheckpointerProcess() ||
+		(AmStartupProcess() && PgUpgradeFirstStartPending()))
 	{
 		HASHCTL		hash_ctl;
 

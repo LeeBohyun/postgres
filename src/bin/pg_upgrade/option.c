@@ -70,6 +70,7 @@ parseCommandLine(int argc, char *argv[])
 		{"initdb-options", required_argument, NULL, 9},
 		{"print-initdb-options", optional_argument, NULL, 10},
 		{"initdb-database", required_argument, NULL, 11},
+		{"wal-upgrade", no_argument, NULL, 12},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -265,6 +266,10 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.initdb_database = pg_strdup(optarg);
 				break;
 
+			case 12:
+				user_opts.wal_upgrade = true;
+				break;
+
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 						os_info.progname);
@@ -279,6 +284,8 @@ parseCommandLine(int argc, char *argv[])
 		pg_fatal("options --print-initdb-options and --initdb cannot be used together");
 	if (user_opts.print_initdb_options && user_opts.check)
 		pg_fatal("options --print-initdb-options and --check cannot be used together");
+	if (user_opts.print_initdb_options && user_opts.wal_upgrade)
+		pg_fatal("options --print-initdb-options and --wal-upgrade cannot be used together");
 	if (user_opts.initdb_database && !user_opts.print_initdb_options)
 		pg_fatal("--initdb-database requires --print-initdb-options");
 
@@ -441,6 +448,7 @@ usage(void)
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
 	printf(_("  --copy                        copy files to new cluster (default)\n"));
 	printf(_("  --copy-file-range             copy files to new cluster with copy_file_range\n"));
+	printf(_("  --wal-upgrade                 capture the upgrade as WAL at first startup\n"));
 	printf(_("  --initdb                      create the new cluster with initdb before\n"
 			 "                                checking or upgrading, using old cluster settings\n"));
 	printf(_("  --initdb-database=DBNAME       database supplying printed encoding and locale\n"

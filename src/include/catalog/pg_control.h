@@ -167,7 +167,9 @@ typedef struct ControlFileData
 	 * online backup which was taken from the standby and haven't reached the
 	 * end of backup yet. It is initialized to the minimum recovery point in
 	 * pg_control which was backed up last. It is reset to zero when the end
-	 * of backup is reached, and we mustn't start up before that.
+	 * of backup is reached, and we mustn't start up before that. PG_INT64_MAX
+	 * instead marks a target that has begun upgrade WAL emission and must not
+	 * be restarted.
 	 *
 	 * If backupEndRequired is true, we know for sure that we're restoring
 	 * from a backup, and must see a backup-end record before we can safely

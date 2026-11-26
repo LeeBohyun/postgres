@@ -50,6 +50,7 @@
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/pgupgrade_first_start.h"
 #include "access/rewriteheap.h"
 #include "access/subtrans.h"
 #include "access/timeline.h"
@@ -746,6 +747,7 @@ static void CleanupAfterArchiveRecovery(TimeLineID EndOfLogTLI,
 										XLogRecPtr EndOfLog,
 										TimeLineID newTLI);
 static void CheckRequiredParameterValues(void);
+static XLogRecPtr XLogInsertParameterChange(void);
 static void XLogReportParameters(void);
 static int	LocalSetXLogInsertAllowed(void);
 static void CreateEndOfRecoveryRecord(void);
@@ -4706,6 +4708,49 @@ UpdateControlFile(void)
 	update_controlfile(DataDir, ControlFile, true);
 }
 
+void
+GetControlFileCopy(ControlFileData *copy)
+{
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	memcpy(copy, ControlFile, sizeof(*copy));
+	LWLockRelease(ControlFileLock);
+}
+
+/* Persist the marker before startup WAL or slot changes can reach disk. */
+void
+BeginControlFileUpgrade(void)
+{
+	Assert(ControlFile != NULL);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (XLogRecPtrIsValid(ControlFile->backupStartPoint) ||
+		XLogRecPtrIsValid(ControlFile->backupEndPoint) ||
+		ControlFile->backupEndRequired)
+	{
+		LWLockRelease(ControlFileLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot emit upgrade WAL while backup recovery is pending")));
+	}
+	ControlFile->backupEndPoint = PG_INT64_MAX;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+}
+
+/* The completion checkpoint and command-file removal are already durable. */
+void
+FinishControlFileUpgrade(void)
+{
+	Assert(AmStartupProcess() && PgUpgradeFirstStartInProgress());
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (ControlFile->backupEndPoint != PG_INT64_MAX)
+		elog(PANIC, "invalid pg_upgrade state after command-file removal");
+	ControlFile->backupEndPoint = InvalidXLogRecPtr;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+}
+
 /*
  * Returns the unique system identifier from control file.
  */
@@ -6108,6 +6153,9 @@ StartupXLOG(void)
 		   CurrentResourceOwner == AuxProcessResourceOwner);
 	CurrentResourceOwner = AuxProcessResourceOwner;
 
+	/* Reject interrupted emission before recovery. */
+	PgUpgradePrepareFirstStart();
+
 	/*
 	 * Check that contents look valid.
 	 */
@@ -6976,6 +7024,30 @@ StartupXLOG(void)
 	 */
 	if (promoted)
 		RequestCheckpoint(CHECKPOINT_FORCE);
+
+	PgUpgradeRunFirstStart();
+}
+
+/*
+ * Run an end-of-recovery checkpoint after COMPLETE. Only after it succeeds,
+ * mark pg_control finalized and restore production state so normal startup
+ * can continue.
+ */
+XLogRecPtr
+PgUpgradeCompletionCheckPoint(XLogRecPtr complete_lsn)
+{
+	Assert(AmStartupProcess() && PgUpgradeFirstStartInProgress());
+	Assert(XLogRecPtrIsValid(complete_lsn));
+	CreateCheckPoint(CHECKPOINT_FAST | CHECKPOINT_END_OF_RECOVERY);
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (ControlFile->checkPoint < complete_lsn)
+		elog(PANIC, "pg_upgrade completion checkpoint precedes COMPLETE");
+	if (ControlFile->backupEndPoint != PG_INT64_MAX)
+		elog(PANIC, "invalid pg_upgrade state at completion checkpoint");
+	ControlFile->state = DB_IN_PRODUCTION;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+	return XactLastRecEnd;
 }
 
 /*
@@ -8987,6 +9059,22 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 		}
 	}
 
+	/*
+	 * Retain the segment containing startup's initial redo position and all
+	 * later WAL through the completion checkpoint. Startup then removes
+	 * pg_upgrade_relink and releases this protection.
+	 */
+
+	if (PgUpgradeFirstStartInProgress())
+	{
+		XLogSegNo	upgrade_segno;
+
+		keep = PgUpgradeFirstStartRedo();
+		Assert(XLogRecPtrIsValid(keep));
+		XLByteToSeg(keep, upgrade_segno, wal_segment_size);
+		segno = Min(segno, upgrade_segno);
+	}
+
 	/* don't delete WAL segments newer than the calculated segment */
 	if (segno < *logSegNo)
 		*logSegNo = segno;
@@ -9095,6 +9183,26 @@ XLogAssignLSN(void)
 	return XLogInsert(RM_XLOG_ID, XLOG_ASSIGN_LSN);
 }
 
+/* Insert the current parameters that are critical for hot standby. */
+static XLogRecPtr
+XLogInsertParameterChange(void)
+{
+	xl_parameter_change xlrec;
+
+	xlrec.MaxConnections = MaxConnections;
+	xlrec.max_worker_processes = max_worker_processes;
+	xlrec.max_wal_senders = max_wal_senders;
+	xlrec.max_prepared_xacts = max_prepared_xacts;
+	xlrec.max_locks_per_xact = max_locks_per_xact;
+	xlrec.wal_level = wal_level;
+	xlrec.wal_log_hints = wal_log_hints;
+	xlrec.track_commit_timestamp = track_commit_timestamp;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	return XLogInsert(RM_XLOG_ID, XLOG_PARAMETER_CHANGE);
+}
+
 /*
  * Check if any of the GUC parameters that are critical for hot standby
  * have changed, and update the value in pg_control file if necessary.
@@ -9120,22 +9228,8 @@ XLogReportParameters(void)
 		 */
 		if (wal_level != ControlFile->wal_level || XLogIsNeeded())
 		{
-			xl_parameter_change xlrec;
-			XLogRecPtr	recptr;
+			XLogRecPtr	recptr = XLogInsertParameterChange();
 
-			xlrec.MaxConnections = MaxConnections;
-			xlrec.max_worker_processes = max_worker_processes;
-			xlrec.max_wal_senders = max_wal_senders;
-			xlrec.max_prepared_xacts = max_prepared_xacts;
-			xlrec.max_locks_per_xact = max_locks_per_xact;
-			xlrec.wal_level = wal_level;
-			xlrec.wal_log_hints = wal_log_hints;
-			xlrec.track_commit_timestamp = track_commit_timestamp;
-
-			XLogBeginInsert();
-			XLogRegisterData(&xlrec, sizeof(xlrec));
-
-			recptr = XLogInsert(RM_XLOG_ID, XLOG_PARAMETER_CHANGE);
 			XLogFlush(recptr);
 		}
 
@@ -9201,6 +9295,15 @@ XLogChecksums(uint32 new_type)
 	XLogFlush(recptr);
 
 	return recptr;
+}
+
+/*
+ * Record runtime control values after the captured pg_control image.
+ */
+void
+XLogReportCurrentControlState(void)
+{
+	(void) XLogInsertParameterChange();
 }
 
 /*

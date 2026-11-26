@@ -10,6 +10,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	brindesc.o \
+	pgupgradedesc.o \
 	clogdesc.o \
 	committsdesc.o \
 	dbasedesc.o \

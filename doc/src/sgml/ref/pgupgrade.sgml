@@ -331,7 +331,8 @@ eval /new/bin/initdb --pgdata=/new/data "$initdb_options"
         but does not require or use the new cluster's binary or data
         directories.
         It cannot be combined with <option>--initdb</option>,
-        <option>--initdb-options</option>, or <option>--check</option>.
+        <option>--initdb-options</option>, <option>--check</option>, or
+        <option>--wal-upgrade</option>.
        </para>
        <para>
         The old server is started temporarily if it is stopped, and is left
@@ -612,6 +613,33 @@ pg_upgrade --initdb --initdb-options='-c huge_pages=off --waldir=/wal/new' ...
       <listitem><para>show help, then exit</para></listitem>
      </varlistentry>
 
+
+     <varlistentry id="app-pgupgrade-option-wal-upgrade">
+      <term><option>--wal-upgrade</option></term>
+      <listitem>
+       <para>
+        Record the upgrade as WAL. <application>pg_upgrade</application>
+        prepares the new cluster, publishes its upgrade commands, and leaves
+        it shut down. The first normal startup emits upgrade WAL before
+        accepting connections or starting background database writers.
+        Initialization and catalog-restore WAL are discarded before this
+        startup.
+       </para>
+       <para>
+        Storage inherited with <option>--link</option>, <option>--clone</option>,
+        or <option>--swap</option> can reuse its main fork without logging its contents.
+        Copying modes log relation contents as full-page images. Newly created,
+        rebuilt, and unlogged relations are recreated in every mode.
+       </para>
+       <para>
+        Startup completes only after the upgrade's completion checkpoint is
+        durable. Do not edit or remove <filename>pg_upgrade_relink</filename>.
+        An interrupted first startup requires a fresh target and intact old
+        storage; the source-reuse restrictions of the chosen transfer mode
+        still apply.
+       </para>
+      </listitem>
+     </varlistentry>
     </variablelist>
    </para>
 
