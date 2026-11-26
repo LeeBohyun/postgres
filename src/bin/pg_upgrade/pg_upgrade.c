@@ -45,10 +45,12 @@
 
 #include "access/multixact.h"
 #include "catalog/pg_class_d.h"
+#include "catalog/pg_collation_d.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
 #include "common/restricted_token.h"
 #include "fe_utils/string_utils.h"
+#include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
 
 /*
@@ -68,6 +70,9 @@ static void set_frozenxids(void);
 static void make_outputdirs(char *pgdata);
 static void check_bin_dirs(char *argv0);
 static void check_clusters_stopped(void);
+static void print_initdb_options(void);
+static void get_old_cluster_initdb_info(void);
+static void append_source_initdb_options(PQExpBuffer options);
 static void create_logical_replication_slots(void);
 static void create_conflict_detection_slot(void);
 
@@ -106,6 +111,15 @@ main(int argc, char **argv)
 	parseCommandLine(argc, argv);
 
 	get_restricted_token();
+
+	if (user_opts.print_initdb_options)
+	{
+		check_pghost_envvar();
+		check_bin_dir(&old_cluster, false);
+		adjust_data_dir(&old_cluster);
+		print_initdb_options();
+		return 0;
+	}
 
 	/*
 	 * Resolve old and new binary dirs before adjust_data_dir(), because
@@ -402,7 +416,7 @@ check_clusters_stopped(void)
 	 */
 	check_pghost_envvar();
 
-	/* no postmasters should be running, except for a live check */
+	/* A running old server is allowed for live checks or printing. */
 	if (pid_lock_file_exists(old_cluster.pgdata))
 	{
 		/*
@@ -418,7 +432,7 @@ check_clusters_stopped(void)
 			stop_postmaster(false);
 		else
 		{
-			if (!user_opts.check)
+			if (!user_opts.check && !user_opts.print_initdb_options)
 				pg_fatal("There seems to be a postmaster servicing the old cluster.\n"
 						 "Please shutdown that postmaster and try again.");
 			else
@@ -426,8 +440,9 @@ check_clusters_stopped(void)
 		}
 	}
 
-	/* same goes for the new postmaster */
-	if (pid_lock_file_exists(new_cluster.pgdata))
+	/* Printing does not use the new cluster. */
+	if (!user_opts.print_initdb_options &&
+		pid_lock_file_exists(new_cluster.pgdata))
 	{
 		if (start_postmaster(&new_cluster, false))
 			stop_postmaster(false);
@@ -436,6 +451,102 @@ check_clusters_stopped(void)
 					 "Please shutdown that postmaster and try again.");
 	}
 }
+
+/*
+ * Print one line of shell-quoted initdb arguments for callers that initialize
+ * and configure the new cluster themselves.  Complete discovery and formatting
+ * before writing to stdout, so failures in those steps leave it empty.
+ */
+static void
+print_initdb_options(void)
+{
+	PQExpBufferData options;
+
+	check_current_dir_write_permissions();
+	make_outputdirs(".");
+	get_old_cluster_initdb_info();
+
+	initPQExpBuffer(&options);
+	append_source_initdb_options(&options);
+	if (PQExpBufferBroken(&options))
+		pg_fatal("out of memory");
+
+	if (printf("%s\n", options.data) < 0 || fflush(stdout) != 0)
+		pg_fatal("could not write initdb options: %m");
+	termPQExpBuffer(&options);
+
+	cleanup_output_dirs();
+}
+
+
+/*
+ * Collect the source control data and template0 settings needed by initdb.
+ * Leave an already running source running, and stop any server started here.
+ * start_postmaster() registers an exit hook to stop it on discovery failure.
+ */
+static void
+get_old_cluster_initdb_info(void)
+{
+	check_data_dir(&old_cluster);
+	check_cluster_binary_version(&old_cluster);
+
+	if (!old_cluster.sockdir)
+		old_cluster.sockdir = user_opts.socketdir ? user_opts.socketdir : ".";
+
+	check_clusters_stopped();
+
+	get_sock_dir(&old_cluster);
+	get_control_data(&old_cluster);
+
+	prep_status("Examining old cluster settings");
+	if (!user_opts.live_check)
+		start_postmaster(&old_cluster, true);
+	get_template0_info(&old_cluster);
+	if (!user_opts.live_check)
+		stop_postmaster(false);
+	check_ok();
+}
+
+
+/* Append the source initialization settings as shell-quoted arguments. */
+static void
+append_source_initdb_options(PQExpBuffer options)
+{
+	DbLocaleInfo *locale = old_cluster.template0;
+
+	appendPQExpBuffer(options, "--wal-segsize=%u",
+					  old_cluster.controldata.walseg / (1024 * 1024));
+
+	/*
+	 * Pass --data-checksums or --no-data-checksums explicitly.  Starting from
+	 * PG18, initdb enables checksums by default, so we must mirror the old
+	 * cluster's setting to avoid a mismatch that check_control_data() would
+	 * reject.
+	 */
+	appendPQExpBufferStr(options,
+						 old_cluster.controldata.data_checksum_version != 0 ?
+						 " --data-checksums" : " --no-data-checksums");
+
+	appendPQExpBufferStr(options, " --encoding=");
+	appendShellString(options, pg_encoding_to_char(locale->db_encoding));
+	appendPQExpBufferStr(options, " --locale-provider=");
+	appendShellString(options, collprovider_name(locale->db_collprovider));
+	appendPQExpBufferStr(options, " --lc-collate=");
+	appendShellString(options, locale->db_collate);
+	appendPQExpBufferStr(options, " --lc-ctype=");
+	appendShellString(options, locale->db_ctype);
+
+	if (locale->db_locale &&
+		(locale->db_collprovider == COLLPROVIDER_ICU ||
+		 locale->db_collprovider == COLLPROVIDER_BUILTIN))
+	{
+		appendPQExpBufferStr(options,
+							 locale->db_collprovider == COLLPROVIDER_ICU ?
+							 " --icu-locale=" : " --builtin-locale=");
+		appendShellString(options, locale->db_locale);
+	}
+}
+
 
 /*
  * Set the new cluster's default char signedness using the old cluster's

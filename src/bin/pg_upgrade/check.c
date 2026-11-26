@@ -822,6 +822,27 @@ output_completion_banner(char *deletion_script_file_name)
 }
 
 
+/*
+ * Require the binaries and data directory to have the same major version.
+ * Call this before inspecting control data with the cluster's binaries.
+ */
+void
+check_cluster_binary_version(ClusterInfo *cluster)
+{
+	Assert(cluster->major_version != 0);
+	Assert(cluster->bin_version != 0);
+
+	if (GET_MAJOR_VERSION(cluster->major_version) ==
+		GET_MAJOR_VERSION(cluster->bin_version))
+		return;
+
+	if (cluster == &old_cluster)
+		pg_fatal("Old cluster data and binary directories are from different major versions.");
+	else
+		pg_fatal("New cluster data and binary directories are from different major versions.");
+}
+
+
 void
 check_cluster_versions(void)
 {
@@ -854,12 +875,8 @@ check_cluster_versions(void)
 		pg_fatal("This utility cannot be used to downgrade to older major PostgreSQL versions.");
 
 	/* Ensure binaries match the designated data directories */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) !=
-		GET_MAJOR_VERSION(old_cluster.bin_version))
-		pg_fatal("Old cluster data and binary directories are from different major versions.");
-	if (GET_MAJOR_VERSION(new_cluster.major_version) !=
-		GET_MAJOR_VERSION(new_cluster.bin_version))
-		pg_fatal("New cluster data and binary directories are from different major versions.");
+	check_cluster_binary_version(&old_cluster);
+	check_cluster_binary_version(&new_cluster);
 
 	/*
 	 * Since from version 18, newly created database clusters always have

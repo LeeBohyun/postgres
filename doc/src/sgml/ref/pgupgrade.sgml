@@ -31,6 +31,13 @@ PostgreSQL documentation
    <arg choice="plain"><replaceable>newconfigdir</replaceable></arg>
    <arg rep="repeat"><replaceable>option</replaceable></arg>
   </cmdsynopsis>
+  <cmdsynopsis>
+   <command>pg_upgrade</command>
+   <arg choice="plain"><option>--print-initdb-options</option></arg>
+   <arg choice="plain"><option>-b</option> <replaceable>oldbindir</replaceable></arg>
+   <arg choice="plain"><option>-d</option> <replaceable>oldconfigdir</replaceable></arg>
+   <arg rep="repeat"><replaceable>option</replaceable></arg>
+  </cmdsynopsis>
  </refsynopsisdiv>
 
  <refsect1>
@@ -263,6 +270,40 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--print-initdb-options</option></term>
+      <listitem>
+       <para>
+        Print the old cluster's initialization options and exit.  The output
+        contains its WAL segment size and checksum setting, and the encoding
+        and locale settings of its <literal>template0</literal> database.
+        Standard output contains one line of shell-quoted arguments;
+        diagnostics are written to standard error.  Target paths, the
+        superuser name, and authentication settings are left to the caller.
+       </para>
+       <para>
+        As with <xref linkend="app-pgconfig"/>'s <option>--configure</option>
+        output, preserve the shell quotation marks when reusing the arguments.
+        For example, in a POSIX shell script:
+<programlisting>
+initdb_options=$(/new/bin/pg_upgrade --print-initdb-options \
+    --old-bindir=/old/bin --old-datadir=/old/data) || exit
+eval /new/bin/initdb --pgdata=/new/data "$initdb_options"
+</programlisting>
+        A wrapper can then configure the new cluster before running
+        <application>pg_upgrade</application> normally.
+       </para>
+       <para>
+        The old server is started temporarily if stopped, and is left running
+        otherwise.  The current directory must be writable for diagnostic
+        logs in <filename>pg_upgrade_output.d</filename>.  Logs are removed
+        on success unless <option>--retain</option> is specified.
+        This mode does not perform upgrade compatibility checks and cannot
+        be combined with <option>--check</option>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--no-statistics</option></term>
       <listitem>
        <para>
@@ -457,10 +498,18 @@ make prefix=/usr/local/pgsql.new install
 
     <para>
      Initialize the new cluster using <command>initdb</command>.
-     Again, use compatible <command>initdb</command>
-     flags that match the old cluster. Many
-     prebuilt installers do this step automatically. There is no need to
-     start the new cluster.
+     Two <command>initdb</command> settings must match the old cluster, or
+     <application>pg_upgrade</application> will fail with a control-data
+     mismatch: the WAL segment size (<option>--wal-segsize</option>) and the
+     data checksum setting (<option>--data-checksums</option> or
+     <option>--no-data-checksums</option>).  You can read the old cluster's
+     values with
+     <link linkend="app-pgcontroldata">
+      <application>pg_controldata</application></link>.
+     (The encoding and locale need not match:
+     <application>pg_upgrade</application> copies them from the old cluster.)
+     Many prebuilt installers do this step automatically.  There is no need
+     to start the new cluster.
     </para>
    </step>
 
